@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "racer"
+version = "0.1.0"
+description = "Redundant-GPU Accelerated Checkpoint Erasure-coding and Routing prototype"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "RACER prototype"}]
+dependencies = ["torch", "numpy"]
+
+[tool.setuptools]
+packages = ["racer"]
+
+[tool.setuptools.package-data]
+racer = ["csrc/*.cpp", "csrc/*.cu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,55 @@
+import torch
+
+import racer
+
+
+def test_store_writes_manifest_with_train_owners_and_virtual_slots():
+    ctx = racer.init(
+        k=3,
+        m=1,
+        train_ranks=[0, 1, 2, 3],
+        spare_ranks=[4],
+        backend="cpu",
+        storage_backend="in_process_cpu",
+        async_op=False,
+    )
+    obj = {
+        rank: torch.arange(rank * 11, rank * 11 + 7, dtype=torch.uint8)
+        for rank in [0, 1, 2, 3]
+    }
+    racer.store(obj, tag="manifest", context=ctx, async_op=False)
+    manifest = ctx.chunk_storage.get_manifest("manifest")
+
+    assert manifest["E"] == ctx.matrix
+    assert manifest["train_ranks"] == [0, 1, 2, 3]
+    assert manifest["spare_ranks"] == [4]
+    assert manifest["elastic_layout"]["num_virtual_zero"] == 2
+    assert [slot["slot_id"] for slot in manifest["virtual_slots"]] == [4, 5]
+    assert set(manifest["chunk_owner"].values()) <= {0, 1, 2, 3}
+    assert 4 not in manifest["chunk_owner"].values()
+    assert len(ctx.chunk_storage.list_chunks("manifest")) == 8
+    assert all("checksum" in chunk for chunk in manifest["chunks"])
+    assert manifest["routing_plan"]["strategy"] == "spare_compute"
+    assert manifest["routing_cost"]["skipped_virtual_zero_bytes"] > 0
+    assert ctx.last_routing_plan is not None
+
+
+def test_load_can_rebuild_checkpoint_from_chunk_storage_manifest():
+    ctx = racer.init(
+        k=3,
+        m=1,
+        train_ranks=[0, 1, 2, 3],
+        spare_ranks=[4],
+        backend="cpu",
+        storage_backend="file_mmap",
+        async_op=False,
+    )
+    obj = {
+        rank: torch.arange(rank * 13, rank * 13 + 9, dtype=torch.uint8)
+        for rank in [0, 1, 2, 3]
+    }
+    racer.store(obj, tag="persistent", context=ctx, async_op=False)
+
+    ctx.storage._items.clear()
+    recovered = racer.load(tag="persistent", failed_train_ranks=[0], context=ctx)
+    assert torch.equal(recovered[0], obj[0])

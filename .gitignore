@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# RACER generated outputs
+results/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Benchmark/profiling artifacts
+*.prof
+*.nvprof
+*.nsys-rep
+*.qdrep
