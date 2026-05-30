@@ -1,5 +1,3 @@
-import torch
-
 from racer import bitmatrix, gf256
 
 
@@ -12,8 +10,9 @@ def test_element_bitmatrix_matches_gf_multiply():
 
 def test_all_coefficients_and_bytes_match_gf_multiply():
     for coef in range(256):
+        bm = bitmatrix.coeff_to_bitmatrix(coef)
         for value in range(256):
-            assert bitmatrix.apply_bitmatrix_cpu(coef, value) == gf256.gf_mul(coef, value)
+            assert bitmatrix.apply_bitmatrix_to_byte(bm, value) == gf256.gf_mul(coef, value)
 
 
 def test_zero_and_one_bitmatrices():
@@ -28,10 +27,3 @@ def test_matrix_to_bitmatrix_shape():
     assert len(bm) == 16
     assert all(len(row) == 16 for row in bm)
     assert bitmatrix.bitmatrix_weight(bm) > 0
-
-
-def test_apply_bitmatrix_cpu_tensor():
-    src = torch.tensor([0, 1, 2, 255], dtype=torch.uint8)
-    out = bitmatrix.apply_bitmatrix_cpu(7, src)
-    expected = torch.tensor([gf256.gf_mul(7, int(v)) for v in src], dtype=torch.uint8)
-    assert torch.equal(out, expected)

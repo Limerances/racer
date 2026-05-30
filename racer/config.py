@@ -1,4 +1,4 @@
-"""Validated RACER configuration.
+"""Validated RACER configuration for the spare-GPU CUDA route.
 
 The central invariant is `k + m == len(train_ranks)`. Spare ranks are
 compute-only resources and are never counted in the erasure-code matrix.
@@ -31,7 +31,7 @@ class RacerConfig:
         object.__setattr__(self, "spare_ranks", tuple(int(r) for r in self.spare_ranks))
 
         if self.include_spares_in_train:
-            raise NotImplementedError("include_spares_in_train=True is intentionally not implemented in phase 1")
+            raise NotImplementedError("include_spares_in_train=True is intentionally not implemented")
 
         if self.k + self.m != len(self.train_ranks):
             raise ValueError(
@@ -41,7 +41,7 @@ class RacerConfig:
         if self.k <= 0 or self.m <= 0:
             raise ValueError("k and m must be positive")
         if self.w != 8:
-            raise NotImplementedError("phase 1 implements GF(2^8) only")
+            raise NotImplementedError("RACER implements GF(2^8) only")
         if len(set(self.train_ranks)) != len(self.train_ranks):
             raise ValueError("train_ranks must be unique")
         if len(set(self.spare_ranks)) != len(self.spare_ranks):
@@ -49,9 +49,11 @@ class RacerConfig:
         overlap = set(self.train_ranks) & set(self.spare_ranks)
         if overlap:
             raise ValueError(f"spare_ranks must not overlap train_ranks: {sorted(overlap)}")
-        if self.backend not in {"cpu", "cuda"}:
-            raise ValueError("backend must be 'cpu' or 'cuda'")
-        if self.storage_backend not in {"in_process_cpu", "in_process_cuda", "cpu_pinned", "file_mmap", "egm"}:
-            raise ValueError("unsupported storage_backend")
-        if self.backend == "cpu" and self.storage_backend == "in_process_cuda":
-            raise ValueError("cpu backend requires storage_backend='in_process_cpu'")
+        if not self.spare_ranks:
+            raise ValueError("spare_ranks must contain at least one spare GPU")
+        if self.backend != "cuda":
+            raise ValueError("backend must be 'cuda'; the CPU data path has been removed")
+        if self.storage_backend not in {"in_process_cuda", "egm"}:
+            raise ValueError("storage_backend must be 'in_process_cuda' or 'egm'")
+        if self.routing_strategy != "spare_compute":
+            raise ValueError("routing_strategy must be 'spare_compute'; CPU/local routes have been removed")

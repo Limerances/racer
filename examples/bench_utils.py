@@ -1,18 +1,16 @@
-"""Shared benchmark helpers for RACER examples."""
+"""Shared benchmark helpers for CUDA-only RACER examples."""
 
 from __future__ import annotations
 
 import csv
 import os
-import statistics
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
 
 import torch
 
-from racer import cauchy, codec_cpu, codec_cuda
+from racer import cauchy, codec_cuda
 from racer.layout import ElasticLayout
 from racer.routing import make_planner
 
@@ -33,13 +31,13 @@ CSV_COLUMNS = [
     "store_wall_ms",
     "decode_ms",
     "load_wall_ms",
-    "cpu_baseline_encode_ms",
-    "cpu_baseline_decode_ms",
     "bytes_sent",
     "num_messages",
     "compute_bytes_on_train_ranks",
     "compute_bytes_on_accelerators",
     "skipped_virtual_zero_bytes",
+    "comm_backend",
+    "compute_backend",
     "correct",
 ]
 
@@ -118,13 +116,11 @@ def maybe_init_distributed(backend: str | None = None) -> tuple[int, int, int]:
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        actual_backend = backend if backend is not None else ("nccl" if torch.cuda.is_available() else "gloo")
-        dist.init_process_group(backend=actual_backend)
+        dist.init_process_group(backend=backend or "nccl")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
+    torch.cuda.set_device(local_rank)
     return rank, world, local_rank
 
 
@@ -154,37 +150,26 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[idx]
 
 
-def sync_if_cuda(device: torch.device | str | None = None) -> None:
-    if not torch.cuda.is_available():
-        return
+def sync_cuda(device: torch.device | str | None = None) -> None:
     if device is None:
         torch.cuda.synchronize()
     else:
         torch.cuda.synchronize(device)
 
 
-def time_cuda_or_wall(fn, device: torch.device | None) -> tuple[float, object]:
-    if device is not None and device.type == "cuda":
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        result = fn()
-        end.record()
-        torch.cuda.synchronize(device)
-        return float(start.elapsed_time(end)), result
-    begin = time.perf_counter()
+def time_cuda(fn, device: torch.device) -> tuple[float, object]:
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
     result = fn()
-    return (time.perf_counter() - begin) * 1000.0, result
-
-
-def make_cpu_chunks(k: int, size_bytes: int) -> list[torch.Tensor]:
-    torch.manual_seed(0)
-    return [torch.randint(0, 256, (size_bytes,), dtype=torch.uint8) for _ in range(k)]
+    end.record()
+    torch.cuda.synchronize(device)
+    return float(start.elapsed_time(end)), result
 
 
 def make_cuda_chunks(k: int, size_bytes: int, device: torch.device) -> list[torch.Tensor]:
     if not torch.cuda.is_available():
-        raise RuntimeError("backend='cuda' requested but torch.cuda is unavailable")
+        raise RuntimeError("CUDA is required")
     torch.manual_seed(0)
     return [torch.randint(0, 256, (size_bytes,), dtype=torch.uint8, device=device) for _ in range(k)]
 
@@ -194,52 +179,30 @@ def benchmark_codec(
     k: int,
     m: int,
     size_bytes: int,
-    backend: str,
-    cpu_baseline: bool,
     routing_strategy: str,
     train_ranks: list[int] | None = None,
     spare_ranks: list[int] | None = None,
 ) -> dict:
     train_ranks = train_ranks if train_ranks is not None else list(range(k + m))
-    spare_ranks = spare_ranks if spare_ranks is not None else []
+    spare_ranks = spare_ranks if spare_ranks is not None else [k + m]
     validate_config(k, m, train_ranks)
+    if routing_strategy != "spare_compute":
+        raise ValueError("benchmark_codec supports only routing_strategy='spare_compute'")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
     layout = ElasticLayout.build(train_ranks, spare_ranks, k, m)
     E = cauchy.generate_systematic_matrix(k, m)
     failed_rows = list(range(m))
     survivor_rows = [row for row in range(k + m) if row not in failed_rows]
 
-    device = torch.device("cuda:0") if backend == "cuda" else torch.device("cpu")
-    if backend == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("backend='cuda' requested but torch.cuda is unavailable")
-        if torch.cuda.device_count() < 1:
-            raise RuntimeError("backend='cuda' requested but no visible CUDA devices were found")
-        chunks = make_cuda_chunks(k, size_bytes, device)
-        encode_ms, code = time_cuda_or_wall(lambda: codec_cuda.apply_matrix_cuda(chunks, E), device)
-        decode_ms, decoded = time_cuda_or_wall(
-            lambda: codec_cuda.decode_blocks([code[row] for row in survivor_rows], survivor_rows, E),
-            device,
-        )
-        correct = all(torch.equal(decoded[i].cpu(), chunks[i].cpu()) for i in range(k))
-    else:
-        chunks = make_cpu_chunks(k, size_bytes)
-        encode_ms, code = time_cuda_or_wall(lambda: codec_cpu.encode_cpu(chunks, E), None)
-        decode_ms, decoded = time_cuda_or_wall(
-            lambda: codec_cpu.decode_cpu([code[row] for row in survivor_rows], survivor_rows, E),
-            None,
-        )
-        correct = all(torch.equal(decoded[i], chunks[i]) for i in range(k))
-
-    cpu_encode_ms = ""
-    cpu_decode_ms = ""
-    if cpu_baseline:
-        cpu_chunks = [chunk.detach().cpu().clone() for chunk in chunks]
-        cpu_encode_ms, cpu_code = time_cuda_or_wall(lambda: codec_cpu.encode_cpu(cpu_chunks, E), None)
-        cpu_decode_ms, cpu_decoded = time_cuda_or_wall(
-            lambda: codec_cpu.decode_cpu([cpu_code[row] for row in survivor_rows], survivor_rows, E),
-            None,
-        )
-        correct = correct and all(torch.equal(cpu_decoded[i], cpu_chunks[i]) for i in range(k))
+    device = torch.device("cuda:0")
+    chunks = make_cuda_chunks(k, size_bytes, device)
+    encode_ms, code = time_cuda(lambda: codec_cuda.apply_matrix_cuda(chunks, E), device)
+    decode_ms, decoded = time_cuda(
+        lambda: codec_cuda.decode_blocks([code[row] for row in survivor_rows], survivor_rows, E),
+        device,
+    )
+    correct = all(torch.equal(decoded[i], chunks[i]) for i in range(k))
 
     return make_result_row(
         k=k,
@@ -255,8 +218,6 @@ def benchmark_codec(
         store_wall_ms=encode_ms,
         decode_ms=decode_ms,
         load_wall_ms=decode_ms,
-        cpu_baseline_encode_ms=cpu_encode_ms,
-        cpu_baseline_decode_ms=cpu_decode_ms,
         correct=correct,
     )
 
@@ -277,9 +238,9 @@ def make_result_row(
     decode_ms: float,
     load_wall_ms: float,
     correct: bool,
-    cpu_baseline_encode_ms="",
-    cpu_baseline_decode_ms="",
     cost=None,
+    comm_backend: str = "",
+    compute_backend: str = "cuda",
 ) -> dict:
     return {
         "timestamp": utc_timestamp(),
@@ -297,13 +258,13 @@ def make_result_row(
         "store_wall_ms": f"{store_wall_ms:.3f}",
         "decode_ms": f"{decode_ms:.3f}",
         "load_wall_ms": f"{load_wall_ms:.3f}",
-        "cpu_baseline_encode_ms": "" if cpu_baseline_encode_ms == "" else f"{float(cpu_baseline_encode_ms):.3f}",
-        "cpu_baseline_decode_ms": "" if cpu_baseline_decode_ms == "" else f"{float(cpu_baseline_decode_ms):.3f}",
         "bytes_sent": 0 if cost is None else cost.total_bytes_sent,
         "num_messages": 0 if cost is None else cost.num_messages,
         "compute_bytes_on_train_ranks": 0 if cost is None else cost.compute_bytes_on_train_ranks,
         "compute_bytes_on_accelerators": 0 if cost is None else cost.compute_bytes_on_accelerators,
         "skipped_virtual_zero_bytes": 0 if cost is None else cost.skipped_virtual_zero_bytes,
+        "comm_backend": comm_backend,
+        "compute_backend": compute_backend,
         "correct": bool(correct),
     }
 

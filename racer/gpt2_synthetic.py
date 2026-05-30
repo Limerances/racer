@@ -247,7 +247,7 @@ def make_rank_state(
     rank: int,
     config: GPT2CheckpointConfig,
     *,
-    device: torch.device | str = "cpu",
+    device: torch.device | str = "cuda:0",
     fill: bool = False,
     max_tensors: int | None = None,
 ) -> dict[str, torch.Tensor]:
@@ -271,13 +271,16 @@ def make_rank_states(
     fill: bool = False,
     max_tensors: int | None = None,
 ) -> dict[int, dict[str, torch.Tensor]]:
+    if backend != "cuda":
+        raise ValueError("make_rank_states supports only backend='cuda'")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required to materialize RACER benchmark states")
     states: dict[int, dict[str, torch.Tensor]] = {}
     for rank in ranks:
-        device = torch.device("cuda", int(rank)) if backend == "cuda" else torch.device("cpu")
         states[int(rank)] = make_rank_state(
             int(rank),
             config,
-            device=device,
+            device=torch.device("cuda", int(rank)),
             fill=fill,
             max_tensors=max_tensors,
         )
@@ -295,11 +298,18 @@ def states_nbytes(states: dict[int, dict[str, torch.Tensor]]) -> int:
 def state_dict_byte_equal(left: dict[str, torch.Tensor], right: dict[str, torch.Tensor]) -> bool:
     if set(left) != set(right):
         return False
+    touched: set[torch.device] = set()
     for key in left:
-        a = left[key].detach().contiguous().view(torch.uint8).cpu()
-        b = right[key].detach().contiguous().view(torch.uint8).cpu()
+        a = left[key].detach().contiguous().view(torch.uint8)
+        b = right[key].detach().contiguous().view(torch.uint8)
+        if b.device != a.device:
+            b = b.to(a.device, non_blocking=True)
+        if a.device.type == "cuda":
+            touched.add(a.device)
         if not torch.equal(a, b):
             return False
+    for device in touched:
+        torch.cuda.synchronize(device)
     return True
 
 

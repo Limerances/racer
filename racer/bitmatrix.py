@@ -12,8 +12,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-import torch
-
 from . import gf256
 
 
@@ -47,33 +45,6 @@ def apply_bitmatrix_to_byte(matrix: list[list[int]], value: int, w: int = 8) -> 
         if bit:
             out |= 1 << row
     return out
-
-
-def _apply_coeff_to_byte(e: int, value: int, w: int) -> int:
-    return apply_bitmatrix_to_byte(coeff_to_bitmatrix(e, w), value, w)
-
-
-def apply_bitmatrix_cpu(e: int, src_uint8, w: int = 8):
-    if w != 8:
-        raise NotImplementedError("only w=8 is implemented")
-    coeff = int(e) & 0xFF
-    if isinstance(src_uint8, int):
-        return _apply_coeff_to_byte(coeff, src_uint8, w)
-    if isinstance(src_uint8, torch.Tensor):
-        if src_uint8.dtype != torch.uint8:
-            raise TypeError("apply_bitmatrix_cpu expects torch.uint8 input")
-        if src_uint8.device.type != "cpu":
-            raise ValueError("apply_bitmatrix_cpu expects a CPU tensor")
-        flat = src_uint8.contiguous().view(-1)
-        out = torch.empty_like(flat)
-        for idx, value in enumerate(flat.tolist()):
-            out[idx] = _apply_coeff_to_byte(coeff, int(value), w)
-        return out.view(src_uint8.shape)
-    if isinstance(src_uint8, (bytes, bytearray)):
-        return bytes(_apply_coeff_to_byte(coeff, value, w) for value in src_uint8)
-    if isinstance(src_uint8, Sequence):
-        return [_apply_coeff_to_byte(coeff, int(value), w) for value in src_uint8]
-    raise TypeError("src_uint8 must be an int, CPU uint8 tensor, bytes, bytearray, or sequence")
 
 
 def matrix_to_bitmatrix(matrix: list[list[int]], w: int = 8) -> list[list[int]]:

@@ -1,4 +1,4 @@
-"""Single-process RACER codec benchmark."""
+"""Single-process CUDA RACER codec benchmark."""
 
 import sys
 from pathlib import Path
@@ -16,9 +16,9 @@ def main() -> None:
     parser.add_argument("--bytes", type=int, default=None, help="Backward-compatible single size in bytes")
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--m", type=int, default=1)
-    parser.add_argument("--backend", choices=["cpu", "cuda"], default="cuda")
-    parser.add_argument("--cpu-baseline", action="store_true")
-    parser.add_argument("--routing-strategy", default="local")
+    parser.add_argument("--train-ranks", default=None, help="Optional comma-separated train ranks")
+    parser.add_argument("--spare-ranks", default=None, help="Optional comma-separated spare ranks")
+    parser.add_argument("--routing-strategy", default="spare_compute", choices=["spare_compute"])
     args = parser.parse_args()
 
     if args.sizes:
@@ -28,15 +28,17 @@ def main() -> None:
     else:
         sizes = [64 * 1024 * 1024]
 
+    train_ranks = None if args.train_ranks is None else [int(v) for v in args.train_ranks.split(",") if v]
+    spare_ranks = None if args.spare_ranks is None else [int(v) for v in args.spare_ranks.split(",") if v]
     rows = []
     for size_bytes in sizes:
         row = benchmark_codec(
             k=args.k,
             m=args.m,
             size_bytes=size_bytes,
-            backend=args.backend,
-            cpu_baseline=args.cpu_baseline,
             routing_strategy=args.routing_strategy,
+            train_ranks=train_ranks,
+            spare_ranks=spare_ranks,
         )
         rows.append(row)
         print(row)

@@ -36,8 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--include-optimizer", type=parse_bool, default=True)
     parser.add_argument("--include-master-weights", type=parse_bool, default=True)
-    parser.add_argument("--backend", choices=["cuda", "cpu"], default="cuda")
-    parser.add_argument("--storage-backend", default=None)
+    parser.add_argument("--storage-backend", default="in_process_cuda", choices=["in_process_cuda"])
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--m", type=int, default=1)
     parser.add_argument("--train-ranks", default="0,1,2,3")
@@ -91,16 +90,13 @@ def main() -> None:
         raise SystemExit("invalid RACER config: k + m must equal len(train_ranks); spare ranks are extra")
     if args.failed_rank not in train_ranks:
         raise SystemExit("--failed-rank must be one of --train-ranks")
-    if args.backend == "cuda":
-        if not torch.cuda.is_available():
-            raise SystemExit("CUDA is not available")
-        needed = max(train_ranks + spare_ranks) if spare_ranks else max(train_ranks)
-        if torch.cuda.device_count() <= needed:
-            raise SystemExit(f"need CUDA device rank {needed}, visible device_count={torch.cuda.device_count()}")
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is not available")
+    needed = max(train_ranks + spare_ranks)
+    if torch.cuda.device_count() <= needed:
+        raise SystemExit(f"need CUDA device rank {needed}, visible device_count={torch.cuda.device_count()}")
 
     storage_backend = args.storage_backend
-    if storage_backend is None:
-        storage_backend = "in_process_cuda" if args.backend == "cuda" else "in_process_cpu"
 
     config = profile_config(
         args.profile,
@@ -120,14 +116,14 @@ def main() -> None:
     print(f"estimated_total_train_bytes={estimated_total_bytes} ({estimated_total_bytes / 1024**3:.3f} GiB)")
     chunk_size = parse_size(args.chunk_size)
     print(f"chunk_size_bytes={chunk_size}")
-    print(f"cuda_extension_available={codec_cuda.extension_available() if args.backend == 'cuda' else False}")
+    print(f"cuda_extension_available={codec_cuda.extension_available()}")
     if args.estimate_only:
         return
 
     states = make_rank_states(
         train_ranks,
         config,
-        backend=args.backend,
+        backend="cuda",
         fill=args.fill or args.verify,
         max_tensors=args.max_tensors,
     )
@@ -139,7 +135,7 @@ def main() -> None:
         m=args.m,
         train_ranks=train_ranks,
         spare_ranks=spare_ranks,
-        backend=args.backend,
+        backend="cuda",
         storage_backend=storage_backend,
         buffer_size=chunk_size,
         async_op=False,
@@ -177,7 +173,7 @@ def main() -> None:
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "iteration": run - args.warmup,
             "profile": args.profile,
-            "backend": args.backend,
+            "backend": "cuda",
             "storage_backend": storage_backend,
             "k": args.k,
             "m": args.m,

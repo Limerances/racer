@@ -19,7 +19,7 @@ from typing import Any, Sequence
 
 import torch
 
-from . import cauchy, codec_cpu, codec_cuda, gf256, routing
+from . import cauchy, codec_cuda, gf256, routing
 from .config import RacerConfig
 from .layout import ElasticLayout, RacerLayout, Stripe
 from .state_dict_codec import RankStateMetadata, TensorMetadata, flatten_state_dict, unflatten_state_dict
@@ -101,10 +101,8 @@ class RacerContext:
         if extra:
             raise ValueError(f"checkpoint obj contains ranks outside train_ranks: {sorted(extra)}")
         for rank, tensor in tensor_map.items():
-            if self.config.backend == "cuda" and tensor.device.type != "cuda":
-                raise ValueError(f"rank {rank} tensor must be a CUDA tensor for backend='cuda'")
-            if self.config.backend == "cpu" and tensor.device.type != "cpu":
-                raise ValueError(f"rank {rank} tensor must be a CPU tensor for backend='cpu'")
+            if tensor.device.type != "cuda":
+                raise ValueError(f"rank {rank} tensor must be a CUDA tensor")
         return tensor_map
 
 
@@ -123,9 +121,7 @@ class RacerContext:
             raise ValueError(f"checkpoint obj contains ranks outside train_ranks: {sorted(extra)}")
 
     def _state_dict_target_device(self, rank: int) -> torch.device:
-        if self.config.backend == "cuda":
-            return torch.device("cuda", int(rank))
-        return torch.device("cpu")
+        return torch.device("cuda", int(rank))
 
     def _prepare_obj(
         self,
@@ -229,11 +225,8 @@ class RacerContext:
             self._sync_compute_device(tensor.device)
 
     def _empty_storage_row(self, numel: int, device: torch.device) -> torch.Tensor:
-        if device.type == "cpu":
-            try:
-                return torch.empty(int(numel), dtype=torch.uint8, pin_memory=True)
-            except RuntimeError:
-                return torch.empty(int(numel), dtype=torch.uint8)
+        if device.type != "cuda":
+            raise ValueError("RACER storage rows must be allocated on CUDA devices")
         return torch.empty(int(numel), dtype=torch.uint8, device=device)
 
     def _host_buffer_owner_rank(self, stripe: Stripe, row: int) -> int | None:
@@ -246,12 +239,8 @@ class RacerContext:
         return int(self.config.train_ranks[int(row)])
 
     def _parity_compute_device(self, parity_id: int) -> torch.device:
-        if self.config.backend == "cpu":
-            return torch.device("cpu")
-        if self.config.routing_strategy == "spare_compute" and self.config.spare_ranks:
-            rank = self.config.spare_ranks[int(parity_id) % len(self.config.spare_ranks)]
-            return torch.device("cuda", int(rank))
-        return routing.compute_device(self.config)
+        rank = self.config.spare_ranks[int(parity_id) % len(self.config.spare_ranks)]
+        return torch.device("cuda", int(rank))
 
     def _codec_apply_matrix(
         self,
@@ -259,19 +248,10 @@ class RacerContext:
         matrix: Sequence[Sequence[int]],
         outputs: Sequence[torch.Tensor] | None = None,
     ) -> list[torch.Tensor]:
-        if self.config.backend == "cuda":
-            return codec_cuda.apply_matrix_cuda(blocks, matrix, outputs=outputs)
-        if outputs is not None:
-            encoded = codec_cpu.encode_blocks(blocks, matrix)
-            for dst, src in zip(outputs, encoded):
-                dst.copy_(src)
-            return list(outputs)
-        return codec_cpu.encode_blocks(blocks, matrix)
+        return codec_cuda.apply_matrix_cuda(blocks, matrix, outputs=outputs)
 
     def _codec_encode(self, blocks: Sequence[torch.Tensor], matrix: Sequence[Sequence[int]]) -> list[torch.Tensor]:
-        if self.config.backend == "cuda":
-            return codec_cuda.encode_blocks(blocks, matrix)
-        return codec_cpu.encode_blocks(blocks, matrix)
+        return codec_cuda.encode_blocks(blocks, matrix)
 
     def _codec_decode(
         self,
@@ -279,9 +259,7 @@ class RacerContext:
         survivor_rows: Sequence[int],
         matrix: Sequence[Sequence[int]],
     ) -> list[torch.Tensor]:
-        if self.config.backend == "cuda":
-            return codec_cuda.decode_blocks(blocks, survivor_rows, matrix)
-        return codec_cpu.decode_blocks(blocks, survivor_rows, matrix)
+        return codec_cuda.decode_blocks(blocks, survivor_rows, matrix)
 
     def _checksum(self, tensor: torch.Tensor) -> str:
         flat = tensor.detach().contiguous().view(-1)
@@ -361,7 +339,7 @@ class RacerContext:
                     "host_buffer_role": "train_local" if row < self.config.k else "spare_local",
                     "is_spare_owned": False,
                     "stored_device": str(tensor.device),
-                    "is_pinned_host": bool(tensor.device.type == "cpu" and tensor.is_pinned()),
+                    "is_pinned_host": False,
                     "num_bytes": int(tensor.numel()),
                     "checksum": self._checksum(tensor),
                     "slots": slot_entries,
@@ -533,8 +511,8 @@ class RacerContext:
                 row = self._empty_storage_row(stripe_bytes, dst)
                 copy_len = int(flat.numel())
                 if copy_len:
-                    row.narrow(0, 0, copy_len).copy_(flat, non_blocking=dst.type == "cpu")
-                    self._sync_tensor_device(flat if dst.type == "cpu" else row)
+                    row.narrow(0, 0, copy_len).copy_(flat, non_blocking=True)
+                    self._sync_tensor_device(row)
                 if copy_len < stripe_bytes:
                     row.narrow(0, copy_len, stripe_bytes - copy_len).zero_()
             self._sync_tensor_device(row)
@@ -607,8 +585,8 @@ class RacerContext:
             for parity_id in range(self.config.m):
                 chunk = parity_chunks_by_id[parity_id]
                 dst_slice = parity_rows[parity_id].narrow(0, offset, chunk_len)
-                dst_slice.copy_(chunk[:chunk_len], non_blocking=dst_slice.device.type == "cpu")
-                self._sync_tensor_device(chunk if dst_slice.device.type == "cpu" else dst_slice)
+                dst_slice.copy_(chunk[:chunk_len], non_blocking=True)
+                self._sync_tensor_device(dst_slice)
             parity_chunk_save_ms += (time.perf_counter() - save_start) * 1000.0
 
         stored_rows.extend(parity_rows)
@@ -666,67 +644,24 @@ class RacerContext:
         parity_row_count = 0
 
         for stripe in self.layout.stripes:
-            if self.config.backend == "cuda":
-                stored_stripe, stripe_profile, stripe_devices = self._store_stripe_chunked_parity(
-                    tensor_map,
-                    stripe,
-                    compute_device,
-                )
-                touched_devices |= stripe_devices
-                max_stripe_bytes = max(max_stripe_bytes, int(stored_stripe.stripe_bytes))
-                stripe_pack_ms += float(stripe_profile["stripe_pack_ms"])
-                ec_encode_ms += float(stripe_profile["ec_encode_ms"])
-                storage_device_copy_ms += float(stripe_profile["storage_device_copy_ms"])
-                data_direct_save_ms += float(stripe_profile.get("data_direct_save_ms", 0.0))
-                parity_chunk_save_ms += float(stripe_profile.get("parity_chunk_save_ms", 0.0))
-                spare_buffer_alloc_ms += float(stripe_profile.get("spare_buffer_alloc_ms", 0.0))
-                data_row_bytes += int(stripe_profile["data_row_bytes"])
-                parity_row_bytes += int(stripe_profile["parity_row_bytes"])
-                data_row_count += int(stripe_profile["data_row_count"])
-                parity_row_count += int(stripe_profile["parity_row_count"])
-                stored_stripes.append(stored_stripe)
-                continue
-
-            pack_start = time.perf_counter()
-            blocks, stripe_bytes, shapes, numels = self._stripe_data_blocks(tensor_map, stripe, compute_device)
-            max_stripe_bytes = max(max_stripe_bytes, int(stripe_bytes))
-            self._sync_compute_device(compute_device)
-            stripe_pack_ms += (time.perf_counter() - pack_start) * 1000.0
-
-            ec_start = time.perf_counter()
-            encoded_rows = self._codec_encode(blocks, self.matrix)
-            self._sync_compute_device(compute_device)
-            ec_encode_ms += (time.perf_counter() - ec_start) * 1000.0
-
-            copy_start = time.perf_counter()
-            stored_rows: list[torch.Tensor] = []
-            for row, encoded in enumerate(encoded_rows):
-                dst = routing.storage_device_for_row(self.config, row)
-                touched_devices.add(dst)
-                stored = encoded.to(dst, non_blocking=True).clone()
-                stored_rows.append(stored)
-                if row < self.config.k:
-                    data_row_bytes += int(stored.numel())
-                    data_row_count += 1
-                else:
-                    parity_row_bytes += int(stored.numel())
-                    parity_row_count += 1
-
-            sync_start = time.perf_counter()
-            synchronize_devices({row.device for row in stored_rows})
-            storage_device_copy_sync_ms += (time.perf_counter() - sync_start) * 1000.0
-            storage_device_copy_ms += (time.perf_counter() - copy_start) * 1000.0
-
-            stored_stripes.append(
-                StoredStripe(
-                    index=stripe.index,
-                    rows=stored_rows,
-                    data_ranks=stripe.data_ranks,
-                    stripe_bytes=stripe_bytes,
-                    shapes=shapes,
-                    numels=numels,
-                )
+            stored_stripe, stripe_profile, stripe_devices = self._store_stripe_chunked_parity(
+                tensor_map,
+                stripe,
+                compute_device,
             )
+            touched_devices |= stripe_devices
+            max_stripe_bytes = max(max_stripe_bytes, int(stored_stripe.stripe_bytes))
+            stripe_pack_ms += float(stripe_profile["stripe_pack_ms"])
+            ec_encode_ms += float(stripe_profile["ec_encode_ms"])
+            storage_device_copy_ms += float(stripe_profile["storage_device_copy_ms"])
+            data_direct_save_ms += float(stripe_profile.get("data_direct_save_ms", 0.0))
+            parity_chunk_save_ms += float(stripe_profile.get("parity_chunk_save_ms", 0.0))
+            spare_buffer_alloc_ms += float(stripe_profile.get("spare_buffer_alloc_ms", 0.0))
+            data_row_bytes += int(stripe_profile["data_row_bytes"])
+            parity_row_bytes += int(stripe_profile["parity_row_bytes"])
+            data_row_count += int(stripe_profile["data_row_count"])
+            parity_row_count += int(stripe_profile["parity_row_count"])
+            stored_stripes.append(stored_stripe)
 
         encode_ms = stripe_pack_ms + ec_encode_ms + storage_device_copy_ms
         checkpoint = StoredCheckpoint(

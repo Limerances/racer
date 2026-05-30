@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from racer.gpt2_synthetic import (
@@ -17,15 +18,17 @@ def test_gpt2_124m_tp4_estimate_is_checkpoint_scale():
     assert 350 < rank_mib < 650
 
 
-def test_gpt2_synthetic_state_has_many_named_tensors_and_roundtrips():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_gpt2_synthetic_state_has_many_named_tensors_and_roundtrips_on_cuda():
     config = profile_config("megatron-test-tp4", include_optimizer=True)
-    state = make_rank_state(0, config, device="cpu", fill=True, max_tensors=24)
+    state = make_rank_state(0, config, device="cuda:0", fill=True, max_tensors=24)
 
     assert len(state) == 24
     assert any(key.startswith("model.decoder.layers.0") for key in state)
     assert any(key.startswith("optimizer.state.") for key in state)
 
-    flat = flatten_state_dict(0, state)
-    recovered = unflatten_state_dict(flat.metadata, flat.payload)
+    flat = flatten_state_dict(0, state, target_device="cuda:0")
+    recovered = unflatten_state_dict(flat.metadata, flat.payload, target_device="cuda:0")
     assert state_dict_byte_equal(state, recovered)
     assert all(isinstance(tensor, torch.Tensor) for tensor in recovered.values())
+    assert all(tensor.device.type == "cuda" for tensor in recovered.values())

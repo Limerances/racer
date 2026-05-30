@@ -1,6 +1,3 @@
-import torch
-
-from racer import cauchy, codec_cpu
 from racer.layout import ElasticLayout, RacerLayout
 
 
@@ -40,26 +37,3 @@ def test_elastic_layout_k4_m2_virtual_zero_slots():
     assert [slot.train_rank for slot in layout.reduction_groups[0]] == [0, 1, 2, 3]
     assert [slot.train_rank for slot in layout.reduction_groups[1]] == [4, 5, None, None]
     assert all(slot.train_rank not in {6, 7} for group in layout.data_groups for slot in group)
-
-
-def test_elastic_layout_virtual_zero_cpu_codec_recovery():
-    layout = ElasticLayout.build([0, 1, 2, 3], [4], k=3, m=1)
-    E = cauchy.generate_systematic_matrix(k=3, m=1)
-    packets = {
-        rank: torch.arange(rank * 17, rank * 17 + 19, dtype=torch.uint8)
-        for rank in layout.train_ranks
-    }
-
-    for group in layout.reduction_groups:
-        chunks = [
-            torch.zeros(0, dtype=torch.uint8) if slot.is_virtual_zero else packets[slot.train_rank]
-            for slot in group
-        ]
-        code = codec_cpu.encode_cpu(chunks, E)
-        for failed_row in range(4):
-            survivors = [row for row in range(4) if row != failed_row]
-            decoded = codec_cpu.decode_cpu([code[row] for row in survivors], survivors, E)
-            for col, slot in enumerate(group):
-                if not slot.is_virtual_zero:
-                    expected = packets[slot.train_rank]
-                    assert torch.equal(decoded[col][: expected.numel()], expected)

@@ -1,7 +1,7 @@
 """Flatten and unflatten supported single-process state_dict payloads.
 
-This module is not a CPU Reed-Solomon codec. It only serializes tensor metadata
-and exposes byte payload tensors so the EC matrix work can happen on GPU.
+This module only serializes tensor metadata and exposes byte payload tensors so
+the EC matrix work can happen on GPU.
 """
 
 from __future__ import annotations
@@ -98,8 +98,9 @@ def flatten_state_dict(
     if pieces:
         payload = torch.cat(pieces).contiguous()
     else:
-        device = target_device if target_device is not None else "cpu"
-        payload = torch.empty(0, dtype=torch.uint8, device=device)
+        if target_device is None:
+            raise ValueError("empty state_dict payloads require an explicit target_device")
+        payload = torch.empty(0, dtype=torch.uint8, device=target_device)
     metadata = RankStateMetadata(
         source_train_rank=source_train_rank,
         tensors=tensor_meta,

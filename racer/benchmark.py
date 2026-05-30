@@ -23,8 +23,7 @@ def bench_store(
         handle = context.store(obj, tag=f"bench_{i}", async_op=not sync)
         if sync:
             handle.wait()
-    if context.config.backend == "cuda":
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
     gib = (bytes_per_iter * iters) / (1024**3)
     return {"seconds": elapsed, "input_gib": gib, "input_gib_per_s": gib / elapsed}

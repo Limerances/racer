@@ -1,20 +1,22 @@
+import pytest
 import torch
 
 import racer
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 5, reason="requires train GPUs 0-3 plus spare GPU 4")
 def test_store_writes_manifest_with_train_owners_and_virtual_slots():
     ctx = racer.init(
         k=3,
         m=1,
         train_ranks=[0, 1, 2, 3],
         spare_ranks=[4],
-        backend="cpu",
-        storage_backend="in_process_cpu",
+        backend="cuda",
+        storage_backend="in_process_cuda",
         async_op=False,
     )
     obj = {
-        rank: torch.arange(rank * 11, rank * 11 + 7, dtype=torch.uint8)
+        rank: torch.arange(rank * 11, rank * 11 + 7, dtype=torch.uint8, device=f"cuda:{rank}")
         for rank in [0, 1, 2, 3]
     }
     racer.store(obj, tag="manifest", context=ctx, async_op=False)
@@ -34,22 +36,23 @@ def test_store_writes_manifest_with_train_owners_and_virtual_slots():
     assert ctx.last_routing_plan is not None
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 5, reason="requires train GPUs 0-3 plus spare GPU 4")
 def test_load_can_rebuild_checkpoint_from_chunk_storage_manifest():
     ctx = racer.init(
         k=3,
         m=1,
         train_ranks=[0, 1, 2, 3],
         spare_ranks=[4],
-        backend="cpu",
-        storage_backend="file_mmap",
+        backend="cuda",
+        storage_backend="in_process_cuda",
         async_op=False,
     )
     obj = {
-        rank: torch.arange(rank * 13, rank * 13 + 9, dtype=torch.uint8)
+        rank: torch.arange(rank * 13, rank * 13 + 9, dtype=torch.uint8, device=f"cuda:{rank}")
         for rank in [0, 1, 2, 3]
     }
     racer.store(obj, tag="persistent", context=ctx, async_op=False)
 
     ctx.storage._items.clear()
     recovered = racer.load(tag="persistent", failed_train_ranks=[0], context=ctx)
-    assert torch.equal(recovered[0], obj[0])
+    assert torch.equal(recovered[0].to(obj[0].device), obj[0])

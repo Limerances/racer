@@ -28,7 +28,7 @@ def main():
     }
     racer.store(obj, tag="verify", context=ctx, async_op=False)
     recovered = racer.load(tag="verify", failed_train_ranks=[0], context=ctx)
-    assert torch.equal(recovered[0].cpu(), obj[0].cpu())
+    assert torch.equal(recovered[0].to(obj[0].device), obj[0])
     print("RACER 5-GPU verification passed; failed rank 0 recovered on", recovered[0].device)
 
 

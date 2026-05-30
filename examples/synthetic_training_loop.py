@@ -90,7 +90,7 @@ def _measure_baseline(mode: str, iter_ms: float, matmul_state, samples: int = 5)
 
 
 def _max_distributed_ms(begin: float) -> float:
-    elapsed_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    elapsed_device = torch.device("cuda", torch.cuda.current_device())
     elapsed = torch.tensor([(time.perf_counter() - begin) * 1000.0], dtype=torch.float64, device=elapsed_device)
     if "RANK" in __import__("os").environ:
         import torch.distributed as dist
@@ -111,7 +111,7 @@ def main() -> None:
     parser.add_argument("--save-interval", type=int, default=1)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--async-store", default="true")
-    parser.add_argument("--routing-strategy", default="spare_compute")
+    parser.add_argument("--routing-strategy", default="spare_compute", choices=["spare_compute"])
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--mode", choices=["sleep", "matmul"], default="sleep")
     parser.add_argument("--matmul-size", type=int, default=2048)
@@ -166,7 +166,6 @@ def main() -> None:
                         config=config,
                         local_packet=local_packet,
                         tag=f"synthetic_{step:06d}",
-                        use_jerasure=True,
                     )
                     store_wall_times.append(_max_distributed_ms(begin_store))
                     last_step = step
@@ -181,10 +180,10 @@ def main() -> None:
                 load_wall_ms = _max_distributed_ms(begin_load)
                 if rank in failed:
                     assert local_packet is not None
-                    correct = torch.equal(recovered.recovered[rank].cpu(), local_packet.cpu())
+                    correct = torch.equal(recovered.recovered[rank], local_packet)
                 import torch.distributed as dist
 
-                correct_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+                correct_device = torch.device("cuda", torch.cuda.current_device())
                 correct_tensor = torch.tensor([1 if correct else 0], dtype=torch.int32, device=correct_device)
                 dist.all_reduce(correct_tensor, op=dist.ReduceOp.MIN)
                 correct = bool(int(correct_tensor.item()))
@@ -298,7 +297,7 @@ def main() -> None:
             recovered = racer.load(tag=last_tag, failed_train_ranks=failed, context=ctx)
             _sync_all()
             load_wall_ms = (time.perf_counter() - begin_load) * 1000.0
-            correct = all(torch.equal(recovered[rank].cpu(), obj[rank].cpu()) for rank in failed)
+            correct = all(torch.equal(recovered[rank].to(obj[rank].device), obj[rank]) for rank in failed)
 
         avg_store_wall_ms = statistics.mean(store_wall_times) if store_wall_times else 0.0
         max_store_wall_ms = max(store_wall_times) if store_wall_times else 0.0

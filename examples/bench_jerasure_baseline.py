@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Jerasure C CPU baseline for GPT2/Megatron-style RACER checkpoints.
 
-This is not RACER's CPU fallback. It explicitly models the original CPU route:
-train-rank tensors are flattened/offloaded to CPU, each train rank performs
-local Jerasure GF region multiply for its contribution, and parity is produced
-by XOR reduction of those contributions.
+This is not RACER's spare-GPU runtime and is not a fallback. It is an explicit
+comparison route: CUDA source tensors are flattened/offloaded to host memory,
+Jerasure performs GF region multiply on CPU buffers, and parity is produced by
+XOR reduction of those contributions.
 """
 
 from __future__ import annotations
@@ -42,17 +42,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--include-optimizer", type=parse_bool, default=True)
     parser.add_argument("--include-master-weights", type=parse_bool, default=True)
-    parser.add_argument("--source-backend", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--m", type=int, default=1)
-    parser.add_argument("--train-ranks", default="1,2,3,4")
-    parser.add_argument("--spare-ranks", default="5")
-    parser.add_argument("--failed-rank", type=int, default=1)
+    parser.add_argument("--train-ranks", default="0,1,2,3")
+    parser.add_argument("--spare-ranks", default="4")
+    parser.add_argument("--failed-rank", type=int, default=0)
     parser.add_argument("--load-ranks", choices=["failed", "all"], default="all")
     parser.add_argument("--iters", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--estimate-only", action="store_true")
     parser.add_argument("--fill", action="store_true")
+    parser.add_argument("--max-tensors", type=int, default=None, help="debug/smoke-test cap on tensors per rank")
     return parser.parse_args()
 
 
@@ -229,8 +229,8 @@ def run_once(args: argparse.Namespace, states: dict[int, dict[str, torch.Tensor]
         m=args.m,
         train_ranks=tuple(train_ranks),
         spare_ranks=tuple(spare_ranks),
-        backend="cuda" if args.source_backend == "cuda" else "cpu",
-        storage_backend="cpu_pinned",
+        backend="cuda",
+        storage_backend="in_process_cuda",
     )
 
     total_store_start = time.perf_counter()
@@ -281,10 +281,9 @@ def main() -> None:
         raise SystemExit("k + m must equal len(train_ranks)")
     if args.failed_rank not in train_ranks:
         raise SystemExit("--failed-rank must be in --train-ranks")
-    if args.source_backend == "cuda":
-        needed = max(train_ranks + spare_ranks) if spare_ranks else max(train_ranks)
-        if not torch.cuda.is_available() or torch.cuda.device_count() <= needed:
-            raise SystemExit("not enough CUDA devices for source-backend=cuda")
+    needed = max(train_ranks + spare_ranks)
+    if not torch.cuda.is_available() or torch.cuda.device_count() <= needed:
+        raise SystemExit("not enough CUDA devices for Jerasure baseline source tensors")
 
     config_obj = profile_config(
         args.profile,
@@ -303,7 +302,7 @@ def main() -> None:
     if args.estimate_only:
         return
 
-    states = make_rank_states(train_ranks, config_obj, backend=args.source_backend, fill=args.fill)
+    states = make_rank_states(train_ranks, config_obj, backend="cuda", fill=args.fill, max_tensors=args.max_tensors)
     sync_devices(train_ranks + spare_ranks)
     actual_bytes = states_nbytes(states)
     print(f"actual_materialized_train_bytes={actual_bytes} ({actual_bytes / 1024**3:.3f} GiB)", flush=True)

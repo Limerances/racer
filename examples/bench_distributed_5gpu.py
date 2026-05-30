@@ -48,7 +48,7 @@ def _sync_all() -> None:
 
 
 def _max_wall_ms(begin: float) -> float:
-    elapsed_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    elapsed_device = torch.device("cuda", torch.cuda.current_device())
     elapsed = torch.tensor([(time.perf_counter() - begin) * 1000.0], dtype=torch.float64, device=elapsed_device)
     if "RANK" in __import__("os").environ:
         import torch.distributed as dist
@@ -68,7 +68,7 @@ def main() -> None:
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--test-nondivisible", action="store_true")
     parser.add_argument("--failures", type=str, default=None)
-    parser.add_argument("--routing-strategy", default="spare_compute")
+    parser.add_argument("--routing-strategy", default="spare_compute", choices=["spare_compute"])
     args = parser.parse_args()
 
     train_ranks = parse_rank_list(args.train_ranks)
@@ -112,7 +112,6 @@ def main() -> None:
                     config=config,
                     local_packet=local_packet,
                     tag=f"bench_{size_bytes}",
-                    use_jerasure=True,
                 )
                 store_wall_ms = _max_wall_ms(begin)
 
@@ -126,8 +125,8 @@ def main() -> None:
                 local_correct = True
                 if args.verify and rank in failures:
                     assert local_packet is not None
-                    local_correct = torch.equal(load_result.recovered[rank].cpu(), local_packet.cpu())
-                correct_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+                    local_correct = torch.equal(load_result.recovered[rank], local_packet)
+                correct_device = torch.device("cuda", torch.cuda.current_device())
                 correct_tensor = torch.tensor([1 if local_correct else 0], dtype=torch.int32, device=correct_device)
                 import torch.distributed as dist
 
@@ -152,7 +151,6 @@ def main() -> None:
                         correct=correct,
                         cost=state.routing_cost,
                     )
-                    row["used_jerasure"] = state.used_jerasure
                     row["comm_backend"] = state.comm_backend
                     row["compute_backend"] = state.compute_backend
                     rows.append(row)
@@ -199,7 +197,7 @@ def main() -> None:
 
             correct = True
             if args.verify:
-                correct = all(torch.equal(recovered[rank].cpu(), obj[rank].cpu()) for rank in failures)
+                correct = all(torch.equal(recovered[rank].to(obj[rank].device), obj[rank]) for rank in failures)
 
             cost = routing_cost(ctx.config, ctx.elastic_layout, ctx.matrix, size_bytes)
             row = make_result_row(
