@@ -12,9 +12,6 @@ def test_store_load_state_dict_payload_cuda_failed_rank():
         m=1,
         train_ranks=[0, 1, 2],
         spare_ranks=[3],
-        backend="cuda",
-        storage_backend="in_process_cuda",
-        async_op=False,
     )
     states = {
         rank: {
@@ -25,7 +22,7 @@ def test_store_load_state_dict_payload_cuda_failed_rank():
         for rank in [0, 1, 2]
     }
 
-    handle = racer.store(states, tag="state", context=ctx, async_op=False)
+    handle = racer.store(states, tag="state", context=ctx)
     assert handle.stats["payload_kind"] == "state_dict"
     recovered = racer.load(tag="state", failed_train_ranks=[0], context=ctx)
 
@@ -42,12 +39,9 @@ def test_state_dict_manifest_metadata_is_json_serializable():
         m=1,
         train_ranks=[0, 1, 2],
         spare_ranks=[3],
-        backend="cuda",
-        storage_backend="in_process_cuda",
-        async_op=False,
     )
     states = {rank: {"x": torch.full((8,), rank, dtype=torch.uint8, device=f"cuda:{rank}")} for rank in [0, 1, 2]}
-    racer.store(states, tag="state_manifest", context=ctx, async_op=False)
+    racer.store(states, tag="state_manifest", context=ctx)
 
     import json
 

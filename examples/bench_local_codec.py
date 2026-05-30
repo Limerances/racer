@@ -18,7 +18,6 @@ def main() -> None:
     parser.add_argument("--m", type=int, default=1)
     parser.add_argument("--train-ranks", default=None, help="Optional comma-separated train ranks")
     parser.add_argument("--spare-ranks", default=None, help="Optional comma-separated spare ranks")
-    parser.add_argument("--routing-strategy", default="spare_compute", choices=["spare_compute"])
     args = parser.parse_args()
 
     if args.sizes:
@@ -36,7 +35,6 @@ def main() -> None:
             k=args.k,
             m=args.m,
             size_bytes=size_bytes,
-            routing_strategy=args.routing_strategy,
             train_ranks=train_ranks,
             spare_ranks=spare_ranks,
         )

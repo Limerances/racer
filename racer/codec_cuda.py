@@ -94,10 +94,42 @@ def _validate_cuda_buffer(tensor: torch.Tensor, name: str) -> torch.Tensor:
     return tensor
 
 
+def _optional_extension_function(*names: str):
+    ext = _extension()
+    if ext is None:
+        return None
+    for name in names:
+        if hasattr(ext, name):
+            return getattr(ext, name)
+    return None
+
+
+@lru_cache(maxsize=1)
+def _apply_matrix_abi() -> str:
+    ext = _extension()
+    fn = _extension_function("apply_matrix_cuda")
+    doc = (getattr(fn, "__doc__", "") or "").lower()
+    if "list" in doc or "vector" in doc:
+        return "vector"
+    if ext is not None and not hasattr(ext, "apply_matrix_cuda_table") and not hasattr(ext, "gf256_matmul"):
+        return "tensor_table"
+    return "tensor_output"
+
+
+def _function_doc_has_arg(fn, arg_name: str) -> bool:
+    return arg_name in (getattr(fn, "__doc__", "") or "")
+
+
 def gf256_mul(src_uint8_cuda: torch.Tensor, coeff: int, *, synchronize: bool = False) -> torch.Tensor:
     src = _validate_cuda_buffer(src_uint8_cuda, "src_uint8_cuda")
     c = int(coeff) & 0xFF
-    out = _extension_function("gf256_mul")(src, c)
+    fn = _optional_extension_function("gf256_mul", "gf256_mul_cuda")
+    if fn is None:
+        out = apply_matrix_cuda([src], [[c]])[0]
+    elif _function_doc_has_arg(fn, "arg2"):
+        out = fn(src, c, gf256.torch_mul_table(src.device))
+    else:
+        out = fn(src, c)
     if synchronize:
         _sync(src.device)
     return out
@@ -117,7 +149,14 @@ def gf256_mul_xor(
     if src.numel() != dst.numel():
         raise ValueError("src and dst must have the same numel")
     c = int(coeff) & 0xFF
-    out = _extension_function("gf256_mul_xor")(src, dst, c)
+    fn = _optional_extension_function("gf256_mul_xor", "gf256_mul_xor_cuda")
+    if fn is not None:
+        if _function_doc_has_arg(fn, "arg3"):
+            out = fn(src, dst, c, gf256.torch_mul_table(src.device))
+        else:
+            out = fn(src, dst, c)
+    else:
+        out = dst.bitwise_xor_(gf256_mul(src, c))
     if synchronize:
         _sync(src.device)
     return out
@@ -135,11 +174,11 @@ def xor_inplace(
         raise ValueError("src and dst must be on the same CUDA device")
     if src.numel() != dst.numel():
         raise ValueError("src and dst must have the same numel")
-    out = _extension_function("xor_inplace")(dst, src)
+    fn = _optional_extension_function("xor_inplace")
+    out = fn(dst, src) if fn is not None else dst.bitwise_xor_(src)
     if synchronize:
         _sync(dst.device)
     return out
-
 
 
 def matmul(data: torch.Tensor, coeff: torch.Tensor, *, synchronize: bool = False) -> torch.Tensor:
@@ -149,10 +188,44 @@ def matmul(data: torch.Tensor, coeff: torch.Tensor, *, synchronize: bool = False
         raise ValueError("CUDA GF matmul expects CUDA tensors")
     data = data.contiguous().view(data.shape[0], -1)
     coeff = coeff.contiguous()
-    out = _extension_function("gf256_matmul")(data, coeff)
+    fn = _optional_extension_function("gf256_matmul")
+    out = fn(data, coeff) if fn is not None else torch.stack(apply_matrix_cuda(list(data), coeff), dim=0)
     if synchronize:
         _sync(data.device)
     return out
+
+
+def _apply_matrix_extension(
+    flat_inputs: Sequence[torch.Tensor],
+    coeff: torch.Tensor,
+    flat_outputs: Sequence[torch.Tensor],
+    *,
+    outputs_provided: bool,
+) -> list[torch.Tensor]:
+    fn = _extension_function("apply_matrix_cuda")
+    abi = _apply_matrix_abi()
+    if abi == "vector":
+        return list(fn(list(flat_inputs), coeff, list(flat_outputs)))
+
+    stacked_inputs = torch.stack(list(flat_inputs), dim=0).contiguous()
+    stacked_outputs = torch.empty(
+        (int(coeff.shape[0]), int(flat_inputs[0].numel())),
+        dtype=torch.uint8,
+        device=flat_inputs[0].device,
+    )
+    if abi == "tensor_table":
+        result_stack = fn(stacked_inputs, coeff, gf256.torch_mul_table(flat_inputs[0].device))
+    else:
+        returned = fn(stacked_inputs, coeff, stacked_outputs)
+        result_stack = returned if isinstance(returned, torch.Tensor) else stacked_outputs
+    if result_stack.dim() != 2 or result_stack.shape[0] != int(coeff.shape[0]):
+        raise RuntimeError("apply_matrix_cuda extension returned an invalid output shape")
+
+    if outputs_provided:
+        for dst, row in zip(flat_outputs, result_stack):
+            dst.copy_(row.contiguous().view(-1), non_blocking=True)
+        return list(flat_outputs)
+    return [result_stack[row].contiguous().view(-1) for row in range(int(result_stack.shape[0]))]
 
 
 def apply_matrix_cuda(
@@ -185,13 +258,14 @@ def apply_matrix_cuda(
                 raise ValueError("all outputs must have the same numel as inputs")
 
     use_table_kernel = os.environ.get("RACER_USE_TABLE_KERNEL") == "1"
-    if outputs is None and use_table_kernel:
+    table_fn = _optional_extension_function("apply_matrix_cuda_table")
+    if outputs is None and use_table_kernel and table_fn is not None:
         stacked = torch.stack(flat_inputs, dim=0).contiguous()
         mul_table = gf256.torch_mul_table(device)
-        table_result = _extension_function("apply_matrix_cuda_table")(stacked, coeff, mul_table)
+        table_result = table_fn(stacked, coeff, mul_table)
         result = [table_result[row].contiguous().view(-1) for row in range(int(table_result.shape[0]))]
     else:
-        result = list(_extension_function("apply_matrix_cuda")(flat_inputs, coeff, flat_outputs))
+        result = _apply_matrix_extension(flat_inputs, coeff, flat_outputs, outputs_provided=outputs is not None)
     if synchronize:
         _sync(device)
     return result

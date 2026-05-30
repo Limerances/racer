@@ -31,7 +31,7 @@ from racer.gpt2_synthetic import (
     states_nbytes,
     tensor_count,
 )
-from racer.layout import RacerLayout
+from racer.layout import ElasticLayout
 from racer.state_dict_codec import flatten_state_dict, unflatten_state_dict
 
 
@@ -83,11 +83,11 @@ def pad_block(payload: torch.Tensor, size: int) -> torch.Tensor:
 
 
 def build_code_rows(
-    layout: RacerLayout,
+    layout: ElasticLayout,
     payloads: dict[int, torch.Tensor],
     parity_matrix: list[list[int]],
 ) -> tuple[list[list[torch.Tensor]], dict[str, float | int]]:
-    code_by_stripe: list[list[torch.Tensor]] = []
+    code_by_reduction_group: list[list[torch.Tensor]] = []
     local_mul_ms = 0.0
     reduction_xor_ms = 0.0
     data_save_ms = 0.0
@@ -95,23 +95,24 @@ def build_code_rows(
     modeled_p2p_bytes = 0
     modeled_p2p_messages = 0
 
-    for stripe in layout.stripes:
-        real_ranks = [rank for rank in stripe.data_ranks if rank is not None]
-        stripe_bytes = max((int(payloads[rank].numel()) for rank in real_ranks), default=1)
+    for reduction_group in layout.reduction_groups:
+        data_ranks = tuple(slot.train_rank for slot in reduction_group)
+        real_ranks = [rank for rank in data_ranks if rank is not None]
+        reduction_group_bytes = max((int(payloads[rank].numel()) for rank in real_ranks), default=1)
         data_rows: list[torch.Tensor] = []
-        for rank in stripe.data_ranks:
+        for rank in data_ranks:
             start = time.perf_counter()
             if rank is None:
-                row = torch.zeros(stripe_bytes, dtype=torch.uint8)
+                row = torch.zeros(reduction_group_bytes, dtype=torch.uint8)
             else:
-                row = pad_block(payloads[rank], stripe_bytes).clone()
+                row = pad_block(payloads[rank], reduction_group_bytes).clone()
             data_save_ms += (time.perf_counter() - start) * 1000.0
             data_rows.append(row)
 
         parity_rows: list[torch.Tensor] = []
         for parity_id in range(len(parity_matrix)):
-            parity = torch.zeros(stripe_bytes, dtype=torch.uint8)
-            for col, rank in enumerate(stripe.data_ranks):
+            parity = torch.zeros(reduction_group_bytes, dtype=torch.uint8)
+            for col, rank in enumerate(data_ranks):
                 if rank is None:
                     continue
                 coeff = int(parity_matrix[parity_id][col]) & 0xFF
@@ -129,9 +130,9 @@ def build_code_rows(
             start = time.perf_counter()
             parity_rows.append(parity.clone())
             parity_save_ms += (time.perf_counter() - start) * 1000.0
-        code_by_stripe.append(data_rows + parity_rows)
+        code_by_reduction_group.append(data_rows + parity_rows)
 
-    return code_by_stripe, {
+    return code_by_reduction_group, {
         "data_save_ms": data_save_ms,
         "local_jerasure_mul_ms": local_mul_ms,
         "modeled_reduction_xor_ms": reduction_xor_ms,
@@ -143,19 +144,20 @@ def build_code_rows(
 
 def decode_needed(
     *,
-    layout: RacerLayout,
-    code_by_stripe: list[list[torch.Tensor]],
+    layout: ElasticLayout,
+    code_by_reduction_group: list[list[torch.Tensor]],
     E: list[list[int]],
     config: RacerConfig,
     rank_metadata: dict[int, object],
     failed_rank: int,
     requested: list[int],
 ) -> tuple[dict[int, dict[str, torch.Tensor]], dict[str, float | int]]:
-    failed_rows = {layout.locate_rank(failed_rank)[1]}
-    by_stripe: dict[int, list[tuple[int, int]]] = {}
+    failed_slot = layout.locate_rank(failed_rank)
+    failed_rows = {failed_slot.data_group_id}
+    by_reduction_group: dict[int, list[tuple[int, int]]] = {}
     for rank in requested:
-        stripe_idx, col = layout.locate_rank(rank)
-        by_stripe.setdefault(stripe_idx, []).append((rank, col))
+        slot = layout.locate_rank(rank)
+        by_reduction_group.setdefault(slot.relative_index, []).append((rank, slot.data_group_id))
 
     storage_read_ms = 0.0
     decode_matrix_ms = 0.0
@@ -165,8 +167,8 @@ def decode_needed(
     unflatten_ms = 0.0
     results: dict[int, dict[str, torch.Tensor]] = {}
 
-    for stripe_idx, rank_cols in by_stripe.items():
-        rows = code_by_stripe[stripe_idx]
+    for reduction_group_idx, rank_cols in by_reduction_group.items():
+        rows = code_by_reduction_group[reduction_group_idx]
         decoded_cache: list[torch.Tensor] | None = None
         for rank, col in rank_cols:
             if rank != failed_rank:
@@ -221,7 +223,7 @@ def decode_needed(
 
 
 def run_once(args: argparse.Namespace, states: dict[int, dict[str, torch.Tensor]], config_obj, train_ranks, spare_ranks) -> dict:
-    layout = RacerLayout.build(train_ranks, args.k)
+    layout = ElasticLayout.build(train_ranks, spare_ranks, args.k, args.m)
     E = cauchy.generate_systematic_matrix(args.k, args.m)
     C = cauchy.generate_cauchy_matrix(args.k, args.m)
     runtime_config = RacerConfig(
@@ -229,8 +231,6 @@ def run_once(args: argparse.Namespace, states: dict[int, dict[str, torch.Tensor]
         m=args.m,
         train_ranks=tuple(train_ranks),
         spare_ranks=tuple(spare_ranks),
-        backend="cuda",
-        storage_backend="in_process_cuda",
     )
 
     total_store_start = time.perf_counter()
@@ -243,14 +243,14 @@ def run_once(args: argparse.Namespace, states: dict[int, dict[str, torch.Tensor]
     payloads = {rank: flat.payload for rank, flat in flat_by_rank.items()}
     rank_metadata = {rank: flat.metadata for rank, flat in flat_by_rank.items()}
 
-    code_by_stripe, store_profile = build_code_rows(layout, payloads, C)
+    code_by_reduction_group, store_profile = build_code_rows(layout, payloads, C)
     store_total_ms = (time.perf_counter() - total_store_start) * 1000.0
 
     requested = [args.failed_rank] if args.load_ranks == "failed" else list(train_ranks)
     total_load_start = time.perf_counter()
     _, load_profile = decode_needed(
         layout=layout,
-        code_by_stripe=code_by_stripe,
+        code_by_reduction_group=code_by_reduction_group,
         E=E,
         config=runtime_config,
         rank_metadata=rank_metadata,
@@ -302,7 +302,7 @@ def main() -> None:
     if args.estimate_only:
         return
 
-    states = make_rank_states(train_ranks, config_obj, backend="cuda", fill=args.fill, max_tensors=args.max_tensors)
+    states = make_rank_states(train_ranks, config_obj, fill=args.fill, max_tensors=args.max_tensors)
     sync_devices(train_ranks + spare_ranks)
     actual_bytes = states_nbytes(states)
     print(f"actual_materialized_train_bytes={actual_bytes} ({actual_bytes / 1024**3:.3f} GiB)", flush=True)

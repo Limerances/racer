@@ -23,7 +23,6 @@ CSV_COLUMNS = [
     "m",
     "q",
     "virtual_slots",
-    "routing_strategy",
     "size_bytes",
     "encode_ms",
     "p2p_ms",
@@ -36,8 +35,6 @@ CSV_COLUMNS = [
     "compute_bytes_on_train_ranks",
     "compute_bytes_on_accelerators",
     "skipped_virtual_zero_bytes",
-    "comm_backend",
-    "compute_backend",
     "correct",
 ]
 
@@ -110,13 +107,13 @@ def validate_config(k: int, m: int, train_ranks: list[int]) -> None:
         raise SystemExit(INVALID_CONFIG_MESSAGE)
 
 
-def maybe_init_distributed(backend: str | None = None) -> tuple[int, int, int]:
+def maybe_init_distributed() -> tuple[int, int, int]:
     if "RANK" not in os.environ:
         return 0, 1, 0
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend or "nccl")
+        dist.init_process_group(backend="nccl")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
@@ -179,15 +176,12 @@ def benchmark_codec(
     k: int,
     m: int,
     size_bytes: int,
-    routing_strategy: str,
     train_ranks: list[int] | None = None,
     spare_ranks: list[int] | None = None,
 ) -> dict:
     train_ranks = train_ranks if train_ranks is not None else list(range(k + m))
     spare_ranks = spare_ranks if spare_ranks is not None else [k + m]
     validate_config(k, m, train_ranks)
-    if routing_strategy != "spare_compute":
-        raise ValueError("benchmark_codec supports only routing_strategy='spare_compute'")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     layout = ElasticLayout.build(train_ranks, spare_ranks, k, m)
@@ -210,7 +204,6 @@ def benchmark_codec(
         train_ranks=train_ranks,
         spare_ranks=spare_ranks,
         layout=layout,
-        routing_strategy=routing_strategy,
         size_bytes=size_bytes,
         encode_ms=encode_ms,
         p2p_ms=0.0,
@@ -229,7 +222,6 @@ def make_result_row(
     train_ranks: list[int],
     spare_ranks: list[int],
     layout: ElasticLayout,
-    routing_strategy: str,
     size_bytes: int,
     encode_ms: float,
     p2p_ms: float,
@@ -239,8 +231,6 @@ def make_result_row(
     load_wall_ms: float,
     correct: bool,
     cost=None,
-    comm_backend: str = "",
-    compute_backend: str = "cuda",
 ) -> dict:
     return {
         "timestamp": utc_timestamp(),
@@ -250,7 +240,6 @@ def make_result_row(
         "m": m,
         "q": layout.q,
         "virtual_slots": layout.num_virtual_zero,
-        "routing_strategy": routing_strategy,
         "size_bytes": size_bytes,
         "encode_ms": f"{encode_ms:.3f}",
         "p2p_ms": f"{p2p_ms:.3f}",
@@ -263,8 +252,6 @@ def make_result_row(
         "compute_bytes_on_train_ranks": 0 if cost is None else cost.compute_bytes_on_train_ranks,
         "compute_bytes_on_accelerators": 0 if cost is None else cost.compute_bytes_on_accelerators,
         "skipped_virtual_zero_bytes": 0 if cost is None else cost.skipped_virtual_zero_bytes,
-        "comm_backend": comm_backend,
-        "compute_backend": compute_backend,
         "correct": bool(correct),
     }
 

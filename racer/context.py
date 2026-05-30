@@ -1,7 +1,7 @@
 """RACER runtime context implementing store/load over synthetic packets.
 
 The context owns the immutable RACER configuration, the train-rank-only E
-matrix, elastic layout metadata, and configured storage backend. Phase 1 keeps
+matrix and elastic data/reduction group metadata. Phase 1 keeps
 the API local to one process while preserving the intended distributed
 semantics in manifests and routing plans.
 
@@ -21,9 +21,9 @@ import torch
 
 from . import cauchy, codec_cuda, gf256, routing
 from .config import RacerConfig
-from .layout import ElasticLayout, RacerLayout, Stripe
+from .layout import ElasticLayout, ElasticSlot
 from .state_dict_codec import RankStateMetadata, TensorMetadata, flatten_state_dict, unflatten_state_dict
-from .storage import InProcessStorage, StoredCheckpoint, StoredStripe, create_storage_backend
+from .storage import InProcessCudaStorage, InProcessStorage, StoredCheckpoint, StoredReductionGroup
 from .utils import normalize_rank_set, require_uint8_tensor_map, synchronize_devices
 
 
@@ -59,24 +59,22 @@ class RacerContext:
             config.w,
             optimize=config.optimize_cauchy,
         )
-        self.layout = RacerLayout.build(config.train_ranks, config.k)
         self.elastic_layout = ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m)
         self.storage = InProcessStorage()
-        self.chunk_storage = create_storage_backend(config.storage_backend)
+        self.chunk_storage = InProcessCudaStorage()
         self.train_rank_to_row = {rank: row for row, rank in enumerate(config.train_ranks)}
         self.last_routing_plan: routing.RoutingPlan | None = None
         self.last_store_profile: dict[str, Any] = {}
         self.last_load_profile: dict[str, Any] = {}
         self._counter = 0
 
-        if config.backend == "cuda":
-            if not torch.cuda.is_available():
-                raise RuntimeError("backend='cuda' requested but torch.cuda is unavailable")
-            max_rank = max(config.train_ranks + config.spare_ranks) if config.spare_ranks else max(config.train_ranks)
-            if torch.cuda.device_count() <= max_rank:
-                raise RuntimeError(
-                    f"CUDA device_count={torch.cuda.device_count()} is insufficient for rank {max_rank}"
-                )
+        if not torch.cuda.is_available():
+            raise RuntimeError("RACER requires CUDA")
+        max_rank = max(config.train_ranks + config.spare_ranks)
+        if torch.cuda.device_count() <= max_rank:
+            raise RuntimeError(
+                f"CUDA device_count={torch.cuda.device_count()} is insufficient for rank {max_rank}"
+            )
 
     @property
     def n_train(self) -> int:
@@ -229,9 +227,9 @@ class RacerContext:
             raise ValueError("RACER storage rows must be allocated on CUDA devices")
         return torch.empty(int(numel), dtype=torch.uint8, device=device)
 
-    def _host_buffer_owner_rank(self, stripe: Stripe, row: int) -> int | None:
+    def _host_buffer_owner_rank(self, data_ranks: tuple[int | None, ...], row: int) -> int | None:
         if row < self.config.k:
-            rank = stripe.data_ranks[row]
+            rank = data_ranks[row]
             return None if rank is None else int(rank)
         if self.config.spare_ranks:
             parity_id = (int(row) - self.config.k) % len(self.config.spare_ranks)
@@ -285,13 +283,13 @@ class RacerContext:
         total = int(torch.sum(sample, dtype=torch.int64).item()) & 0xFFFFFFFFFFFFFFFF
         return f"sample64-v1:{numel}:{sample_count}:{total:016x}:{first:02x}:{last:02x}"
 
-    def _chunk_id(self, stripe_index: int, row: int) -> str:
-        return f"stripe_{stripe_index:06d}_row_{row:03d}"
+    def _chunk_id(self, reduction_group_index: int, row: int) -> str:
+        return f"rg_{reduction_group_index:06d}_row_{row:03d}"
 
     def _build_manifest(
         self,
         tag: str,
-        stored_stripes: list[StoredStripe],
+        stored_reduction_groups: list[StoredReductionGroup],
         plan: routing.RoutingPlan,
     ) -> dict:
         chunks = []
@@ -310,8 +308,8 @@ class RacerContext:
                         }
                     )
 
-        for stripe in stored_stripes:
-            group = self.elastic_layout.reduction_groups[stripe.index]
+        for reduction_group in stored_reduction_groups:
+            group = self.elastic_layout.reduction_groups[reduction_group.index]
             slot_entries = [
                 {
                     "slot_id": slot.slot_id,
@@ -319,18 +317,18 @@ class RacerContext:
                     "relative_index": slot.relative_index,
                     "train_rank": slot.train_rank,
                     "is_virtual_zero": slot.is_virtual_zero,
-                    "valid_nbytes": stripe.numels.get(slot.train_rank, 0) if slot.train_rank is not None else 0,
-                    "shape": list(stripe.shapes.get(slot.train_rank, ())) if slot.train_rank is not None else [],
+                    "valid_nbytes": reduction_group.numels.get(slot.train_rank, 0) if slot.train_rank is not None else 0,
+                    "shape": list(reduction_group.shapes.get(slot.train_rank, ())) if slot.train_rank is not None else [],
                 }
                 for slot in group
             ]
-            for row, tensor in enumerate(stripe.rows):
+            for row, tensor in enumerate(reduction_group.rows):
                 owner = int(self.config.train_ranks[row])
-                chunk_id = self._chunk_id(stripe.index, row)
-                host_owner = self._host_buffer_owner_rank(stripe, row)
+                chunk_id = self._chunk_id(reduction_group.index, row)
+                host_owner = self._host_buffer_owner_rank(reduction_group.data_ranks, row)
                 chunk = {
                     "chunk_id": chunk_id,
-                    "stripe_index": stripe.index,
+                    "reduction_group_index": reduction_group.index,
                     "row": row,
                     "chunk_role": "data" if row < self.config.k else "parity",
                     "parity_id": None if row < self.config.k else row - self.config.k,
@@ -355,12 +353,9 @@ class RacerContext:
             "E": [row[:] for row in self.matrix],
             "train_ranks": list(self.config.train_ranks),
             "spare_ranks": list(self.config.spare_ranks),
-            "storage_backend": self.config.storage_backend,
-            "routing_strategy": self.config.routing_strategy,
             "routing_plan": asdict(plan),
             "routing_cost": asdict(plan.cost),
             "elastic_layout": {
-                "pad_mode": self.elastic_layout.pad_mode,
                 "q": self.elastic_layout.q,
                 "virtual_W": self.elastic_layout.virtual_W,
                 "num_virtual_zero": self.elastic_layout.num_virtual_zero,
@@ -371,7 +366,7 @@ class RacerContext:
             "checksum": hashlib.sha256("".join(chunk["checksum"] for chunk in chunks).encode()).hexdigest(),
         }
 
-    def _write_chunks_and_manifest(self, tag: str, stored_stripes: list[StoredStripe], manifest: dict) -> dict[str, Any]:
+    def _write_chunks_and_manifest(self, tag: str, stored_reduction_groups: list[StoredReductionGroup], manifest: dict) -> dict[str, Any]:
         by_id = {chunk["chunk_id"]: chunk for chunk in manifest["chunks"]}
         metrics: dict[str, Any] = {
             "data_chunk_write_ms": 0.0,
@@ -382,9 +377,9 @@ class RacerContext:
             "data_chunk_count": 0,
             "parity_chunk_count": 0,
         }
-        for stripe in stored_stripes:
-            for row, tensor in enumerate(stripe.rows):
-                chunk_id = self._chunk_id(stripe.index, row)
+        for reduction_group in stored_reduction_groups:
+            for row, tensor in enumerate(reduction_group.rows):
+                chunk_id = self._chunk_id(reduction_group.index, row)
                 role = "data" if row < self.config.k else "parity"
                 start = time.perf_counter()
                 self.chunk_storage.put(tag, chunk_id, tensor, by_id[chunk_id])
@@ -401,12 +396,12 @@ class RacerContext:
         if tag is None:
             raise KeyError("tag is required when loading from chunk storage")
         manifest = self.chunk_storage.get_manifest(tag)
-        stripes: list[StoredStripe] = []
-        chunks_by_stripe: dict[int, list[dict]] = {}
+        reduction_groups: list[StoredReductionGroup] = []
+        chunks_by_reduction_group: dict[int, list[dict]] = {}
         for chunk in manifest["chunks"]:
-            chunks_by_stripe.setdefault(int(chunk["stripe_index"]), []).append(chunk)
-        for stripe_index in sorted(chunks_by_stripe):
-            chunk_entries = sorted(chunks_by_stripe[stripe_index], key=lambda item: int(item["row"]))
+            chunks_by_reduction_group.setdefault(int(chunk["reduction_group_index"]), []).append(chunk)
+        for reduction_group_index in sorted(chunks_by_reduction_group):
+            chunk_entries = sorted(chunks_by_reduction_group[reduction_group_index], key=lambda item: int(item["row"]))
             rows = [self.chunk_storage.get(tag, entry["chunk_id"]) for entry in chunk_entries]
             slots = chunk_entries[0]["slots"]
             data_ranks = tuple(slot["train_rank"] for slot in slots)
@@ -418,71 +413,44 @@ class RacerContext:
                     shape = tuple(int(v) for v in slot.get("shape", []))
                     shapes[int(rank)] = shape if shape else (int(slot["valid_nbytes"]),)
                     numels[int(rank)] = int(slot["valid_nbytes"])
-            stripes.append(
-                StoredStripe(
-                    index=stripe_index,
+            reduction_groups.append(
+                StoredReductionGroup(
+                    index=reduction_group_index,
                     rows=rows,
                     data_ranks=data_ranks,
-                    stripe_bytes=max((int(row.numel()) for row in rows), default=0),
+                    reduction_group_bytes=max((int(row.numel()) for row in rows), default=0),
                     shapes=shapes,
                     numels=numels,
                 )
             )
-        return StoredCheckpoint(tag=tag, stripes=stripes, matrix=manifest["E"], metadata=manifest)
-
-    def _stripe_data_blocks(
-        self,
-        obj: Mapping[int, torch.Tensor],
-        stripe: Stripe,
-        compute_device: torch.device,
-    ) -> tuple[list[torch.Tensor], int, dict[int, tuple[int, ...]], dict[int, int]]:
-        shapes: dict[int, tuple[int, ...]] = {}
-        numels: dict[int, int] = {}
-        stripe_bytes = 0
-        for rank in stripe.data_ranks:
-            if rank is None:
-                continue
-            tensor = obj[rank]
-            shapes[rank] = tuple(tensor.shape)
-            numels[rank] = tensor.numel()
-            stripe_bytes = max(stripe_bytes, tensor.numel())
-        if stripe_bytes == 0:
-            stripe_bytes = 1
-
-        blocks: list[torch.Tensor] = []
-        for rank in stripe.data_ranks:
-            block = torch.zeros(stripe_bytes, dtype=torch.uint8, device=compute_device)
-            if rank is not None:
-                flat = obj[rank].contiguous().view(-1).to(compute_device, non_blocking=True)
-                block[: flat.numel()].copy_(flat, non_blocking=True)
-            blocks.append(block)
-        return blocks, stripe_bytes, shapes, numels
-
+        return StoredCheckpoint(tag=tag, reduction_groups=reduction_groups, matrix=manifest["E"], metadata=manifest)
 
     def _chunk_ranges(self, total: int) -> list[tuple[int, int]]:
         chunk_size = max(1, int(self.config.buffer_size))
         return [(start, min(start + chunk_size, total)) for start in range(0, int(total), chunk_size)]
 
-    def _store_stripe_chunked_parity(
+    def _store_reduction_group_chunked_parity(
         self,
         obj: Mapping[int, torch.Tensor],
-        stripe: Stripe,
+        reduction_group_index: int,
+        reduction_group: tuple[ElasticSlot, ...],
         compute_device: torch.device,
-    ) -> tuple[StoredStripe, dict[str, Any], set[torch.device]]:
+    ) -> tuple[StoredReductionGroup, dict[str, Any], set[torch.device]]:
+        data_ranks = tuple(slot.train_rank for slot in reduction_group)
         shapes: dict[int, tuple[int, ...]] = {}
         numels: dict[int, int] = {}
-        stripe_bytes = 0
+        reduction_group_bytes = 0
         flats: dict[int, torch.Tensor] = {}
-        for rank in stripe.data_ranks:
+        for rank in data_ranks:
             if rank is None:
                 continue
             flat = obj[rank].contiguous().view(-1)
             flats[int(rank)] = flat
             shapes[int(rank)] = tuple(obj[rank].shape)
             numels[int(rank)] = int(flat.numel())
-            stripe_bytes = max(stripe_bytes, int(flat.numel()))
-        if stripe_bytes == 0:
-            stripe_bytes = 1
+            reduction_group_bytes = max(reduction_group_bytes, int(flat.numel()))
+        if reduction_group_bytes == 0:
+            reduction_group_bytes = 1
 
         parity_devices: dict[torch.device, list[int]] = {}
         for parity_id in range(self.config.m):
@@ -493,14 +461,14 @@ class RacerContext:
         data_direct_save_ms = 0.0
         parity_chunk_save_ms = 0.0
         spare_buffer_alloc_ms = 0.0
-        stripe_pack_ms = 0.0
+        reduction_group_pack_ms = 0.0
         ec_encode_ms = 0.0
         data_row_bytes = 0
         parity_row_bytes = 0
         data_row_count = 0
         parity_row_count = 0
 
-        for col, rank in enumerate(stripe.data_ranks):
+        for col, rank in enumerate(data_ranks):
             dst = routing.storage_device_for_row(self.config, col)
             touched_devices.add(dst)
             start = time.perf_counter()
@@ -508,13 +476,13 @@ class RacerContext:
                 row = torch.empty(0, dtype=torch.uint8, device=dst)
             else:
                 flat = flats[int(rank)]
-                row = self._empty_storage_row(stripe_bytes, dst)
+                row = self._empty_storage_row(reduction_group_bytes, dst)
                 copy_len = int(flat.numel())
                 if copy_len:
                     row.narrow(0, 0, copy_len).copy_(flat, non_blocking=True)
                     self._sync_tensor_device(row)
-                if copy_len < stripe_bytes:
-                    row.narrow(0, copy_len, stripe_bytes - copy_len).zero_()
+                if copy_len < reduction_group_bytes:
+                    row.narrow(0, copy_len, reduction_group_bytes - copy_len).zero_()
             self._sync_tensor_device(row)
             data_direct_save_ms += (time.perf_counter() - start) * 1000.0
             data_row_bytes += int(row.numel())
@@ -526,13 +494,13 @@ class RacerContext:
             row_index = self.config.k + parity_id
             dst = routing.storage_device_for_row(self.config, row_index)
             touched_devices.add(dst)
-            parity = self._empty_storage_row(stripe_bytes, dst)
+            parity = self._empty_storage_row(reduction_group_bytes, dst)
             parity_rows.append(parity)
             parity_row_bytes += int(parity.numel())
             parity_row_count += 1
 
         spare_alloc_start = time.perf_counter()
-        staging_len = min(int(self.config.buffer_size), int(stripe_bytes))
+        staging_len = min(int(self.config.buffer_size), int(reduction_group_bytes))
         staging: dict[torch.device, dict[str, Any]] = {}
         for device, parity_ids in parity_devices.items():
             inputs = [torch.empty(staging_len, dtype=torch.uint8, device=device) for _ in range(self.config.k)]
@@ -542,13 +510,13 @@ class RacerContext:
         spare_buffer_alloc_ms += (time.perf_counter() - spare_alloc_start) * 1000.0
 
         parity_matrix = [row[:] for row in self.matrix[self.config.k :]]
-        for offset, end in self._chunk_ranges(stripe_bytes):
+        for offset, end in self._chunk_ranges(reduction_group_bytes):
             chunk_len = int(end - offset)
             copied_devices: set[torch.device] = set()
             pack_start = time.perf_counter()
             for device, buffers in staging.items():
                 input_slices = [buf.narrow(0, 0, chunk_len) for buf in buffers["inputs"]]
-                for col, rank in enumerate(stripe.data_ranks):
+                for col, rank in enumerate(data_ranks):
                     block = input_slices[col]
                     if rank is None:
                         block.zero_()
@@ -566,7 +534,7 @@ class RacerContext:
                         block.zero_()
                 copied_devices.add(device)
             synchronize_devices(copied_devices)
-            stripe_pack_ms += (time.perf_counter() - pack_start) * 1000.0
+            reduction_group_pack_ms += (time.perf_counter() - pack_start) * 1000.0
 
             ec_start = time.perf_counter()
             parity_chunks_by_id: dict[int, torch.Tensor] = {}
@@ -591,16 +559,16 @@ class RacerContext:
 
         stored_rows.extend(parity_rows)
         return (
-            StoredStripe(
-                index=stripe.index,
+            StoredReductionGroup(
+                index=reduction_group_index,
                 rows=stored_rows,
-                data_ranks=stripe.data_ranks,
-                stripe_bytes=stripe_bytes,
+                data_ranks=data_ranks,
+                reduction_group_bytes=reduction_group_bytes,
                 shapes=shapes,
                 numels=numels,
             ),
             {
-                "stripe_pack_ms": stripe_pack_ms,
+                "reduction_group_pack_ms": reduction_group_pack_ms,
                 "ec_encode_ms": ec_encode_ms,
                 "storage_device_copy_ms": data_direct_save_ms + parity_chunk_save_ms,
                 "data_direct_save_ms": data_direct_save_ms,
@@ -618,20 +586,20 @@ class RacerContext:
         self,
         obj: object,
         tag: str | None = None,
-        async_op: bool | None = None,
+        async_op: bool = False,
     ) -> StoreHandle:
         total_start = time.perf_counter()
         prepare_start = time.perf_counter()
         tensor_map, payload_kind, rank_state_metadata = self._prepare_obj(obj)
         flatten_ms = (time.perf_counter() - prepare_start) * 1000.0
         actual_tag = tag if tag is not None else self._next_tag()
-        actual_async = self.config.async_op if async_op is None else bool(async_op)
+        actual_async = bool(async_op)
         compute_device = routing.compute_device(self.config)
 
-        stored_stripes: list[StoredStripe] = []
+        stored_reduction_groups: list[StoredReductionGroup] = []
         touched_devices = {compute_device}
-        max_stripe_bytes = 0
-        stripe_pack_ms = 0.0
+        max_reduction_group_bytes = 0
+        reduction_group_pack_ms = 0.0
         ec_encode_ms = 0.0
         storage_device_copy_ms = 0.0
         storage_device_copy_sync_ms = 0.0
@@ -643,37 +611,38 @@ class RacerContext:
         data_row_count = 0
         parity_row_count = 0
 
-        for stripe in self.layout.stripes:
-            stored_stripe, stripe_profile, stripe_devices = self._store_stripe_chunked_parity(
+        for reduction_group_index, reduction_group in enumerate(self.elastic_layout.reduction_groups):
+            stored_reduction_group, reduction_group_profile, reduction_group_devices = self._store_reduction_group_chunked_parity(
                 tensor_map,
-                stripe,
+                reduction_group_index,
+                reduction_group,
                 compute_device,
             )
-            touched_devices |= stripe_devices
-            max_stripe_bytes = max(max_stripe_bytes, int(stored_stripe.stripe_bytes))
-            stripe_pack_ms += float(stripe_profile["stripe_pack_ms"])
-            ec_encode_ms += float(stripe_profile["ec_encode_ms"])
-            storage_device_copy_ms += float(stripe_profile["storage_device_copy_ms"])
-            data_direct_save_ms += float(stripe_profile.get("data_direct_save_ms", 0.0))
-            parity_chunk_save_ms += float(stripe_profile.get("parity_chunk_save_ms", 0.0))
-            spare_buffer_alloc_ms += float(stripe_profile.get("spare_buffer_alloc_ms", 0.0))
-            data_row_bytes += int(stripe_profile["data_row_bytes"])
-            parity_row_bytes += int(stripe_profile["parity_row_bytes"])
-            data_row_count += int(stripe_profile["data_row_count"])
-            parity_row_count += int(stripe_profile["parity_row_count"])
-            stored_stripes.append(stored_stripe)
+            touched_devices |= reduction_group_devices
+            max_reduction_group_bytes = max(max_reduction_group_bytes, int(stored_reduction_group.reduction_group_bytes))
+            reduction_group_pack_ms += float(reduction_group_profile["reduction_group_pack_ms"])
+            ec_encode_ms += float(reduction_group_profile["ec_encode_ms"])
+            storage_device_copy_ms += float(reduction_group_profile["storage_device_copy_ms"])
+            data_direct_save_ms += float(reduction_group_profile.get("data_direct_save_ms", 0.0))
+            parity_chunk_save_ms += float(reduction_group_profile.get("parity_chunk_save_ms", 0.0))
+            spare_buffer_alloc_ms += float(reduction_group_profile.get("spare_buffer_alloc_ms", 0.0))
+            data_row_bytes += int(reduction_group_profile["data_row_bytes"])
+            parity_row_bytes += int(reduction_group_profile["parity_row_bytes"])
+            data_row_count += int(reduction_group_profile["data_row_count"])
+            parity_row_count += int(reduction_group_profile["parity_row_count"])
+            stored_reduction_groups.append(stored_reduction_group)
 
-        encode_ms = stripe_pack_ms + ec_encode_ms + storage_device_copy_ms
+        encode_ms = reduction_group_pack_ms + ec_encode_ms + storage_device_copy_ms
         checkpoint = StoredCheckpoint(
             tag=actual_tag,
-            stripes=stored_stripes,
+            reduction_groups=stored_reduction_groups,
             matrix=[row[:] for row in self.matrix],
             metadata={},
         )
         metadata_start = time.perf_counter()
-        plan = routing.make_planner(self.config).plan(self.elastic_layout, self.matrix, max_stripe_bytes)
+        plan = routing.make_planner(self.config).plan(self.elastic_layout, self.matrix, max_reduction_group_bytes)
         self.last_routing_plan = plan
-        manifest = self._build_manifest(actual_tag, stored_stripes, plan)
+        manifest = self._build_manifest(actual_tag, stored_reduction_groups, plan)
         manifest["payload_kind"] = payload_kind
         manifest["rank_state_metadata"] = {
             str(rank): self._metadata_to_manifest(metadata)
@@ -682,7 +651,7 @@ class RacerContext:
         checkpoint.metadata = manifest
         metadata_ms = (time.perf_counter() - metadata_start) * 1000.0
         storage_write_start = time.perf_counter()
-        chunk_write_profile = self._write_chunks_and_manifest(actual_tag, stored_stripes, manifest)
+        chunk_write_profile = self._write_chunks_and_manifest(actual_tag, stored_reduction_groups, manifest)
         storage_write_ms = (time.perf_counter() - storage_write_start) * 1000.0
         checkpoint_index_start = time.perf_counter()
         self.storage.put(checkpoint)
@@ -693,7 +662,7 @@ class RacerContext:
             "tag": actual_tag,
             "payload_kind": payload_kind,
             "flatten_ms": flatten_ms,
-            "stripe_pack_ms": stripe_pack_ms,
+            "reduction_group_pack_ms": reduction_group_pack_ms,
             "ec_encode_ms": ec_encode_ms,
             "storage_device_copy_ms": storage_device_copy_ms,
             "storage_device_copy_sync_ms": storage_device_copy_sync_ms,
@@ -751,10 +720,10 @@ class RacerContext:
             )
         return rows
 
-    def _decode_stripe(
+    def _decode_reduction_group(
         self,
         checkpoint: StoredCheckpoint,
-        stripe: StoredStripe,
+        reduction_group: StoredReductionGroup,
         survivor_rows: list[int],
         compute_device: torch.device,
         needed_cols: Sequence[int],
@@ -770,23 +739,23 @@ class RacerContext:
         coeff_rows = [inverse[col] for col in cols]
         decode_matrix_ms = (time.perf_counter() - matrix_start) * 1000.0
 
-        stripe_bytes = int(stripe.stripe_bytes)
+        reduction_group_bytes = int(reduction_group.reduction_group_bytes)
         decoded_by_col = {
-            col: torch.empty(stripe_bytes, dtype=torch.uint8, device=compute_device)
+            col: torch.empty(reduction_group_bytes, dtype=torch.uint8, device=compute_device)
             for col in cols
         }
         survivor_to_compute_ms = 0.0
         ec_decode_ms = 0.0
 
-        for offset, end in self._chunk_ranges(stripe_bytes):
+        for offset, end in self._chunk_ranges(reduction_group_bytes):
             chunk_len = int(end - offset)
             survivor_copy_start = time.perf_counter()
             blocks = []
             for row in chosen:
-                if row < self.config.k and stripe.data_ranks[row] is None:
+                if row < self.config.k and reduction_group.data_ranks[row] is None:
                     block = torch.zeros(chunk_len, dtype=torch.uint8, device=compute_device)
                 else:
-                    block = stripe.rows[row].contiguous().view(-1).narrow(0, offset, chunk_len).to(
+                    block = reduction_group.rows[row].contiguous().view(-1).narrow(0, offset, chunk_len).to(
                         compute_device,
                         non_blocking=True,
                     )
@@ -834,10 +803,10 @@ class RacerContext:
         unknown_failed = failed_ranks - set(self.config.train_ranks)
         if unknown_failed:
             raise ValueError(f"failed_train_ranks contains non-train ranks: {sorted(unknown_failed)}")
-        failed_cols_by_stripe: dict[int, set[int]] = {}
+        failed_cols_by_reduction_group: dict[int, set[int]] = {}
         for rank in failed_ranks:
-            stripe_idx, col = self.layout.locate_rank(int(rank))
-            failed_cols_by_stripe.setdefault(stripe_idx, set()).add(col)
+            slot = self.elastic_layout.locate_rank(int(rank))
+            failed_cols_by_reduction_group.setdefault(slot.relative_index, set()).add(slot.data_group_id)
 
         if requested_train_ranks is not None:
             requested = [int(rank) for rank in requested_train_ranks]
@@ -853,10 +822,10 @@ class RacerContext:
         compute_device = routing.compute_device(self.config)
         raw_results: dict[int, torch.Tensor] = {}
 
-        ranks_by_stripe: dict[int, list[tuple[int, int]]] = {}
+        ranks_by_reduction_group: dict[int, list[tuple[int, int]]] = {}
         for rank in requested:
-            stripe_idx, col = self.layout.locate_rank(int(rank))
-            ranks_by_stripe.setdefault(stripe_idx, []).append((int(rank), col))
+            slot = self.elastic_layout.locate_rank(int(rank))
+            ranks_by_reduction_group.setdefault(slot.relative_index, []).append((int(rank), slot.data_group_id))
 
         survivor_to_compute_ms = 0.0
         decode_matrix_ms = 0.0
@@ -865,22 +834,22 @@ class RacerContext:
         raw_payload_to_output_device_sync_ms = 0.0
 
         decode_start = time.perf_counter()
-        for stripe_idx, rank_cols in ranks_by_stripe.items():
-            stripe = checkpoint.stripes[stripe_idx]
-            stripe_failed_cols = failed_cols_by_stripe.get(stripe_idx, set())
-            survivors = self._normalize_survivor_rows(survivor_rows, stripe_failed_cols)
+        for reduction_group_idx, rank_cols in ranks_by_reduction_group.items():
+            reduction_group = checkpoint.reduction_groups[reduction_group_idx]
+            reduction_group_failed_cols = failed_cols_by_reduction_group.get(reduction_group_idx, set())
+            survivors = self._normalize_survivor_rows(survivor_rows, reduction_group_failed_cols)
             decode_cols = sorted(
                 {
                     col
                     for _, col in rank_cols
-                    if not (survivor_rows is None and col not in stripe_failed_cols)
+                    if not (survivor_rows is None and col not in reduction_group_failed_cols)
                 }
             )
             decoded_by_col: dict[int, torch.Tensor] = {}
             if decode_cols:
-                decoded_by_col, decode_profile = self._decode_stripe(
+                decoded_by_col, decode_profile = self._decode_reduction_group(
                     checkpoint,
-                    stripe,
+                    reduction_group,
                     survivors,
                     compute_device,
                     decode_cols,
@@ -890,17 +859,17 @@ class RacerContext:
                 ec_decode_ms += decode_profile["ec_decode_ms"]
 
             for rank, col in rank_cols:
-                direct_allowed = survivor_rows is None and col not in stripe_failed_cols
+                direct_allowed = survivor_rows is None and col not in reduction_group_failed_cols
                 if direct_allowed:
-                    source = stripe.rows[col].contiguous().view(-1)
+                    source = reduction_group.rows[col].contiguous().view(-1)
                     source_is_direct = True
                 else:
                     source = decoded_by_col[col].contiguous().view(-1)
                     source_is_direct = False
 
                 copy_start = time.perf_counter()
-                numel = stripe.numels[rank]
-                shape = stripe.shapes[rank]
+                numel = reduction_group.numels[rank]
+                shape = reduction_group.shapes[rank]
                 failed = rank in failed_ranks
                 dst = routing.output_device_for_rank(self.config, rank, failed)
                 if source.device.type == "cuda":

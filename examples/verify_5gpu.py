@@ -17,16 +17,12 @@ def main():
         m=1,
         train_ranks=[0, 1, 2, 3],
         spare_ranks=[4],
-        backend="cuda",
-        storage_backend="in_process_cuda",
-        async_op=False,
-        routing_strategy="spare_compute",
     )
     obj = {
         rank: torch.randint(0, 256, (8 * 1024 * 1024,), dtype=torch.uint8, device=f"cuda:{rank}")
         for rank in [0, 1, 2, 3]
     }
-    racer.store(obj, tag="verify", context=ctx, async_op=False)
+    racer.store(obj, tag="verify", context=ctx)
     recovered = racer.load(tag="verify", failed_train_ranks=[0], context=ctx)
     assert torch.equal(recovered[0].to(obj[0].device), obj[0])
     print("RACER 5-GPU verification passed; failed rank 0 recovered on", recovered[0].device)

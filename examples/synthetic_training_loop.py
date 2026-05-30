@@ -111,7 +111,6 @@ def main() -> None:
     parser.add_argument("--save-interval", type=int, default=1)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--async-store", default="true")
-    parser.add_argument("--routing-strategy", default="spare_compute", choices=["spare_compute"])
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--mode", choices=["sleep", "matmul"], default="sleep")
     parser.add_argument("--matmul-size", type=int, default=2048)
@@ -123,7 +122,7 @@ def main() -> None:
     async_store = parse_bool(args.async_store)
     packet_size = parse_size(args.packet_size)
 
-    rank, world, local_rank = maybe_init_distributed(backend="nccl")
+    rank, world, local_rank = maybe_init_distributed()
     rows = []
     try:
         if not torch.cuda.is_available():
@@ -139,10 +138,6 @@ def main() -> None:
                 m=args.m,
                 train_ranks=tuple(train_ranks),
                 spare_ranks=tuple(spare_ranks),
-                backend="cuda",
-                storage_backend="in_process_cuda",
-                async_op=False,
-                routing_strategy=args.routing_strategy,
             )
             local_packet = _make_local_packet(rank, local_rank, train_ranks, packet_size)
             _fill_local_packet(local_packet, rank, 0)
@@ -204,7 +199,6 @@ def main() -> None:
                     train_ranks=train_ranks,
                     spare_ranks=spare_ranks,
                     layout=last_state.layout,
-                    routing_strategy=args.routing_strategy,
                     size_bytes=packet_size,
                     encode_ms=avg_store_wall_ms,
                     p2p_ms=0.0,
@@ -242,10 +236,6 @@ def main() -> None:
             m=args.m,
             train_ranks=train_ranks,
             spare_ranks=spare_ranks,
-            backend="cuda",
-            storage_backend="in_process_cuda",
-            async_op=async_store,
-            routing_strategy=args.routing_strategy,
         )
         obj = _make_obj(train_ranks, packet_size)
         _fill_obj(obj, 0)
@@ -314,7 +304,6 @@ def main() -> None:
             train_ranks=train_ranks,
             spare_ranks=spare_ranks,
             layout=ctx.elastic_layout,
-            routing_strategy=args.routing_strategy,
             size_bytes=packet_size,
             encode_ms=avg_store_wall_ms,
             p2p_ms=0.0,

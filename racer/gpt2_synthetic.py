@@ -267,12 +267,9 @@ def make_rank_states(
     ranks: Iterable[int],
     config: GPT2CheckpointConfig,
     *,
-    backend: str = "cuda",
     fill: bool = False,
     max_tensors: int | None = None,
 ) -> dict[int, dict[str, torch.Tensor]]:
-    if backend != "cuda":
-        raise ValueError("make_rank_states supports only backend='cuda'")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to materialize RACER benchmark states")
     states: dict[int, dict[str, torch.Tensor]] = {}

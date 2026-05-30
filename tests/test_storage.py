@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from racer.storage import EgmStorage, InProcessCudaStorage
+from racer.storage import InProcessCudaStorage
 
 
 def test_in_process_cuda_storage_rejects_host_tensor():
@@ -24,8 +24,3 @@ def test_in_process_cuda_storage_preserves_cuda_tensor_isolation():
     assert storage.get_metadata("t", "c0")["owner_rank"] == 0
     assert storage.list_chunks("t") == ["c0"]
     assert storage.get_manifest("t")["spare_ranks"] == [1]
-
-
-def test_egm_storage_is_declared_but_not_implemented():
-    with pytest.raises(NotImplementedError):
-        EgmStorage()

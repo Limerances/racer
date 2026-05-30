@@ -88,7 +88,6 @@ class CostModel:
 
 @dataclass(frozen=True)
 class RoutingPlan:
-    strategy: str
     transfers: tuple[TransferOp, ...] = field(default_factory=tuple)
     computes: tuple[ComputeOp, ...] = field(default_factory=tuple)
     reductions: tuple[ReductionOp, ...] = field(default_factory=tuple)
@@ -141,9 +140,7 @@ class _CostAccumulator:
         )
 
 
-class BasePlanner:
-    strategy = "base"
-
+class SpareComputePlanner:
     def __init__(self, config: RacerConfig) -> None:
         self.config = config
 
@@ -161,13 +158,6 @@ class BasePlanner:
 
     def _coeff(self, E: Sequence[Sequence[int]], parity_id: int, data_group_id: int) -> int:
         return int(E[self.config.k + int(parity_id)][int(data_group_id)]) & 0xFF
-
-    def plan(self, layout: ElasticLayout, E: Sequence[Sequence[int]], chunk_nbytes: int) -> RoutingPlan:
-        raise NotImplementedError
-
-
-class SpareComputePlanner(BasePlanner):
-    strategy = "spare_compute"
 
     def plan(self, layout: ElasticLayout, E: Sequence[Sequence[int]], chunk_nbytes: int) -> RoutingPlan:
         transfers: list[TransferOp] = []
@@ -230,7 +220,7 @@ class SpareComputePlanner(BasePlanner):
                     transfers.append(self._transfer(group[0], compute_rank, owner, parity_id, 1, chunk_nbytes, "parity result to train-rank chunk owner"))
                     cost.transfer(chunk_nbytes)
 
-        return RoutingPlan(self.strategy, tuple(transfers), tuple(computes), tuple(reductions), cost.build())
+        return RoutingPlan(tuple(transfers), tuple(computes), tuple(reductions), cost.build())
 
     def _transfer(
         self,
@@ -258,7 +248,5 @@ class SpareComputePlanner(BasePlanner):
         )
 
 
-def make_planner(config: RacerConfig) -> BasePlanner:
-    if config.routing_strategy == "spare_compute":
-        return SpareComputePlanner(config)
-    raise ValueError("routing_strategy must be 'spare_compute'; CPU/local routes have been removed")
+def make_planner(config: RacerConfig) -> SpareComputePlanner:
+    return SpareComputePlanner(config)

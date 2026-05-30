@@ -1,12 +1,13 @@
-from racer.layout import ElasticLayout, RacerLayout
+from racer.layout import ElasticLayout
 
 
-def test_layout_supports_w_mod_k_not_zero():
-    layout = RacerLayout.build([0, 1, 2, 3], k=3)
-    assert len(layout.stripes) == 2
-    assert layout.stripes[0].data_ranks == (0, 1, 2)
-    assert layout.stripes[1].data_ranks == (3, None, None)
-    assert layout.locate_rank(3) == (1, 0)
+def test_elastic_layout_supports_w_mod_k_not_zero():
+    layout = ElasticLayout.build([0, 1, 2, 3], [4], k=3, m=1)
+    assert len(layout.reduction_groups) == 2
+    assert [slot.train_rank for slot in layout.reduction_groups[0]] == [0, 1, 2]
+    assert [slot.train_rank for slot in layout.reduction_groups[1]] == [3, None, None]
+    slot = layout.locate_rank(3)
+    assert (slot.relative_index, slot.data_group_id) == (1, 0)
 
 
 def test_elastic_layout_k3_m1_virtual_zero_slots():

@@ -18,8 +18,6 @@ class StoreStats:
     total_ms: float
     bytes_total: int
     effective_gbps: float
-    backend: str
-    storage_backend: str
     k: int
     m: int
     n: int
@@ -38,8 +36,6 @@ class LoadStats:
     total_ms: float
     bytes_total: int
     effective_gbps: float
-    backend: str
-    storage_backend: str
     k: int
     m: int
     n: int

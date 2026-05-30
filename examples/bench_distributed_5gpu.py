@@ -68,14 +68,13 @@ def main() -> None:
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--test-nondivisible", action="store_true")
     parser.add_argument("--failures", type=str, default=None)
-    parser.add_argument("--routing-strategy", default="spare_compute", choices=["spare_compute"])
     args = parser.parse_args()
 
     train_ranks = parse_rank_list(args.train_ranks)
     spare_ranks = parse_rank_list(args.spare_ranks)
     validate_config(args.k, args.m, train_ranks)
 
-    rank, world, local_rank = maybe_init_distributed(backend="nccl")
+    rank, world, local_rank = maybe_init_distributed()
     rows = []
     try:
         if not torch.cuda.is_available():
@@ -98,10 +97,6 @@ def main() -> None:
                 m=args.m,
                 train_ranks=tuple(train_ranks),
                 spare_ranks=tuple(spare_ranks),
-                backend="cuda",
-                storage_backend="in_process_cuda",
-                async_op=False,
-                routing_strategy=args.routing_strategy,
             )
             for size_bytes in parse_sizes(args.sizes):
                 local_packet = _make_local_packet(rank, local_rank, train_ranks, size_bytes)
@@ -140,7 +135,6 @@ def main() -> None:
                         train_ranks=train_ranks,
                         spare_ranks=spare_ranks,
                         layout=state.layout,
-                        routing_strategy=args.routing_strategy,
                         size_bytes=size_bytes,
                         encode_ms=store_wall_ms,
                         p2p_ms=0.0,
@@ -151,8 +145,6 @@ def main() -> None:
                         correct=correct,
                         cost=state.routing_cost,
                     )
-                    row["comm_backend"] = state.comm_backend
-                    row["compute_backend"] = state.compute_backend
                     rows.append(row)
                     print(row)
 
@@ -168,10 +160,6 @@ def main() -> None:
             m=args.m,
             train_ranks=train_ranks,
             spare_ranks=spare_ranks,
-            backend="cuda",
-            storage_backend="in_process_cuda",
-            async_op=False,
-            routing_strategy=args.routing_strategy,
         )
         failures = parse_rank_list(args.failures) if args.failures else [train_ranks[0]]
         if len(failures) > args.m:
@@ -181,7 +169,7 @@ def main() -> None:
             obj = _make_obj(train_ranks, size_bytes)
             _sync_all()
             begin = time.perf_counter()
-            handle = racer.store(obj, tag=f"bench_{size_bytes}", context=ctx, async_op=False)
+            handle = racer.store(obj, tag=f"bench_{size_bytes}", context=ctx)
             handle.wait()
             _sync_all()
             store_wall_ms = (time.perf_counter() - begin) * 1000.0
@@ -206,7 +194,6 @@ def main() -> None:
                 train_ranks=train_ranks,
                 spare_ranks=spare_ranks,
                 layout=ctx.elastic_layout,
-                routing_strategy=args.routing_strategy,
                 size_bytes=size_bytes,
                 encode_ms=store_wall_ms,
                 p2p_ms=0.0,

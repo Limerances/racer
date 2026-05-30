@@ -36,7 +36,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--include-optimizer", type=parse_bool, default=True)
     parser.add_argument("--include-master-weights", type=parse_bool, default=True)
-    parser.add_argument("--storage-backend", default="in_process_cuda", choices=["in_process_cuda"])
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--m", type=int, default=1)
     parser.add_argument("--train-ranks", default="0,1,2,3")
@@ -96,7 +95,6 @@ def main() -> None:
     if torch.cuda.device_count() <= needed:
         raise SystemExit(f"need CUDA device rank {needed}, visible device_count={torch.cuda.device_count()}")
 
-    storage_backend = args.storage_backend
 
     config = profile_config(
         args.profile,
@@ -123,7 +121,6 @@ def main() -> None:
     states = make_rank_states(
         train_ranks,
         config,
-        backend="cuda",
         fill=args.fill or args.verify,
         max_tensors=args.max_tensors,
     )
@@ -135,11 +132,7 @@ def main() -> None:
         m=args.m,
         train_ranks=train_ranks,
         spare_ranks=spare_ranks,
-        backend="cuda",
-        storage_backend=storage_backend,
         buffer_size=chunk_size,
-        async_op=False,
-        routing_strategy="spare_compute",
     )
 
     measured_rows: list[dict] = []
@@ -148,7 +141,7 @@ def main() -> None:
     for run in range(total_runs):
         measured = run >= args.warmup
         sync_cuda_devices(train_ranks + spare_ranks)
-        handle = racer.store(states, tag=args.tag, context=ctx, async_op=False)
+        handle = racer.store(states, tag=args.tag, context=ctx)
         handle.wait()
         sync_cuda_devices(train_ranks + spare_ranks)
         requested_train_ranks = train_ranks if args.load_ranks == "all" else None
@@ -173,8 +166,6 @@ def main() -> None:
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "iteration": run - args.warmup,
             "profile": args.profile,
-            "backend": "cuda",
-            "storage_backend": storage_backend,
             "k": args.k,
             "m": args.m,
             "train_ranks": ",".join(map(str, train_ranks)),
@@ -184,7 +175,7 @@ def main() -> None:
             "tensors_per_rank": len(states[args.failed_rank]),
             "actual_total_train_bytes": actual_total_bytes,
             "store_flatten_ms": store_profile.get("flatten_ms", 0.0),
-            "store_stripe_pack_ms": store_profile.get("stripe_pack_ms", 0.0),
+            "store_reduction_group_pack_ms": store_profile.get("reduction_group_pack_ms", 0.0),
             "store_ec_encode_ms": store_profile.get("ec_encode_ms", 0.0),
             "store_storage_device_copy_ms": store_profile.get("storage_device_copy_ms", 0.0),
             "store_data_direct_save_ms": store_profile.get("data_direct_save_ms", 0.0),
@@ -248,7 +239,7 @@ def main() -> None:
     if measured_rows:
         print("summary_mean:")
         print(f"  store_flatten_ms={mean(measured_rows, 'store_flatten_ms'):.3f}")
-        print(f"  store_stripe_pack_ms={mean(measured_rows, 'store_stripe_pack_ms'):.3f}")
+        print(f"  store_reduction_group_pack_ms={mean(measured_rows, 'store_reduction_group_pack_ms'):.3f}")
         print(f"  store_ec_encode_ms={mean(measured_rows, 'store_ec_encode_ms'):.3f}")
         print(f"  store_storage_device_copy_ms={mean(measured_rows, 'store_storage_device_copy_ms'):.3f}")
         print(f"  store_data_direct_save_ms={mean(measured_rows, 'store_data_direct_save_ms'):.3f}")

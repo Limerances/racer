@@ -8,7 +8,7 @@ CUDA GF kernels, and parity rows are returned to train-rank chunk owners.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import torch
 import torch.distributed as dist
@@ -28,8 +28,6 @@ class DistributedStoreResult:
     plan: RoutingPlan
     local_chunks: dict[str, torch.Tensor]
     packet_nbytes_by_rank: dict[int, int]
-    comm_backend: str
-    compute_backend: str
 
     @property
     def routing_cost(self):
@@ -86,8 +84,8 @@ def _barrier() -> None:
     dist.barrier()
 
 
-def _chunk_id(stripe_index: int, row: int) -> str:
-    return f"stripe_{stripe_index:06d}_row_{row:03d}"
+def _chunk_id(reduction_group_index: int, row: int) -> str:
+    return f"rg_{reduction_group_index:06d}_row_{row:03d}"
 
 
 def _cuda_payload(local_packet: torch.Tensor | None) -> torch.Tensor | None:
@@ -250,8 +248,6 @@ def distributed_store(
 
     _require_nccl()
     rank = _rank()
-    if config.routing_strategy != "spare_compute":
-        raise ValueError("distributed_store supports only spare_compute")
     if rank in config.spare_ranks and local_packet is not None:
         raise ValueError("spare ranks must pass local_packet=None")
     if rank in config.train_ranks and local_packet is None:
@@ -294,14 +290,7 @@ def distributed_store(
         plan=plan,
         local_chunks=local_chunks,
         packet_nbytes_by_rank=packet_sizes,
-        comm_backend="nccl",
-        compute_backend="cuda",
     )
-
-
-def _failed_rows(config: RacerConfig, failed_train_ranks: Iterable[int]) -> set[int]:
-    row_by_rank = {int(rank): row for row, rank in enumerate(config.train_ranks)}
-    return {row_by_rank[int(rank)] for rank in failed_train_ranks}
 
 
 def _choose_decode_rank(config: RacerConfig, failed_train_ranks: Sequence[int]) -> int:
@@ -322,16 +311,20 @@ def distributed_load(
     device = _current_cuda_device()
     failed = [int(value) for value in failed_train_ranks]
     decode_rank = _choose_decode_rank(config, failed)
-    failed_rows = _failed_rows(config, failed)
-    survivors = [row for row in range(len(config.train_ranks)) if row not in failed_rows]
-    if len(survivors) < config.k:
-        raise RuntimeError(f"not enough survivor rows to decode: have {len(survivors)}, need {config.k}")
-    chosen_rows = survivors[: config.k]
+    failed_cols_by_reduction_group: dict[int, set[int]] = {}
+    for failed_rank in failed:
+        slot = layout.locate_rank(failed_rank)
+        failed_cols_by_reduction_group.setdefault(slot.relative_index, set()).add(slot.data_group_id)
     recovered: dict[int, torch.Tensor] = {}
 
     _barrier()
     for failed_rank in failed:
         slot = layout.locate_rank(failed_rank)
+        failed_cols = failed_cols_by_reduction_group[slot.relative_index]
+        survivors = [row for row in range(len(config.train_ranks)) if row not in failed_cols]
+        if len(survivors) < config.k:
+            raise RuntimeError(f"not enough survivor rows to decode: have {len(survivors)}, need {config.k}")
+        chosen_rows = survivors[: config.k]
         nbytes = max(
             state.packet_nbytes_by_rank[int(s.train_rank)]
             for s in layout.reduction_groups[slot.relative_index]
