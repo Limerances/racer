@@ -202,6 +202,17 @@ def _apply_matrix_extension(
     *,
     outputs_provided: bool,
 ) -> list[torch.Tensor]:
+    vector_table_fn = _optional_extension_function("apply_matrix_cuda_vector_table")
+    if vector_table_fn is not None:
+        return list(
+            vector_table_fn(
+                list(flat_inputs),
+                coeff,
+                list(flat_outputs),
+                gf256.torch_mul_table(flat_inputs[0].device),
+            )
+        )
+
     fn = _extension_function("apply_matrix_cuda")
     abi = _apply_matrix_abi()
     if abi == "vector":

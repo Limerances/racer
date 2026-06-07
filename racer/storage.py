@@ -56,7 +56,7 @@ class InProcessCudaStorage:
             raise TypeError("RACER storage only supports torch.uint8 chunks")
         if tensor.device.type != "cuda":
             raise ValueError("RACER CUDA storage requires CUDA tensors")
-        return tensor.detach().contiguous().clone()
+        return tensor.detach().contiguous()
 
     def _load_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor.clone()

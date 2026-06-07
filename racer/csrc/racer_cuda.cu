@@ -32,7 +32,7 @@ __global__ void gf256_matmul_kernel(
     int rows,
     int k,
     int64_t size) {
-  const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t total = static_cast<int64_t>(rows) * size;
   if (idx >= total) {
     return;
@@ -58,7 +58,7 @@ __global__ void gf256_matmul_table_kernel(
     int rows,
     int k,
     int64_t size) {
-  const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t total = static_cast<int64_t>(rows) * size;
   if (idx >= total) {
     return;
@@ -81,7 +81,7 @@ __global__ void gf256_mul_kernel(
     unsigned char* __restrict__ dst,
     unsigned char coeff,
     int64_t size) {
-  const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= size) {
     return;
   }
@@ -93,7 +93,7 @@ __global__ void gf256_mul_xor_kernel(
     unsigned char* __restrict__ dst,
     unsigned char coeff,
     int64_t size) {
-  const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= size) {
     return;
   }
@@ -104,7 +104,7 @@ __global__ void xor_inplace_kernel(
     unsigned char* __restrict__ dst,
     const unsigned char* __restrict__ src,
     int64_t size) {
-  const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= size) {
     return;
   }
@@ -118,7 +118,7 @@ __global__ void apply_matrix_vector_kernel(
     int rows,
     int k,
     int64_t size) {
-  const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t total = static_cast<int64_t>(rows) * size;
   if (idx >= total) {
     return;
@@ -135,10 +135,84 @@ __global__ void apply_matrix_vector_kernel(
   outputs[row][offset] = acc;
 }
 
+
+__global__ void apply_matrix_vector_table_kernel(
+    const unsigned char* const* __restrict__ inputs,
+    const unsigned char* __restrict__ matrix,
+    const unsigned char* __restrict__ mul_table,
+    unsigned char** __restrict__ outputs,
+    int rows,
+    int k,
+    int64_t size) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = static_cast<int64_t>(rows) * size;
+  if (idx >= total) {
+    return;
+  }
+  const int row = static_cast<int>(idx / size);
+  const int64_t offset = idx - static_cast<int64_t>(row) * size;
+  unsigned char acc = 0;
+  for (int col = 0; col < k; ++col) {
+    const unsigned char c = matrix[row * k + col];
+    if (c != 0) {
+      const unsigned char x = inputs[col][offset];
+      acc ^= mul_table[static_cast<int>(c) * 256 + static_cast<int>(x)];
+    }
+  }
+  outputs[row][offset] = acc;
+}
+
+__global__ void apply_matrix_k3_table_kernel(
+    const unsigned char* __restrict__ in0,
+    const unsigned char* __restrict__ in1,
+    const unsigned char* __restrict__ in2,
+    const unsigned char* __restrict__ matrix,
+    const unsigned char* __restrict__ mul_table,
+    unsigned char* __restrict__ out0,
+    unsigned char* __restrict__ out1,
+    unsigned char* __restrict__ out2,
+    int rows,
+    int64_t size) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = static_cast<int64_t>(rows) * size;
+  if (idx >= total) {
+    return;
+  }
+  const int row = static_cast<int>(idx / size);
+  const int64_t offset = idx - static_cast<int64_t>(row) * size;
+  const unsigned char c0 = matrix[row * 3];
+  const unsigned char c1 = matrix[row * 3 + 1];
+  const unsigned char c2 = matrix[row * 3 + 2];
+  unsigned char acc = 0;
+  if (c0 != 0) {
+    const unsigned char x = in0[offset];
+    acc ^= mul_table[static_cast<int>(c0) * 256 + static_cast<int>(x)];
+  }
+  if (c1 != 0) {
+    const unsigned char x = in1[offset];
+    acc ^= mul_table[static_cast<int>(c1) * 256 + static_cast<int>(x)];
+  }
+  if (c2 != 0) {
+    const unsigned char x = in2[offset];
+    acc ^= mul_table[static_cast<int>(c2) * 256 + static_cast<int>(x)];
+  }
+  unsigned char* out = row == 0 ? out0 : (row == 1 ? out1 : out2);
+  out[offset] = acc;
+}
+
 void check_uint8_cuda_contiguous(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be CUDA");
   TORCH_CHECK(tensor.scalar_type() == torch::kUInt8, name, " must be torch.uint8");
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+}
+
+
+void check_mul_table(const torch::Tensor& tensor, const c10::Device& device) {
+  check_uint8_cuda_contiguous(tensor, "mul_table");
+  TORCH_CHECK(tensor.dim() == 2, "mul_table must have shape [256, 256]");
+  TORCH_CHECK(tensor.size(0) == 256 && tensor.size(1) == 256,
+              "mul_table must have shape [256, 256]");
+  TORCH_CHECK(tensor.device() == device, "mul_table must be on the same CUDA device as inputs");
 }
 
 int launch_blocks(int64_t size, int threads) {
@@ -338,6 +412,94 @@ std::vector<torch::Tensor> apply_matrix_cuda(
   apply_matrix_vector_kernel<<<blocks, threads, 0, stream>>>(
       d_inputs,
       matrix.data_ptr<unsigned char>(),
+      d_outputs,
+      static_cast<int>(outputs.size()),
+      static_cast<int>(inputs.size()),
+      size);
+  cudaFree(d_inputs);
+  cudaFree(d_outputs);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return outputs;
+}
+
+
+std::vector<torch::Tensor> apply_matrix_cuda_vector_table(
+    std::vector<torch::Tensor> inputs,
+    torch::Tensor matrix,
+    std::vector<torch::Tensor> outputs,
+    torch::Tensor mul_table) {
+  TORCH_CHECK(!inputs.empty(), "inputs must be non-empty");
+  TORCH_CHECK(!outputs.empty(), "outputs must be non-empty");
+  check_uint8_cuda_contiguous(matrix, "matrix");
+  TORCH_CHECK(matrix.dim() == 2, "matrix must have shape [outputs, inputs]");
+  TORCH_CHECK(matrix.size(0) == static_cast<int64_t>(outputs.size()), "matrix row count must match outputs");
+  TORCH_CHECK(matrix.size(1) == static_cast<int64_t>(inputs.size()), "matrix width must match inputs");
+
+  const auto device = inputs[0].device();
+  const int64_t size = inputs[0].numel();
+  TORCH_CHECK(matrix.device() == device, "matrix must be on the same CUDA device as inputs");
+  check_mul_table(mul_table, device);
+  for (const auto& input : inputs) {
+    check_uint8_cuda_contiguous(input, "input");
+    TORCH_CHECK(input.device() == device, "all inputs must be on the same CUDA device");
+    TORCH_CHECK(input.numel() == size, "all inputs must have the same numel");
+  }
+  for (const auto& output : outputs) {
+    check_uint8_cuda_contiguous(output, "output");
+    TORCH_CHECK(output.device() == device, "all outputs must be on the same CUDA device as inputs");
+    TORCH_CHECK(output.numel() == size, "all outputs must have the same numel as inputs");
+  }
+
+  c10::cuda::CUDAGuard guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 256;
+  const int64_t total = static_cast<int64_t>(outputs.size()) * size;
+  const int blocks = launch_blocks(total, threads);
+  if (total == 0) {
+    return outputs;
+  }
+
+  if (inputs.size() == 3 && outputs.size() <= 3) {
+    unsigned char* out0 = outputs[0].data_ptr<unsigned char>();
+    unsigned char* out1 = outputs.size() > 1 ? outputs[1].data_ptr<unsigned char>() : out0;
+    unsigned char* out2 = outputs.size() > 2 ? outputs[2].data_ptr<unsigned char>() : out0;
+    apply_matrix_k3_table_kernel<<<blocks, threads, 0, stream>>>(
+        inputs[0].data_ptr<unsigned char>(),
+        inputs[1].data_ptr<unsigned char>(),
+        inputs[2].data_ptr<unsigned char>(),
+        matrix.data_ptr<unsigned char>(),
+        mul_table.data_ptr<unsigned char>(),
+        out0,
+        out1,
+        out2,
+        static_cast<int>(outputs.size()),
+        size);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return outputs;
+  }
+
+  std::vector<const unsigned char*> h_inputs;
+  std::vector<unsigned char*> h_outputs;
+  h_inputs.reserve(inputs.size());
+  h_outputs.reserve(outputs.size());
+  for (const auto& input : inputs) {
+    h_inputs.push_back(input.data_ptr<unsigned char>());
+  }
+  for (auto& output : outputs) {
+    h_outputs.push_back(output.data_ptr<unsigned char>());
+  }
+
+  const unsigned char** d_inputs = nullptr;
+  unsigned char** d_outputs = nullptr;
+  cudaMalloc(&d_inputs, sizeof(unsigned char*) * h_inputs.size());
+  cudaMalloc(&d_outputs, sizeof(unsigned char*) * h_outputs.size());
+  cudaMemcpyAsync(d_inputs, h_inputs.data(), sizeof(unsigned char*) * h_inputs.size(), cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(d_outputs, h_outputs.data(), sizeof(unsigned char*) * h_outputs.size(), cudaMemcpyHostToDevice, stream);
+
+  apply_matrix_vector_table_kernel<<<blocks, threads, 0, stream>>>(
+      d_inputs,
+      matrix.data_ptr<unsigned char>(),
+      mul_table.data_ptr<unsigned char>(),
       d_outputs,
       static_cast<int>(outputs.size()),
       static_cast<int>(inputs.size()),
