@@ -8,7 +8,7 @@ CUDA GF kernels, and parity rows are returned to train-rank chunk owners.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 import torch.distributed as dist
@@ -58,12 +58,16 @@ def _require_dist() -> None:
         raise RuntimeError("torch.distributed must be initialized before using racer.distributed")
 
 
-def _rank() -> int:
+def _rank(process_group: Any | None = None) -> int:
+    if process_group is not None:
+        return int(process_group.rank())
     _require_dist()
     return int(dist.get_rank())
 
 
-def _world_size() -> int:
+def _world_size(process_group: Any | None = None) -> int:
+    if process_group is not None:
+        return int(process_group.size())
     _require_dist()
     return int(dist.get_world_size())
 
@@ -74,14 +78,19 @@ def _current_cuda_device() -> torch.device:
     return torch.device("cuda", torch.cuda.current_device())
 
 
-def _require_nccl() -> None:
+def _require_nccl(process_group: Any | None = None) -> None:
+    if process_group is not None:
+        return
     _require_dist()
     if str(dist.get_backend()) != "nccl":
         raise RuntimeError("distributed RACER spare_compute requires the default process group backend to be NCCL")
 
 
-def _barrier() -> None:
-    dist.barrier()
+def _barrier(process_group: Any | None = None) -> None:
+    if process_group is None:
+        dist.barrier()
+    else:
+        process_group.barrier().wait()
 
 
 def _chunk_id(reduction_group_index: int, row: int) -> str:
@@ -98,11 +107,14 @@ def _cuda_payload(local_packet: torch.Tensor | None) -> torch.Tensor | None:
     return local_packet.detach().contiguous().view(-1)
 
 
-def _all_gather_int(value: int) -> list[int]:
+def _all_gather_int(value: int, process_group: Any | None = None) -> list[int]:
     device = _current_cuda_device()
     tensor = torch.tensor([int(value)], dtype=torch.long, device=device)
-    gathered = [torch.zeros_like(tensor) for _ in range(_world_size())]
-    dist.all_gather(gathered, tensor)
+    gathered = [torch.zeros_like(tensor) for _ in range(_world_size(process_group))]
+    if process_group is None:
+        dist.all_gather(gathered, tensor)
+    else:
+        process_group.allgather(gathered, tensor).wait()
     return [int(item.item()) for item in gathered]
 
 
@@ -118,17 +130,30 @@ def _pad(payload: torch.Tensor | None, nbytes: int, *, device: torch.device | No
     return out
 
 
-def _send_tensor(tensor: torch.Tensor, dst: int) -> None:
+def _send_tensor(tensor: torch.Tensor, dst: int, process_group: Any | None = None) -> None:
     if tensor.device.type != "cuda":
         raise ValueError("NCCL send requires a CUDA tensor")
-    dist.send(tensor.contiguous(), dst=int(dst))
+    tensor = tensor.contiguous()
+    if process_group is None:
+        dist.send(tensor, dst=int(dst))
+    else:
+        process_group.send([tensor], int(dst), 0).wait()
 
 
-def _recv_tensor(nbytes: int, src: int, *, device: torch.device | None = None) -> torch.Tensor:
+def _recv_tensor(
+    nbytes: int,
+    src: int,
+    *,
+    device: torch.device | None = None,
+    process_group: Any | None = None,
+) -> torch.Tensor:
     if device is None:
         device = _current_cuda_device()
     out = torch.empty(int(nbytes), dtype=torch.uint8, device=device)
-    dist.recv(out, src=int(src))
+    if process_group is None:
+        dist.recv(out, src=int(src))
+    else:
+        process_group.recv([out], int(src), 0).wait()
     return out
 
 
@@ -143,10 +168,14 @@ def _group_nbytes(layout: ElasticLayout, packet_sizes: dict[int, int]) -> dict[i
     return out
 
 
-def _packet_sizes_by_rank(config: RacerConfig, local_payload: torch.Tensor | None) -> dict[int, int]:
-    rank = _rank()
+def _packet_sizes_by_rank(
+    config: RacerConfig,
+    local_payload: torch.Tensor | None,
+    process_group: Any | None = None,
+) -> dict[int, int]:
+    rank = _rank(process_group)
     local_nbytes = int(local_payload.numel()) if rank in config.train_ranks and local_payload is not None else 0
-    gathered = _all_gather_int(local_nbytes)
+    gathered = _all_gather_int(local_nbytes, process_group)
     return {int(train_rank): int(gathered[int(train_rank)]) for train_rank in config.train_ranks}
 
 
@@ -158,6 +187,7 @@ def _store_data_rows(
     group_nbytes: dict[int, int],
     local_slot_payload: dict[int, torch.Tensor],
     local_chunks: dict[str, torch.Tensor],
+    process_group: Any | None = None,
 ) -> int:
     bytes_sent = 0
     device = _current_cuda_device()
@@ -177,10 +207,10 @@ def _store_data_rows(
                 if owner == rank:
                     local_chunks[chunk_id] = payload.clone()
                 else:
-                    _send_tensor(payload, owner)
+                    _send_tensor(payload, owner, process_group)
                     bytes_sent += nbytes
             elif rank == owner:
-                local_chunks[chunk_id] = _recv_tensor(nbytes, src_rank, device=device)
+                local_chunks[chunk_id] = _recv_tensor(nbytes, src_rank, device=device, process_group=process_group)
     return bytes_sent
 
 
@@ -193,6 +223,7 @@ def _store_spare_compute_parity_cuda(
     group_nbytes: dict[int, int],
     local_slot_payload: dict[int, torch.Tensor],
     local_chunks: dict[str, torch.Tensor],
+    process_group: Any | None = None,
 ) -> int:
     bytes_sent = 0
     device = _current_cuda_device()
@@ -211,10 +242,10 @@ def _store_spare_compute_parity_cuda(
                 if compute_rank == rank:
                     raw_by_col[slot.data_group_id] = payload.clone()
                 else:
-                    _send_tensor(payload, compute_rank)
+                    _send_tensor(payload, compute_rank, process_group)
                     bytes_sent += nbytes
             elif rank == compute_rank:
-                raw_by_col[slot.data_group_id] = _recv_tensor(nbytes, src_rank, device=device)
+                raw_by_col[slot.data_group_id] = _recv_tensor(nbytes, src_rank, device=device, process_group=process_group)
 
         if rank == compute_rank:
             inputs = [raw_by_col[col] for col in range(config.k)]
@@ -226,14 +257,14 @@ def _store_spare_compute_parity_cuda(
                 if owner == rank:
                     local_chunks[chunk_id] = parity.clone()
                 else:
-                    _send_tensor(parity, owner)
+                    _send_tensor(parity, owner, process_group)
                     bytes_sent += nbytes
         else:
             for parity_id in range(config.m):
                 owner = int(config.train_ranks[config.k + parity_id])
                 chunk_id = _chunk_id(group[0].relative_index, config.k + parity_id)
                 if rank == owner:
-                    local_chunks[chunk_id] = _recv_tensor(nbytes, compute_rank, device=device)
+                    local_chunks[chunk_id] = _recv_tensor(nbytes, compute_rank, device=device, process_group=process_group)
     torch.cuda.synchronize(device)
     return bytes_sent
 
@@ -243,11 +274,18 @@ def distributed_store(
     config: RacerConfig,
     local_packet: torch.Tensor | None,
     tag: str,
+    process_group: Any | None = None,
 ) -> DistributedStoreResult:
-    """Store one local train-rank packet per torchrun process."""
+    """Store one local train-rank packet per process.
 
-    _require_nccl()
-    rank = _rank()
+    By default this uses the default torch.distributed process group.  Passing a
+    low-level NCCL ``process_group`` allows callers such as Megatron adapters to
+    keep their training world unchanged while adding a spare-GPU worker in a
+    separate communication domain.
+    """
+
+    _require_nccl(process_group)
+    rank = _rank(process_group)
     if rank in config.spare_ranks and local_packet is not None:
         raise ValueError("spare ranks must pass local_packet=None")
     if rank in config.train_ranks and local_packet is None:
@@ -256,13 +294,13 @@ def distributed_store(
     layout = ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m)
     E = cauchy.generate_systematic_matrix(config.k, config.m, config.w, optimize=config.optimize_cauchy)
     local_payload = _cuda_payload(local_packet)
-    packet_sizes = _packet_sizes_by_rank(config, local_payload)
+    packet_sizes = _packet_sizes_by_rank(config, local_payload, process_group)
     group_sizes = _group_nbytes(layout, packet_sizes)
     plan = routing.make_planner(config).plan(layout, E, max(group_sizes.values(), default=0))
     local_slot_payload = {rank: local_payload} if rank in config.train_ranks and local_payload is not None else {}
     local_chunks: dict[str, torch.Tensor] = {}
 
-    _barrier()
+    _barrier(process_group)
     _store_data_rows(
         rank=rank,
         config=config,
@@ -270,6 +308,7 @@ def distributed_store(
         group_nbytes=group_sizes,
         local_slot_payload=local_slot_payload,
         local_chunks=local_chunks,
+        process_group=process_group,
     )
     _store_spare_compute_parity_cuda(
         rank=rank,
@@ -279,8 +318,9 @@ def distributed_store(
         group_nbytes=group_sizes,
         local_slot_payload=local_slot_payload,
         local_chunks=local_chunks,
+        process_group=process_group,
     )
-    _barrier()
+    _barrier(process_group)
 
     return DistributedStoreResult(
         tag=tag,
@@ -297,27 +337,81 @@ def _choose_decode_rank(config: RacerConfig, failed_train_ranks: Sequence[int]) 
     return int(config.spare_ranks[0])
 
 
+def _load_requested_payloads(
+    *,
+    state: DistributedStoreResult,
+    rank: int,
+    requested_train_ranks: Sequence[int],
+    failed_train_ranks: set[int],
+    process_group: Any | None = None,
+) -> dict[int, torch.Tensor]:
+    config = state.config
+    layout = state.layout
+    device = _current_cuda_device()
+    loaded: dict[int, torch.Tensor] = {}
+    for requested_rank in [int(value) for value in requested_train_ranks]:
+        if requested_rank in failed_train_ranks:
+            continue
+        slot = layout.locate_rank(requested_rank)
+        owner = int(config.train_ranks[slot.data_group_id])
+        chunk_id = _chunk_id(slot.relative_index, slot.data_group_id)
+        nbytes = int(state.packet_nbytes_by_rank[requested_rank])
+        if rank == owner:
+            payload = state.local_chunks[chunk_id][:nbytes].contiguous()
+            if owner == requested_rank:
+                loaded[requested_rank] = payload
+            else:
+                _send_tensor(payload, requested_rank, process_group)
+        elif rank == requested_rank:
+            loaded[requested_rank] = _recv_tensor(nbytes, owner, device=device, process_group=process_group)
+    return loaded
+
+
 def distributed_load(
     *,
     state: DistributedStoreResult,
     failed_train_ranks: Sequence[int],
+    requested_train_ranks: Sequence[int] | None = None,
+    process_group: Any | None = None,
 ) -> DistributedLoadResult:
-    """Recover failed train-rank packets with distributed P2P survivor fetches."""
+    """Load or recover train-rank packets with distributed P2P survivor fetches.
 
-    _require_nccl()
-    rank = _rank()
+    ``failed_train_ranks`` requests erasure-code recovery on the spare rank.
+    ``requested_train_ranks`` requests ordinary in-memory loads for nonfailed
+    ranks, routed from the data-row owner back to the original train rank.
+    """
+
+    _require_nccl(process_group)
+    rank = _rank(process_group)
     config = state.config
     layout = state.layout
     device = _current_cuda_device()
     failed = [int(value) for value in failed_train_ranks]
+    failed_set = set(failed)
     decode_rank = _choose_decode_rank(config, failed)
+    recovered: dict[int, torch.Tensor] = {}
+
+    if requested_train_ranks is None:
+        requested = list(failed)
+    else:
+        requested = [int(value) for value in requested_train_ranks]
+
+    _barrier(process_group)
+    recovered.update(
+        _load_requested_payloads(
+            state=state,
+            rank=rank,
+            requested_train_ranks=requested,
+            failed_train_ranks=failed_set,
+            process_group=process_group,
+        )
+    )
+
     failed_cols_by_reduction_group: dict[int, set[int]] = {}
     for failed_rank in failed:
         slot = layout.locate_rank(failed_rank)
         failed_cols_by_reduction_group.setdefault(slot.relative_index, set()).add(slot.data_group_id)
-    recovered: dict[int, torch.Tensor] = {}
 
-    _barrier()
     for failed_rank in failed:
         slot = layout.locate_rank(failed_rank)
         failed_cols = failed_cols_by_reduction_group[slot.relative_index]
@@ -339,9 +433,9 @@ def distributed_load(
                 if owner == decode_rank:
                     survivor_chunks.append(chunk.clone())
                 else:
-                    _send_tensor(chunk, decode_rank)
+                    _send_tensor(chunk, decode_rank, process_group)
             elif rank == decode_rank:
-                survivor_chunks.append(_recv_tensor(nbytes, owner, device=device))
+                survivor_chunks.append(_recv_tensor(nbytes, owner, device=device, process_group=process_group))
 
         if rank == decode_rank:
             decoded = codec_cuda.decode_blocks(survivor_chunks, chosen_rows, state.matrix)
@@ -350,15 +444,16 @@ def distributed_load(
             if failed_rank == decode_rank:
                 recovered[failed_rank] = payload
             else:
-                _send_tensor(payload, failed_rank)
+                _send_tensor(payload, failed_rank, process_group)
         elif rank == failed_rank:
             recovered[failed_rank] = _recv_tensor(
                 state.packet_nbytes_by_rank[failed_rank],
                 decode_rank,
                 device=device,
+                process_group=process_group,
             )
 
-    _barrier()
+    _barrier(process_group)
     return DistributedLoadResult(recovered=recovered, decode_rank=decode_rank)
 
 
