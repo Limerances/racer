@@ -15,6 +15,10 @@ std::vector<torch::Tensor> apply_matrix_cuda_vector_table(
     torch::Tensor matrix,
     std::vector<torch::Tensor> outputs,
     torch::Tensor mul_table);
+std::vector<torch::Tensor> apply_bitmatrix_cuda(
+    std::vector<torch::Tensor> inputs,
+    torch::Tensor bitmatrix,
+    std::vector<torch::Tensor> outputs);
 
 torch::Tensor gf256_matmul(torch::Tensor data, torch::Tensor matrix) {
   TORCH_CHECK(data.is_cuda(), "data must be a CUDA tensor");
@@ -42,4 +46,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("apply_matrix_cuda", &apply_matrix_cuda, "Apply a GF(2^8) coefficient matrix to CUDA byte buffers");
   m.def("apply_matrix_cuda_vector_table", &apply_matrix_cuda_vector_table,
         "Apply a GF(2^8) coefficient matrix to CUDA byte buffers using a device multiplication table");
+  m.def("apply_bitmatrix_cuda", &apply_bitmatrix_cuda,
+        "Apply an expanded GF(2) bitmatrix to CUDA byte buffers using XOR logic");
 }

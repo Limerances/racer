@@ -13,6 +13,34 @@ def assert_equal_state_dict(left, right):
         assert torch.equal(right[key].to(left[key].device), left[key])
 
 
+def test_flatten_unflatten_preserves_non_tensor_metadata_cpu() -> None:
+    state = {
+        "weight": torch.arange(6, dtype=torch.float64).reshape(2, 3),
+        "iteration": 17,
+        "rng": {"seed": 123, "consumed": [1, 2, 3]},
+        "flags": (True, None, "ok"),
+    }
+
+    flat = flatten_state_dict(0, state)
+    recovered = unflatten_state_dict(flat.metadata, flat.payload)
+
+    assert recovered["iteration"] == 17
+    assert recovered["rng"] == {"seed": 123, "consumed": [1, 2, 3]}
+    assert recovered["flags"] == (True, None, "ok")
+    assert recovered["weight"].dtype == torch.float64
+    assert torch.equal(recovered["weight"], state["weight"])
+
+
+def test_flatten_unflatten_metadata_only_state_dict_cpu() -> None:
+    state = {"iteration": 3, "tokens": ["a", "b"]}
+
+    flat = flatten_state_dict(0, state)
+    recovered = unflatten_state_dict(flat.metadata, flat.payload)
+
+    assert int(flat.payload.numel()) == 0
+    assert recovered == state
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_flatten_unflatten_multi_dtype_state_dict_cuda() -> None:
     state = {
@@ -53,3 +81,16 @@ def test_flatten_restores_requires_grad_for_float_tensor() -> None:
 
     assert recovered["weight"].requires_grad
     assert torch.equal(recovered["weight"], state["weight"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_unflatten_handles_misaligned_dtype_slice_cuda() -> None:
+    state = {
+        "u8": torch.arange(1, dtype=torch.uint8, device="cuda:0"),
+        "fp32": torch.randn(3, dtype=torch.float32, device="cuda:0"),
+    }
+
+    flat = flatten_state_dict(0, state, target_device="cuda:0")
+    recovered = unflatten_state_dict(flat.metadata, flat.payload, target_device="cuda:0")
+
+    assert_equal_state_dict(state, recovered)

@@ -1,26 +1,37 @@
 import pytest
-import torch
 
-from racer.storage import InProcessCudaStorage
-
-
-def test_in_process_cuda_storage_rejects_host_tensor():
-    storage = InProcessCudaStorage()
-    tensor = torch.arange(16, dtype=torch.uint8)
-    with pytest.raises(ValueError, match="CUDA tensors"):
-        storage.put("t", "c0", tensor, {"owner_rank": 0})
+import racer
+from racer import storage
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
-def test_in_process_cuda_storage_preserves_cuda_tensor_isolation():
-    storage = InProcessCudaStorage()
-    tensor = torch.arange(16, dtype=torch.uint8, device="cuda:0")
-    storage.put("t", "c0", tensor, {"owner_rank": 0})
-    storage.put_manifest("t", {"train_ranks": [0], "spare_ranks": [1]})
-    loaded = storage.get("t", "c0")
-    assert loaded.device.type == "cuda"
-    loaded.fill_(99)
-    assert torch.equal(storage.get("t", "c0"), tensor)
-    assert storage.get_metadata("t", "c0")["owner_rank"] == 0
-    assert storage.list_chunks("t") == ["c0"]
-    assert storage.get_manifest("t")["spare_ranks"] == [1]
+def test_legacy_storage_classes_are_not_public_exports():
+    assert not hasattr(racer, "InProcessCudaStorage")
+    assert not hasattr(racer, "CpuPinnedStorage")
+    assert not hasattr(racer, "EgmStorage")
+    assert not hasattr(racer, "FdMmapHostBackend")
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [
+        storage.InProcessCudaStorage,
+        storage.CpuPinnedStorage,
+        storage.EgmStorage,
+        storage.InProcessStorage,
+    ],
+)
+def test_legacy_storage_constructors_raise(cls):
+    with pytest.raises(RuntimeError, match="daemon-owned"):
+        cls()
+
+
+@pytest.mark.parametrize("backend", ["cuda", "cuda_legacy", "cpu_pinned", "egm", "csd_pinned", "fd_mmap_host"])
+def test_init_rejects_non_daemon_native_storage_backends(backend):
+    with pytest.raises(ValueError, match="unsupported RACER storage_backend"):
+        racer.init(
+            k=2,
+            m=1,
+            train_ranks=[0, 1, 2],
+            spare_ranks=[3],
+            storage_backend=backend,
+        )
