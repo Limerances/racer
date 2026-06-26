@@ -7,6 +7,7 @@ import argparse
 import csv
 import statistics
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -127,146 +128,157 @@ def main() -> None:
     actual_total_bytes = states_nbytes(states)
     print(f"actual_materialized_train_bytes={actual_total_bytes} ({actual_total_bytes / 1024**3:.3f} GiB)")
 
-    ctx = racer.init(
-        k=args.k,
-        m=args.m,
-        train_ranks=train_ranks,
-        spare_ranks=spare_ranks,
-        buffer_size=chunk_size,
-    )
-
-    measured_rows: list[dict] = []
-    recovered = None
-    total_runs = args.warmup + args.iters
-    for run in range(total_runs):
-        measured = run >= args.warmup
-        sync_cuda_devices(train_ranks + spare_ranks)
-        handle = racer.store(states, tag=args.tag, context=ctx)
-        handle.wait()
-        sync_cuda_devices(train_ranks + spare_ranks)
-        requested_train_ranks = train_ranks if args.load_ranks == "all" else None
-        recovered = racer.load(
-            tag=args.tag,
-            failed_train_ranks=[args.failed_rank],
-            requested_train_ranks=requested_train_ranks,
-            context=ctx,
+    with tempfile.TemporaryDirectory(prefix="racer-csd-") as tmp:
+        daemon = racer.start_checkpoint_storage_daemon(
+            metadata_dir=Path(tmp) / "metadata",
+            backend="native_pinned",
+            backend_options={"segment_bytes": max(chunk_size, 64 * 1024 * 1024), "device": 0},
         )
-        sync_cuda_devices(train_ranks + spare_ranks)
+        try:
+            ctx = racer.init(
+                k=args.k,
+                m=args.m,
+                train_ranks=train_ranks,
+                spare_ranks=spare_ranks,
+                buffer_size=chunk_size,
+                storage_backend="csd_native_pinned",
+                storage_options={"client": daemon.client},
+            )
 
-        correct = ""
-        if args.verify:
-            ranks_to_check = train_ranks if args.load_ranks == "all" else [args.failed_rank]
-            correct = all(state_dict_byte_equal(states[rank], recovered[rank]) for rank in ranks_to_check)
-            if not correct:
-                raise RuntimeError("recovered state does not match original bytes")
+            measured_rows: list[dict] = []
+            recovered = None
+            total_runs = args.warmup + args.iters
+            for run in range(total_runs):
+                measured = run >= args.warmup
+                sync_cuda_devices(train_ranks + spare_ranks)
+                handle = racer.store(states, tag=args.tag, context=ctx)
+                handle.wait()
+                sync_cuda_devices(train_ranks + spare_ranks)
+                requested_train_ranks = train_ranks if args.load_ranks == "all" else None
+                recovered = racer.load(
+                    tag=args.tag,
+                    failed_train_ranks=[args.failed_rank],
+                    requested_train_ranks=requested_train_ranks,
+                    context=ctx,
+                )
+                sync_cuda_devices(train_ranks + spare_ranks)
 
-        store_profile = dict(ctx.last_store_profile)
-        load_profile = dict(ctx.last_load_profile)
-        row = {
-            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "iteration": run - args.warmup,
-            "profile": args.profile,
-            "k": args.k,
-            "m": args.m,
-            "train_ranks": ",".join(map(str, train_ranks)),
-            "spare_ranks": ",".join(map(str, spare_ranks)),
-            "failed_rank": args.failed_rank,
-            "load_ranks": args.load_ranks,
-            "tensors_per_rank": len(states[args.failed_rank]),
-            "actual_total_train_bytes": actual_total_bytes,
-            "store_flatten_ms": store_profile.get("flatten_ms", 0.0),
-            "store_reduction_group_pack_ms": store_profile.get("reduction_group_pack_ms", 0.0),
-            "store_ec_encode_ms": store_profile.get("ec_encode_ms", 0.0),
-            "store_storage_device_copy_ms": store_profile.get("storage_device_copy_ms", 0.0),
-            "store_data_direct_save_ms": store_profile.get("data_direct_save_ms", 0.0),
-            "store_parity_chunk_save_ms": store_profile.get("parity_chunk_save_ms", 0.0),
-            "store_spare_buffer_alloc_ms": store_profile.get("spare_buffer_alloc_ms", 0.0),
-            "store_manifest_build_ms": store_profile.get("manifest_build_ms", 0.0),
-            "store_chunk_storage_write_ms": store_profile.get("chunk_storage_write_ms", 0.0),
-            "store_data_chunk_write_ms": store_profile.get("data_chunk_write_ms", 0.0),
-            "store_parity_chunk_write_ms": store_profile.get("parity_chunk_write_ms", 0.0),
-            "store_checkpoint_index_ms": store_profile.get("checkpoint_index_ms", 0.0),
-            "store_encode_ms": store_profile.get("encode_ms", 0.0),
-            "store_total_ms": store_profile.get("total_ms", 0.0),
-            "store_effective_gbps": gbps(actual_total_bytes, float(store_profile.get("total_ms", 0.0))),
-            "store_data_row_bytes": store_profile.get("data_row_bytes", 0),
-            "store_parity_row_bytes": store_profile.get("parity_row_bytes", 0),
-            "store_storage_device_copy_gbps": gbps(
-                int(store_profile.get("data_row_bytes", 0)) + int(store_profile.get("parity_row_bytes", 0)),
-                float(store_profile.get("storage_device_copy_ms", 0.0)),
-            ),
-            "store_data_direct_save_gbps": gbps(
-                int(store_profile.get("data_row_bytes", 0)),
-                float(store_profile.get("data_direct_save_ms", 0.0)),
-            ),
-            "store_parity_chunk_save_gbps": gbps(
-                int(store_profile.get("parity_row_bytes", 0)),
-                float(store_profile.get("parity_chunk_save_ms", 0.0)),
-            ),
-            "store_chunk_storage_write_gbps": gbps(
-                int(store_profile.get("data_chunk_bytes", 0)) + int(store_profile.get("parity_chunk_bytes", 0)),
-                float(store_profile.get("chunk_storage_write_ms", 0.0)),
-            ),
-            "load_storage_read_ms": load_profile.get("storage_read_ms", 0.0),
-            "load_checkpoint_sync_ms": load_profile.get("checkpoint_sync_ms", 0.0),
-            "load_metadata_ms": load_profile.get("metadata_ms", 0.0),
-            "load_survivor_to_compute_ms": load_profile.get("survivor_to_compute_ms", 0.0),
-            "load_decode_matrix_ms": load_profile.get("decode_matrix_ms", 0.0),
-            "load_ec_decode_ms": load_profile.get("ec_decode_ms", 0.0),
-            "load_raw_payload_to_output_device_ms": load_profile.get("raw_payload_to_output_device_ms", 0.0),
-            "load_unflatten_ms": load_profile.get("unflatten_ms", 0.0),
-            "load_final_sync_ms": load_profile.get("final_sync_ms", 0.0),
-            "load_decode_ms": load_profile.get("decode_ms", 0.0),
-            "load_total_ms": load_profile.get("total_ms", 0.0),
-            "load_effective_gbps": gbps(int(load_profile.get("bytes_total", 0)), float(load_profile.get("total_ms", 0.0))),
-            "load_bytes_total": load_profile.get("bytes_total", 0),
-            "verified": correct,
-        }
-        if measured:
-            measured_rows.append(row)
-        phase = "measure" if measured else "warmup"
-        print(
-            f"{phase} iter={run - args.warmup}: "
-            f"store_total_ms={float(row['store_total_ms']):.3f} "
-            f"load_total_ms={float(row['load_total_ms']):.3f} "
-            f"store_GBps={float(row['store_effective_gbps']):.3f} "
-            f"load_GBps={float(row['load_effective_gbps']):.3f} "
-            f"verified={row['verified']}"
-        )
-        del recovered
-        recovered = None
+                correct = ""
+                if args.verify:
+                    ranks_to_check = train_ranks if args.load_ranks == "all" else [args.failed_rank]
+                    correct = all(state_dict_byte_equal(states[rank], recovered[rank]) for rank in ranks_to_check)
+                    if not correct:
+                        raise RuntimeError("recovered state does not match original bytes")
 
-    if measured_rows:
-        print("summary_mean:")
-        print(f"  store_flatten_ms={mean(measured_rows, 'store_flatten_ms'):.3f}")
-        print(f"  store_reduction_group_pack_ms={mean(measured_rows, 'store_reduction_group_pack_ms'):.3f}")
-        print(f"  store_ec_encode_ms={mean(measured_rows, 'store_ec_encode_ms'):.3f}")
-        print(f"  store_storage_device_copy_ms={mean(measured_rows, 'store_storage_device_copy_ms'):.3f}")
-        print(f"  store_data_direct_save_ms={mean(measured_rows, 'store_data_direct_save_ms'):.3f}")
-        print(f"  store_parity_chunk_save_ms={mean(measured_rows, 'store_parity_chunk_save_ms'):.3f}")
-        print(f"  store_spare_buffer_alloc_ms={mean(measured_rows, 'store_spare_buffer_alloc_ms'):.3f}")
-        print(f"  store_storage_device_copy_gbps={mean(measured_rows, 'store_storage_device_copy_gbps'):.3f}")
-        print(f"  store_data_direct_save_gbps={mean(measured_rows, 'store_data_direct_save_gbps'):.3f}")
-        print(f"  store_parity_chunk_save_gbps={mean(measured_rows, 'store_parity_chunk_save_gbps'):.3f}")
-        print(f"  store_manifest_build_ms={mean(measured_rows, 'store_manifest_build_ms'):.3f}")
-        print(f"  store_chunk_storage_write_ms={mean(measured_rows, 'store_chunk_storage_write_ms'):.3f}")
-        print(f"  store_chunk_storage_write_gbps={mean(measured_rows, 'store_chunk_storage_write_gbps'):.3f}")
-        print(f"  store_total_ms={mean(measured_rows, 'store_total_ms'):.3f}")
-        print(f"  load_storage_read_ms={mean(measured_rows, 'load_storage_read_ms'):.3f}")
-        print(f"  load_checkpoint_sync_ms={mean(measured_rows, 'load_checkpoint_sync_ms'):.3f}")
-        print(f"  load_survivor_to_compute_ms={mean(measured_rows, 'load_survivor_to_compute_ms'):.3f}")
-        print(f"  load_decode_matrix_ms={mean(measured_rows, 'load_decode_matrix_ms'):.3f}")
-        print(f"  load_ec_decode_ms={mean(measured_rows, 'load_ec_decode_ms'):.3f}")
-        print(f"  load_raw_payload_to_output_device_ms={mean(measured_rows, 'load_raw_payload_to_output_device_ms'):.3f}")
-        print(f"  load_unflatten_ms={mean(measured_rows, 'load_unflatten_ms'):.3f}")
-        print(f"  load_final_sync_ms={mean(measured_rows, 'load_final_sync_ms'):.3f}")
-        print(f"  load_total_ms={mean(measured_rows, 'load_total_ms'):.3f}")
-        print(f"  store_effective_gbps={mean(measured_rows, 'store_effective_gbps'):.3f}")
-        print(f"  load_effective_gbps={mean(measured_rows, 'load_effective_gbps'):.3f}")
+                store_profile = dict(ctx.last_store_profile)
+                load_profile = dict(ctx.last_load_profile)
+                row = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "iteration": run - args.warmup,
+                    "profile": args.profile,
+                    "k": args.k,
+                    "m": args.m,
+                    "train_ranks": ",".join(map(str, train_ranks)),
+                    "spare_ranks": ",".join(map(str, spare_ranks)),
+                    "failed_rank": args.failed_rank,
+                    "load_ranks": args.load_ranks,
+                    "tensors_per_rank": len(states[args.failed_rank]),
+                    "actual_total_train_bytes": actual_total_bytes,
+                    "store_flatten_ms": store_profile.get("flatten_ms", 0.0),
+                    "store_reduction_group_pack_ms": store_profile.get("reduction_group_pack_ms", 0.0),
+                    "store_ec_encode_ms": store_profile.get("ec_encode_ms", 0.0),
+                    "store_storage_device_copy_ms": store_profile.get("storage_device_copy_ms", 0.0),
+                    "store_data_direct_save_ms": store_profile.get("data_direct_save_ms", 0.0),
+                    "store_parity_chunk_save_ms": store_profile.get("parity_chunk_save_ms", 0.0),
+                    "store_spare_buffer_alloc_ms": store_profile.get("spare_buffer_alloc_ms", 0.0),
+                    "store_manifest_build_ms": store_profile.get("manifest_build_ms", 0.0),
+                    "store_chunk_storage_write_ms": store_profile.get("chunk_storage_write_ms", 0.0),
+                    "store_data_chunk_write_ms": store_profile.get("data_chunk_write_ms", 0.0),
+                    "store_parity_chunk_write_ms": store_profile.get("parity_chunk_write_ms", 0.0),
+                    "store_checkpoint_index_ms": store_profile.get("checkpoint_index_ms", 0.0),
+                    "store_encode_ms": store_profile.get("encode_ms", 0.0),
+                    "store_total_ms": store_profile.get("total_ms", 0.0),
+                    "store_effective_gbps": gbps(actual_total_bytes, float(store_profile.get("total_ms", 0.0))),
+                    "store_data_row_bytes": store_profile.get("data_row_bytes", 0),
+                    "store_parity_row_bytes": store_profile.get("parity_row_bytes", 0),
+                    "store_storage_device_copy_gbps": gbps(
+                        int(store_profile.get("data_row_bytes", 0)) + int(store_profile.get("parity_row_bytes", 0)),
+                        float(store_profile.get("storage_device_copy_ms", 0.0)),
+                    ),
+                    "store_data_direct_save_gbps": gbps(
+                        int(store_profile.get("data_row_bytes", 0)),
+                        float(store_profile.get("data_direct_save_ms", 0.0)),
+                    ),
+                    "store_parity_chunk_save_gbps": gbps(
+                        int(store_profile.get("parity_row_bytes", 0)),
+                        float(store_profile.get("parity_chunk_save_ms", 0.0)),
+                    ),
+                    "store_chunk_storage_write_gbps": gbps(
+                        int(store_profile.get("data_chunk_bytes", 0)) + int(store_profile.get("parity_chunk_bytes", 0)),
+                        float(store_profile.get("chunk_storage_write_ms", 0.0)),
+                    ),
+                    "load_storage_read_ms": load_profile.get("storage_read_ms", 0.0),
+                    "load_checkpoint_sync_ms": load_profile.get("checkpoint_sync_ms", 0.0),
+                    "load_metadata_ms": load_profile.get("metadata_ms", 0.0),
+                    "load_survivor_to_compute_ms": load_profile.get("survivor_to_compute_ms", 0.0),
+                    "load_decode_matrix_ms": load_profile.get("decode_matrix_ms", 0.0),
+                    "load_ec_decode_ms": load_profile.get("ec_decode_ms", 0.0),
+                    "load_raw_payload_to_output_device_ms": load_profile.get("raw_payload_to_output_device_ms", 0.0),
+                    "load_unflatten_ms": load_profile.get("unflatten_ms", 0.0),
+                    "load_final_sync_ms": load_profile.get("final_sync_ms", 0.0),
+                    "load_decode_ms": load_profile.get("decode_ms", 0.0),
+                    "load_total_ms": load_profile.get("total_ms", 0.0),
+                    "load_effective_gbps": gbps(int(load_profile.get("bytes_total", 0)), float(load_profile.get("total_ms", 0.0))),
+                    "load_bytes_total": load_profile.get("bytes_total", 0),
+                    "verified": correct,
+                }
+                if measured:
+                    measured_rows.append(row)
+                phase = "measure" if measured else "warmup"
+                print(
+                    f"{phase} iter={run - args.warmup}: "
+                    f"store_total_ms={float(row['store_total_ms']):.3f} "
+                    f"load_total_ms={float(row['load_total_ms']):.3f} "
+                    f"store_GBps={float(row['store_effective_gbps']):.3f} "
+                    f"load_GBps={float(row['load_effective_gbps']):.3f} "
+                    f"verified={row['verified']}"
+                )
+                del recovered
+                recovered = None
 
-    if args.csv and measured_rows:
-        path = write_rows(measured_rows)
-        print(f"wrote {path}")
+            if measured_rows:
+                print("summary_mean:")
+                print(f"  store_flatten_ms={mean(measured_rows, 'store_flatten_ms'):.3f}")
+                print(f"  store_reduction_group_pack_ms={mean(measured_rows, 'store_reduction_group_pack_ms'):.3f}")
+                print(f"  store_ec_encode_ms={mean(measured_rows, 'store_ec_encode_ms'):.3f}")
+                print(f"  store_storage_device_copy_ms={mean(measured_rows, 'store_storage_device_copy_ms'):.3f}")
+                print(f"  store_data_direct_save_ms={mean(measured_rows, 'store_data_direct_save_ms'):.3f}")
+                print(f"  store_parity_chunk_save_ms={mean(measured_rows, 'store_parity_chunk_save_ms'):.3f}")
+                print(f"  store_spare_buffer_alloc_ms={mean(measured_rows, 'store_spare_buffer_alloc_ms'):.3f}")
+                print(f"  store_storage_device_copy_gbps={mean(measured_rows, 'store_storage_device_copy_gbps'):.3f}")
+                print(f"  store_data_direct_save_gbps={mean(measured_rows, 'store_data_direct_save_gbps'):.3f}")
+                print(f"  store_parity_chunk_save_gbps={mean(measured_rows, 'store_parity_chunk_save_gbps'):.3f}")
+                print(f"  store_manifest_build_ms={mean(measured_rows, 'store_manifest_build_ms'):.3f}")
+                print(f"  store_chunk_storage_write_ms={mean(measured_rows, 'store_chunk_storage_write_ms'):.3f}")
+                print(f"  store_chunk_storage_write_gbps={mean(measured_rows, 'store_chunk_storage_write_gbps'):.3f}")
+                print(f"  store_total_ms={mean(measured_rows, 'store_total_ms'):.3f}")
+                print(f"  load_storage_read_ms={mean(measured_rows, 'load_storage_read_ms'):.3f}")
+                print(f"  load_checkpoint_sync_ms={mean(measured_rows, 'load_checkpoint_sync_ms'):.3f}")
+                print(f"  load_survivor_to_compute_ms={mean(measured_rows, 'load_survivor_to_compute_ms'):.3f}")
+                print(f"  load_decode_matrix_ms={mean(measured_rows, 'load_decode_matrix_ms'):.3f}")
+                print(f"  load_ec_decode_ms={mean(measured_rows, 'load_ec_decode_ms'):.3f}")
+                print(f"  load_raw_payload_to_output_device_ms={mean(measured_rows, 'load_raw_payload_to_output_device_ms'):.3f}")
+                print(f"  load_unflatten_ms={mean(measured_rows, 'load_unflatten_ms'):.3f}")
+                print(f"  load_final_sync_ms={mean(measured_rows, 'load_final_sync_ms'):.3f}")
+                print(f"  load_total_ms={mean(measured_rows, 'load_total_ms'):.3f}")
+                print(f"  store_effective_gbps={mean(measured_rows, 'store_effective_gbps'):.3f}")
+                print(f"  load_effective_gbps={mean(measured_rows, 'load_effective_gbps'):.3f}")
+
+            if args.csv and measured_rows:
+                path = write_rows(measured_rows)
+                print(f"wrote {path}")
+        finally:
+            daemon.shutdown()
 
 
 if __name__ == "__main__":

@@ -14,7 +14,8 @@ import torch
 
 import racer
 from racer.config import RacerConfig
-from racer.distributed import distributed_load, distributed_store
+from racer.csd import CheckpointStorageDaemonClient
+from racer.distributed import distributed_load_from_storage, distributed_store
 from bench_utils import (
     barrier_if_distributed,
     destroy_distributed,
@@ -100,6 +101,19 @@ def _max_distributed_ms(begin: float) -> float:
     return float(elapsed.item())
 
 
+def _csd_client(args: argparse.Namespace) -> CheckpointStorageDaemonClient:
+    if args.csd_socket_path:
+        address = args.csd_socket_path
+    elif args.csd_port is not None:
+        address = (args.csd_host, int(args.csd_port))
+    else:
+        raise SystemExit(
+            "RACER examples require an external native CSD; pass --csd-socket-path "
+            "or --csd-host/--csd-port. No local storage fallback is allowed."
+        )
+    return CheckpointStorageDaemonClient(address, authkey=args.csd_authkey)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-ranks", default="0,1,2,3")
@@ -114,6 +128,10 @@ def main() -> None:
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--mode", choices=["sleep", "matmul"], default="sleep")
     parser.add_argument("--matmul-size", type=int, default=2048)
+    parser.add_argument("--csd-socket-path", default=None)
+    parser.add_argument("--csd-host", default="127.0.0.1")
+    parser.add_argument("--csd-port", type=int, default=None)
+    parser.add_argument("--csd-authkey", default="racer-csd")
     args = parser.parse_args()
 
     train_ranks = parse_rank_list(args.train_ranks)
@@ -131,6 +149,7 @@ def main() -> None:
             raise SystemExit(
                 f"visible CUDA device_count={torch.cuda.device_count()} is too small for ranks {train_ranks + spare_ranks}"
             )
+        chunk_storage = _csd_client(args)
 
         if world > 1:
             config = RacerConfig(
@@ -161,6 +180,7 @@ def main() -> None:
                         config=config,
                         local_packet=local_packet,
                         tag=f"synthetic_{step:06d}",
+                        chunk_storage=chunk_storage,
                     )
                     store_wall_times.append(_max_distributed_ms(begin_store))
                     last_step = step
@@ -171,7 +191,12 @@ def main() -> None:
             if args.verify and last_state is not None:
                 failed = [train_ranks[0]]
                 begin_load = time.perf_counter()
-                recovered = distributed_load(state=last_state, failed_train_ranks=failed)
+                recovered = distributed_load_from_storage(
+                    config=config,
+                    tag=last_state.tag,
+                    chunk_storage=chunk_storage,
+                    failed_train_ranks=failed,
+                )
                 load_wall_ms = _max_distributed_ms(begin_load)
                 if rank in failed:
                     assert local_packet is not None
@@ -236,6 +261,8 @@ def main() -> None:
             m=args.m,
             train_ranks=train_ranks,
             spare_ranks=spare_ranks,
+            storage_backend="csd_native_pinned",
+            storage_options={"client": chunk_storage},
         )
         obj = _make_obj(train_ranks, packet_size)
         _fill_obj(obj, 0)

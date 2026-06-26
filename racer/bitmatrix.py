@@ -2,15 +2,14 @@
 
 For a coefficient e, B(e) is an 8x8 bitmatrix such that applying B(e) to the
 bits of byte s produces the bits of gf_mul(e, s). V1 uses this for correctness
-tests and Cauchy optimization cost estimates.
-
-TODO: compile B(E) into a CUDA XOR schedule kernel so parity can be generated
-without table-based GF multiply in future RACER versions.
+tests and Cauchy optimization cost estimates. The expanded bitmatrix can also
+be applied directly on CUDA byte buffers through ``apply_matrix_cuda``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 from . import gf256
 
@@ -69,3 +68,40 @@ def bitmatrix_weight(B: Sequence[Sequence[int]]) -> int:
     for row in B:
         total += sum(1 for value in row if int(value) != 0)
     return total
+
+
+def matrix_to_cuda_bitmatrix(
+    matrix: list[list[int]],
+    *,
+    device: Any,
+    w: int = 8,
+) -> Any:
+    if w != 8:
+        raise NotImplementedError("only w=8 is implemented")
+    import torch
+
+    return torch.tensor(matrix_to_bitmatrix(matrix, w), dtype=torch.uint8, device=device).contiguous()
+
+
+def apply_matrix_cuda(
+    inputs: Sequence[Any],
+    matrix: list[list[int]] | Any,
+    outputs: Sequence[Any] | None = None,
+    *,
+    synchronize: bool = False,
+) -> list[Any]:
+    from . import codec_cuda
+
+    if not inputs:
+        raise ValueError("inputs must be non-empty")
+    device = inputs[0].device
+    if hasattr(matrix, "dim"):
+        bitmatrix = matrix
+    else:
+        bitmatrix = matrix_to_cuda_bitmatrix(matrix, device=device)
+    return codec_cuda.apply_bitmatrix_cuda(
+        inputs,
+        bitmatrix,
+        outputs=outputs,
+        synchronize=synchronize,
+    )

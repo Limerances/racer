@@ -1,4 +1,7 @@
-from racer import bitmatrix, gf256
+import pytest
+import torch
+
+from racer import bitmatrix, codec_cuda, gf256
 
 
 def test_element_bitmatrix_matches_gf_multiply():
@@ -27,3 +30,22 @@ def test_matrix_to_bitmatrix_shape():
     assert len(bm) == 16
     assert all(len(row) == 16 for row in bm)
     assert bitmatrix.bitmatrix_weight(bm) > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_bitmatrix_kernel_matches_gf_matrix_kernel():
+    if codec_cuda._optional_extension_function("apply_bitmatrix_cuda") is None:
+        pytest.skip("RACER CUDA bitmatrix extension is unavailable")
+    inputs = [
+        (torch.arange(257, dtype=torch.int16, device="cuda") % 256).to(torch.uint8),
+        ((torch.arange(257, dtype=torch.int16, device="cuda") + 17) % 256).to(torch.uint8),
+        ((torch.arange(257, dtype=torch.int16, device="cuda") + 31) % 256).to(torch.uint8),
+    ]
+    matrix = [[1, 2, 3], [5, 0, 7]]
+
+    expected = codec_cuda.apply_matrix_cuda(inputs, matrix, synchronize=True)
+    actual = bitmatrix.apply_matrix_cuda(inputs, matrix, synchronize=True)
+
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected):
+        assert torch.equal(got, want)

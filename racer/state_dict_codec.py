@@ -7,17 +7,9 @@ the EC matrix work can happen on GPU.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import copy
 from typing import Any
-
-
-SUPPORTED_DTYPE_NAMES = {
-    "torch.float32",
-    "torch.float16",
-    "torch.bfloat16",
-    "torch.int64",
-    "torch.uint8",
-}
 
 
 @dataclass(frozen=True)
@@ -33,10 +25,17 @@ class TensorMetadata:
 
 
 @dataclass(frozen=True)
+class NonTensorMetadata:
+    key: str
+    value: Any
+
+
+@dataclass(frozen=True)
 class RankStateMetadata:
     source_train_rank: int
     tensors: list[TensorMetadata]
     payload_nbytes: int
+    non_tensors: list[NonTensorMetadata] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -61,14 +60,16 @@ def flatten_state_dict(
     pieces = []
     tensor_meta: list[TensorMetadata] = []
     offset = 0
+    non_tensor_meta: list[NonTensorMetadata] = []
     for key, tensor in state_dict.items():
         if not isinstance(key, str):
-            raise TypeError("state_dict tensor keys must be strings.")
+            raise TypeError("state_dict keys must be strings.")
         if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"state_dict[{key!r}] must be a torch.Tensor.")
+            non_tensor_meta.append(NonTensorMetadata(key=key, value=copy.deepcopy(tensor)))
+            continue
+        if tensor.layout != torch.strided:
+            raise TypeError(f"state_dict[{key!r}] must be a dense strided tensor.")
         dtype_name = str(tensor.dtype)
-        if dtype_name not in SUPPORTED_DTYPE_NAMES:
-            raise TypeError(f"Unsupported tensor dtype for {key!r}: {tensor.dtype}.")
 
         original_device = str(tensor.device)
         was_contiguous = tensor.is_contiguous()
@@ -98,13 +99,13 @@ def flatten_state_dict(
     if pieces:
         payload = torch.cat(pieces).contiguous()
     else:
-        if target_device is None:
-            raise ValueError("empty state_dict payloads require an explicit target_device")
-        payload = torch.empty(0, dtype=torch.uint8, device=target_device)
+        payload_device = target_device if target_device is not None else "cpu"
+        payload = torch.empty(0, dtype=torch.uint8, device=payload_device)
     metadata = RankStateMetadata(
         source_train_rank=source_train_rank,
         tensors=tensor_meta,
         payload_nbytes=int(payload.numel()),
+        non_tensors=non_tensor_meta,
     )
     return FlattenedRankState(
         source_train_rank=source_train_rank,
@@ -131,31 +132,60 @@ def unflatten_state_dict(
             f"payload has {payload.numel()} bytes, expected at least {metadata.payload_nbytes}."
         )
 
-    result: dict[str, Any] = {}
+    result: dict[str, Any] = {
+        item.key: copy.deepcopy(item.value)
+        for item in getattr(metadata, "non_tensors", [])
+    }
     for tensor_meta in metadata.tensors:
         dtype = _dtype_from_name(tensor_meta.dtype, torch)
-        byte_slice = payload[tensor_meta.offset : tensor_meta.offset + tensor_meta.nbytes]
         device = target_device if target_device is not None else tensor_meta.device
-        byte_slice = byte_slice.clone().to(device, non_blocking=True).contiguous()
-        tensor = byte_slice.view(dtype).reshape(tensor_meta.shape).clone()
+        byte_slice = _tensor_byte_slice(
+            payload,
+            offset=tensor_meta.offset,
+            nbytes=tensor_meta.nbytes,
+            dtype=dtype,
+            target_device=device,
+            torch=torch,
+        )
+        tensor = byte_slice.view(dtype).reshape(tensor_meta.shape)
         if tensor_meta.requires_grad and tensor.is_floating_point():
+            if not tensor.is_leaf:
+                tensor = tensor.clone()
             tensor.requires_grad_(True)
         result[tensor_meta.key] = tensor
     return result
 
 
+def _tensor_byte_slice(
+    payload: Any,
+    *,
+    offset: int,
+    nbytes: int,
+    dtype: Any,
+    target_device: Any,
+    torch: Any,
+) -> Any:
+    byte_slice = payload.narrow(0, int(offset), int(nbytes))
+    target = torch.device(target_device)
+    if target.type == "cuda" and target.index is None:
+        target = torch.device("cuda", torch.cuda.current_device())
+    if byte_slice.device != target:
+        return byte_slice.to(target, non_blocking=True).contiguous()
+
+    element_size = torch.empty((), dtype=dtype).element_size()
+    if element_size > 1 and int(byte_slice.storage_offset()) % int(element_size) != 0:
+        return byte_slice.clone().contiguous()
+    return byte_slice
+
+
 def _dtype_from_name(name: str, torch: Any) -> Any:
-    mapping = {
-        "torch.float32": torch.float32,
-        "torch.float16": torch.float16,
-        "torch.bfloat16": torch.bfloat16,
-        "torch.int64": torch.int64,
-        "torch.uint8": torch.uint8,
-    }
-    try:
-        return mapping[name]
-    except KeyError as exc:
-        raise TypeError(f"Unsupported tensor dtype metadata: {name}.") from exc
+    if not name.startswith("torch."):
+        raise TypeError(f"Unsupported tensor dtype metadata: {name}.")
+    attr = name.split(".", 1)[1]
+    dtype = getattr(torch, attr, None)
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"Unsupported tensor dtype metadata: {name}.")
+    return dtype
 
 
 def _torch() -> Any:

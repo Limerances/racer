@@ -26,9 +26,19 @@ def test_spare_compute_requires_spare_gpu():
         )
 
 
+def test_default_storage_requires_restart_aware_csd_options():
+    with pytest.raises(ValueError, match="CSD storage requires"):
+        racer.init(
+            k=2,
+            m=1,
+            train_ranks=[0, 1, 2],
+            spare_ranks=[3],
+        )
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 5, reason="requires train GPUs 0-3 plus spare GPU 4")
-def test_store_rejects_spare_rank_key():
-    ctx = racer.init(
+def test_store_rejects_spare_rank_key(native_csd_context_factory):
+    ctx, _daemon = native_csd_context_factory(
         k=3,
         m=1,
         train_ranks=[0, 1, 2, 3],

@@ -12,7 +12,8 @@ import torch
 
 import racer
 from racer.config import RacerConfig
-from racer.distributed import distributed_load, distributed_store
+from racer.csd import CheckpointStorageDaemonClient
+from racer.distributed import distributed_load_from_storage, distributed_store
 from bench_utils import (
     barrier_if_distributed,
     destroy_distributed,
@@ -58,6 +59,19 @@ def _max_wall_ms(begin: float) -> float:
     return float(elapsed.item())
 
 
+def _csd_client(args: argparse.Namespace) -> CheckpointStorageDaemonClient:
+    if args.csd_socket_path:
+        address = args.csd_socket_path
+    elif args.csd_port is not None:
+        address = (args.csd_host, int(args.csd_port))
+    else:
+        raise SystemExit(
+            "RACER examples require an external native CSD; pass --csd-socket-path "
+            "or --csd-host/--csd-port. No local storage fallback is allowed."
+        )
+    return CheckpointStorageDaemonClient(address, authkey=args.csd_authkey)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-ranks", required=True)
@@ -68,6 +82,10 @@ def main() -> None:
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--test-nondivisible", action="store_true")
     parser.add_argument("--failures", type=str, default=None)
+    parser.add_argument("--csd-socket-path", default=None)
+    parser.add_argument("--csd-host", default="127.0.0.1")
+    parser.add_argument("--csd-port", type=int, default=None)
+    parser.add_argument("--csd-authkey", default="racer-csd")
     args = parser.parse_args()
 
     train_ranks = parse_rank_list(args.train_ranks)
@@ -86,6 +104,7 @@ def main() -> None:
 
         if args.test_nondivisible and len(train_ranks) % args.k == 0:
             raise SystemExit("--test-nondivisible was requested, but len(train_ranks) % k == 0")
+        chunk_storage = _csd_client(args)
 
         if world > 1:
             if world <= max(train_ranks + spare_ranks):
@@ -107,6 +126,7 @@ def main() -> None:
                     config=config,
                     local_packet=local_packet,
                     tag=f"bench_{size_bytes}",
+                    chunk_storage=chunk_storage,
                 )
                 store_wall_ms = _max_wall_ms(begin)
 
@@ -114,7 +134,12 @@ def main() -> None:
                 if len(failures) > args.m:
                     raise SystemExit(f"requested {len(failures)} failures, but m={args.m}")
                 begin = time.perf_counter()
-                load_result = distributed_load(state=state, failed_train_ranks=failures if args.verify else [])
+                load_result = distributed_load_from_storage(
+                    config=config,
+                    tag=state.tag,
+                    chunk_storage=chunk_storage,
+                    failed_train_ranks=failures if args.verify else [],
+                )
                 load_wall_ms = _max_wall_ms(begin)
 
                 local_correct = True
@@ -160,6 +185,8 @@ def main() -> None:
             m=args.m,
             train_ranks=train_ranks,
             spare_ranks=spare_ranks,
+            storage_backend="csd_native_pinned",
+            storage_options={"client": chunk_storage},
         )
         failures = parse_rank_list(args.failures) if args.failures else [train_ranks[0]]
         if len(failures) > args.m:

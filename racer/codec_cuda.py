@@ -9,56 +9,24 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from pathlib import Path
 from typing import Sequence
 
 import torch
 
+from .codec import _ext
 from . import gf256
 
 
-@lru_cache(maxsize=1)
 def _extension():
-    try:
-        from . import _C  # type: ignore
-
-        return _C
-    except Exception:
-        pass
-
-    if os.environ.get("RACER_JIT_COMPILE") != "1":
-        return None
-
-    try:
-        from torch.utils.cpp_extension import load
-    except Exception:
-        return None
-
-    root = Path(__file__).resolve().parent
-    try:
-        return load(
-            name="racer_jit_C",
-            sources=[str(root / "csrc" / "binding.cpp"), str(root / "csrc" / "racer_cuda.cu")],
-            extra_cuda_cflags=["-O3", "--use_fast_math"],
-            extra_cflags=["-O3"],
-            verbose=False,
-        )
-    except Exception:
-        return None
+    return _ext.extension()
 
 
 def extension_available() -> bool:
-    return _extension() is not None
+    return _ext.extension_available()
 
 
 def _extension_function(name: str):
-    ext = _extension()
-    if ext is None or not hasattr(ext, name):
-        raise RuntimeError(
-            f"RACER CUDA extension function {name!r} is required; rebuild the package "
-            "or set RACER_JIT_COMPILE=1 in a CUDA build environment"
-        )
-    return getattr(ext, name)
+    return _ext.extension_function(name)
 
 
 def _sync(device: torch.device) -> None:
@@ -95,13 +63,7 @@ def _validate_cuda_buffer(tensor: torch.Tensor, name: str) -> torch.Tensor:
 
 
 def _optional_extension_function(*names: str):
-    ext = _extension()
-    if ext is None:
-        return None
-    for name in names:
-        if hasattr(ext, name):
-            return getattr(ext, name)
-    return None
+    return _ext.optional_extension_function(*names)
 
 
 @lru_cache(maxsize=1)
@@ -277,6 +239,43 @@ def apply_matrix_cuda(
         result = [table_result[row].contiguous().view(-1) for row in range(int(table_result.shape[0]))]
     else:
         result = _apply_matrix_extension(flat_inputs, coeff, flat_outputs, outputs_provided=outputs is not None)
+    if synchronize:
+        _sync(device)
+    return result
+
+
+def apply_bitmatrix_cuda(
+    inputs: Sequence[torch.Tensor],
+    bitmatrix: Sequence[Sequence[int]] | torch.Tensor,
+    outputs: Sequence[torch.Tensor] | None = None,
+    *,
+    synchronize: bool = False,
+) -> list[torch.Tensor]:
+    _validate_blocks(inputs)
+    device = inputs[0].device
+    flat_inputs = [tensor.view(-1) for tensor in inputs]
+    if isinstance(bitmatrix, torch.Tensor):
+        bm = bitmatrix.to(device=device, dtype=torch.uint8).contiguous()
+    else:
+        bm = torch.tensor(bitmatrix, dtype=torch.uint8, device=device).contiguous()
+    if bm.dim() != 2 or bm.shape[1] != len(flat_inputs) * 8 or bm.shape[0] % 8 != 0:
+        raise ValueError("bitmatrix must have shape [num_outputs * 8, num_inputs * 8]")
+
+    output_count = int(bm.shape[0] // 8)
+    if outputs is None:
+        flat_outputs = [torch.empty_like(flat_inputs[0]) for _ in range(output_count)]
+    else:
+        if len(outputs) != output_count:
+            raise ValueError("outputs length must equal bitmatrix row count / 8")
+        flat_outputs = [_validate_cuda_buffer(out, "output").view(-1) for out in outputs]
+        for out in flat_outputs:
+            if out.device != device:
+                raise ValueError("all outputs must be on the same CUDA device as inputs")
+            if out.numel() != flat_inputs[0].numel():
+                raise ValueError("all outputs must have the same numel as inputs")
+
+    fn = _extension_function("apply_bitmatrix_cuda")
+    result = list(fn(list(flat_inputs), bm, list(flat_outputs)))
     if synchronize:
         _sync(device)
     return result

@@ -6,8 +6,8 @@ from racer.gpt2_synthetic import state_dict_byte_equal
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires train GPUs 0-2 plus spare GPU 3")
-def test_store_load_state_dict_payload_cuda_failed_rank():
-    ctx = racer.init(
+def test_store_load_state_dict_payload_cuda_failed_rank(native_csd_context_factory):
+    ctx, _daemon = native_csd_context_factory(
         k=2,
         m=1,
         train_ranks=[0, 1, 2],
@@ -33,8 +33,8 @@ def test_store_load_state_dict_payload_cuda_failed_rank():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires train GPUs 0-2 plus spare GPU 3")
-def test_state_dict_manifest_metadata_is_json_serializable():
-    ctx = racer.init(
+def test_state_dict_manifest_metadata_is_json_serializable(native_csd_context_factory):
+    ctx, _daemon = native_csd_context_factory(
         k=2,
         m=1,
         train_ranks=[0, 1, 2],
@@ -45,7 +45,7 @@ def test_state_dict_manifest_metadata_is_json_serializable():
 
     import json
 
-    metadata = ctx.storage.get("state_manifest").metadata
+    metadata = ctx.chunk_storage.get_manifest("state_manifest")
     json.dumps(metadata)
     assert metadata["payload_kind"] == "state_dict"
     assert sorted(metadata["rank_state_metadata"]) == ["0", "1", "2"]
