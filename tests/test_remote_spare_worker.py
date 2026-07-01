@@ -84,6 +84,45 @@ def test_pai_multinode_dry_run_assigns_train_and_remote_spare_roles(tmp_path):
     assert "DRY_RUN=1: 参数校验完成，跳过 remote spare worker。" in node2.stdout
 
 
+def test_pai_multinode_check_paths_accepts_indexed_dataset_prefix(tmp_path):
+    fake_megatron = tmp_path / "Megatron-LM-FT"
+    fake_megatron.mkdir()
+    (fake_megatron / "pretrain_gpt.py").write_text("# fake pretrain entry\n", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_torchrun = fake_bin / "torchrun"
+    fake_torchrun.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    fake_torchrun.chmod(0o755)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    data_prefix = data_dir / "my_shakespeare_text_document"
+    (data_prefix.with_suffix(".bin")).write_bytes(b"fake-bin")
+    (data_prefix.with_suffix(".idx")).write_bytes(b"fake-idx")
+    vocab_file = tmp_path / "vocab.json"
+    merges_file = tmp_path / "merges.txt"
+    vocab_file.write_text("{}", encoding="utf-8")
+    merges_file.write_text("#version: 0.2\n", encoding="utf-8")
+
+    result = _run_script(
+        "examples/pai_run_megatron_multinode.sh",
+        tmp_path,
+        MODE="baseline",
+        NODE_RANK="0",
+        NNODES="1",
+        NPROC_PER_NODE="1",
+        DRY_RUN="0",
+        MEGATRON_ROOT=str(fake_megatron),
+        DATA_PATH=str(data_prefix),
+        GPT2_VOCAB_FILE=str(vocab_file),
+        GPT2_MERGE_FILE=str(merges_file),
+        PATH=f"{fake_bin}:{os.environ['PATH']}",
+    )
+
+    assert not data_prefix.exists()
+    assert "torchrun exit code: 0" in result.stdout
+
+
 def test_pai_multinode_dry_run_accepts_default_egm_remote_spare_factory(tmp_path):
     result = _run_script(
         "examples/pai_run_megatron_multinode.sh",

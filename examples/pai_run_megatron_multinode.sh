@@ -179,6 +179,25 @@ require_path() {
   fi
 }
 
+require_indexed_dataset_prefix() {
+  local prefix="$1"
+  local name="$2"
+  local missing=0
+  if [[ ! -f "${prefix}.bin" ]]; then
+    echo "ERROR: ${name}.bin 不存在: ${prefix}.bin" >&2
+    missing=1
+  fi
+  if [[ ! -f "${prefix}.idx" ]]; then
+    echo "ERROR: ${name}.idx 不存在: ${prefix}.idx" >&2
+    missing=1
+  fi
+  if (( missing != 0 )); then
+    echo "提示: ${name} 是 Megatron indexed dataset 前缀，不需要存在无后缀文件。" >&2
+    echo "      当前 ${name}=${prefix}" >&2
+    exit 3
+  fi
+}
+
 expand_rank_list() {
   local value="$1"
   local -a out=()
@@ -326,7 +345,7 @@ validate_remote_spare_topology
 require_path "${RACER_ROOT}" "RACER_ROOT"
 require_path "${MEGATRON_ROOT}/pretrain_gpt.py" "Megatron pretrain_gpt.py"
 if [[ "${DRY_RUN}" != "1" ]]; then
-  require_path "${DATA_PATH}" "DATA_PATH"
+  require_indexed_dataset_prefix "${DATA_PATH}" "DATA_PATH"
   require_path "${GPT2_VOCAB_FILE}" "GPT2_VOCAB_FILE"
   require_path "${GPT2_MERGE_FILE}" "GPT2_MERGE_FILE"
 fi

@@ -13,15 +13,15 @@ remote spare 模式下，spare rank 必须紧跟 train rank 连续编号。8 个
 PAI 启动命令先填：
 
 ```bash
-bash -lc 'mkdir -p /mnt/workspace/pai_bootstrap; env | sort > /mnt/workspace/pai_bootstrap/env.$(hostname).txt; hostname -I > /mnt/workspace/pai_bootstrap/ip.$(hostname).txt; sleep infinity'
+bash -lc 'mkdir -p /mnt/data/luohaonan/workspace/pai_bootstrap; env | sort > /mnt/data/luohaonan/workspace/pai_bootstrap/env.$(hostname).txt; hostname -I > /mnt/data/luohaonan/workspace/pai_bootstrap/ip.$(hostname).txt; sleep infinity'
 ```
 
 进入每个节点后确认：
 
 ```bash
 nvidia-smi -L
-ls /mnt/workspace/racer
-ls /mnt/workspace/Megatron-LM-FT
+ls /mnt/data/luohaonan/workspace/racer
+ls /mnt/data/luohaonan/workspace/Megatron-LM-FT
 ```
 
 `MASTER_ADDR` 用 node0 的内网 IP。
@@ -45,37 +45,58 @@ ls /mnt/workspace/Megatron-LM-FT
 node0:
 
 ```bash
-cd /mnt/workspace/racer
+cd /mnt/data/luohaonan/workspace/racer
 MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
   RESTART_OVERWRITE=1 NODE_RANK=0 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=<MASTER_IP> \
-  OUTPUT_ROOT=/mnt/workspace/pai_runs/gb200_pinned_1_5b_001 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
+  bash examples/pai_run_megatron_restart_driver.sh
+```
+```bash
+cd /mnt/data/luohaonan/workspace/racer
+MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
+  RESTART_OVERWRITE=1 NODE_RANK=0 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.155 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
   bash examples/pai_run_megatron_restart_driver.sh
 ```
 
 node1:
 
 ```bash
-cd /mnt/workspace/racer
+cd /mnt/data/luohaonan/workspace/racer
 MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
   RESTART_OVERWRITE=1 NODE_RANK=1 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=<MASTER_IP> \
-  OUTPUT_ROOT=/mnt/workspace/pai_runs/gb200_pinned_1_5b_001 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
+  bash examples/pai_run_megatron_restart_driver.sh
+```
+```bash
+cd /mnt/data/luohaonan/workspace/racer
+MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
+  RESTART_OVERWRITE=1 NODE_RANK=1 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.155 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
   bash examples/pai_run_megatron_restart_driver.sh
 ```
 
 node2:
 
 ```bash
-cd /mnt/workspace/racer
+cd /mnt/data/luohaonan/workspace/racer
 MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
   RESTART_OVERWRITE=1 NODE_RANK=2 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=<MASTER_IP> \
-  OUTPUT_ROOT=/mnt/workspace/pai_runs/gb200_pinned_1_5b_001 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
+  bash examples/pai_run_megatron_restart_driver.sh
+```
+```bash
+cd /mnt/data/luohaonan/workspace/racer
+MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
+  RESTART_OVERWRITE=1 NODE_RANK=2 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.155 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
   bash examples/pai_run_megatron_restart_driver.sh
 ```
 
 5.3B 只改 `MODEL_SIZE`、`BASE_RUN_ID`、`OUTPUT_ROOT`：
 
 ```bash
-MODEL_SIZE=5.3b BASE_RUN_ID=gb200_pinned_5_3b_001 OUTPUT_ROOT=/mnt/workspace/pai_runs/gb200_pinned_5_3b_001
+MODEL_SIZE=5.3b BASE_RUN_ID=gb200_pinned_5_3b_001 OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_5_3b_001
 ```
 
 ## 3. 正式测 EGM
@@ -83,14 +104,14 @@ MODEL_SIZE=5.3b BASE_RUN_ID=gb200_pinned_5_3b_001 OUTPUT_ROOT=/mnt/workspace/pai
 默认使用 repo 内置 runtime factory：`racer.egm_runtime:create_runtime`。先在每个节点确认能 import：
 
 ```bash
-PYTHONPATH=/mnt/workspace/racer:/mnt/workspace/Megatron-LM-FT:$PYTHONPATH \
+PYTHONPATH=/mnt/data/luohaonan/workspace/racer:/mnt/data/luohaonan/workspace/Megatron-LM-FT:$PYTHONPATH \
 python -c 'import racer.egm_runtime as r; print(r.create_runtime)'
 ```
 
 再做 EGM runtime preflight：
 
 ```bash
-PYTHONPATH=/mnt/workspace/racer:/mnt/workspace/Megatron-LM-FT:$PYTHONPATH \
+PYTHONPATH=/mnt/data/luohaonan/workspace/racer:/mnt/data/luohaonan/workspace/Megatron-LM-FT:$PYTHONPATH \
 python - <<'PY'
 from racer.egm_runtime import create_runtime
 runtime = create_runtime(total_bytes=0)
@@ -148,7 +169,7 @@ capabilities()
 node0 完成后看：
 
 ```bash
-cat /mnt/workspace/pai_runs/gb200_pinned_1_5b_001/restart_state/gb200_pinned_1_5b_001/summary.md
+cat /mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001/restart_state/gb200_pinned_1_5b_001/summary.md
 ```
 
 关键文件：
@@ -179,7 +200,7 @@ node2: RACER_CSD_LOCAL_RANKS=8
 MODE=racer_pinned_remote_spare NODE_RANK=0 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=<MASTER_IP> \
   MODEL_SIZE=1.5b TRAIN_ITERS=20 SAVE_INTERVAL=5 \
   RACER_K=6 RACER_M=2 RACER_TRAIN_RANKS=0-7 RACER_SPARE_RANKS=8 \
-  OUTPUT_ROOT=/mnt/workspace/pai_runs/smoke_pinned_1_5b \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/smoke_pinned_1_5b \
   bash examples/pai_run_megatron_multinode.sh
 ```
 
@@ -190,11 +211,11 @@ node1/node2 同理只改 `NODE_RANK`。
 如果要测单机 5 卡形态，例如 4 个 train rank + 1 个 local spare：
 
 ```bash
-cd /mnt/workspace/racer
+cd /mnt/data/luohaonan/workspace/racer
 MODE=racer_pinned_single_node NODE_RANK=0 NNODES=1 NPROC_PER_NODE=4 MASTER_ADDR=127.0.0.1 \
   MODEL_SIZE=1.5b TRAIN_ITERS=80 SAVE_INTERVAL=5 \
   RACER_K=3 RACER_M=1 RACER_TRAIN_RANKS=0-3 RACER_SPARE_RANKS=4 \
-  OUTPUT_ROOT=/mnt/workspace/pai_runs/local_spare_1_5b \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/local_spare_1_5b \
   bash examples/pai_run_megatron_multinode.sh
 ```
 
