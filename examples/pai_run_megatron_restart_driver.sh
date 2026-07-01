@@ -188,7 +188,7 @@ wait_for_save_then_kill() {
   done
 }
 
-summarize_node0_logs() {
+summarize_cluster_logs() {
   python - "${LOG_ROOT}" "${BASE_RUN_ID}" "${SAVE_INTERVAL}" "${STATE_DIR}" <<'PY'
 import csv
 import re
@@ -201,32 +201,34 @@ base_run_id = sys.argv[2]
 save_interval = int(sys.argv[3])
 state_dir = Path(sys.argv[4])
 
-iter_re = re.compile(r"iteration\s+([0-9]+)/\s*([0-9]+).*elapsed time per iteration \(ms\):\s*([0-9.]+)")
+iter_re = re.compile(r"iteration\s+([0-9]+)\s*/\s*([0-9]+).*elapsed time per iteration \(ms\):\s*([0-9.]+)")
 store_re = re.compile(r"RACER distributed tensor-tree checkpoint stored: tag=([^,]+), store=([0-9.]+) ms")
 load_re = re.compile(r"RACER distributed memory checkpoint loaded: tag=([^,]+), total=([0-9.]+) ms")
 
-rows = []
-stores = []
-loads = []
-for path in sorted(log_root.glob(f"{base_run_id}_phase*.node0.log")):
+rows_by_key = {}
+stores_by_key = {}
+loads_by_key = {}
+for path in sorted(log_root.glob(f"{base_run_id}_phase*.driver.node*.log")):
     phase = path.stem.split(".")[0].replace(base_run_id + "_", "")
+    node = path.stem.rsplit("node", 1)[-1]
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         m = iter_re.search(line)
         if m:
             iteration = int(m.group(1))
-            rows.append({
+            rows_by_key[(phase, iteration)] = {
                 "phase": phase,
+                "node": node,
                 "iteration": iteration,
                 "train_iters": int(m.group(2)),
                 "elapsed_time_per_iteration_ms": float(m.group(3)),
                 "checkpoint_iteration": iteration % save_interval == 0,
-            })
+            }
         m = store_re.search(line)
         if m:
-            stores.append({"phase": phase, "tag": m.group(1), "store_ms": float(m.group(2))})
+            stores_by_key[(phase, m.group(1))] = {"phase": phase, "tag": m.group(1), "store_ms": float(m.group(2))}
         m = load_re.search(line)
         if m:
-            loads.append({"phase": phase, "tag": m.group(1), "load_total_ms": float(m.group(2))})
+            loads_by_key[(phase, m.group(1))] = {"phase": phase, "tag": m.group(1), "load_total_ms": float(m.group(2))}
 
 def stats(items):
     if not items:
@@ -241,14 +243,31 @@ def stats(items):
     }
 
 state_dir.mkdir(parents=True, exist_ok=True)
+rows = [rows_by_key[key] for key in sorted(rows_by_key)]
+stores = [stores_by_key[key] for key in sorted(stores_by_key)]
+loads = [loads_by_key[key] for key in sorted(loads_by_key)]
 with (state_dir / "iteration_times.csv").open("w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(f, fieldnames=["phase", "iteration", "train_iters", "elapsed_time_per_iteration_ms", "checkpoint_iteration"])
+    writer = csv.DictWriter(f, fieldnames=["phase", "node", "iteration", "train_iters", "elapsed_time_per_iteration_ms", "checkpoint_iteration"])
     writer.writeheader()
     writer.writerows(rows)
 
 normal = [r["elapsed_time_per_iteration_ms"] for r in rows if not r["checkpoint_iteration"]]
 all_iters = [r["elapsed_time_per_iteration_ms"] for r in rows]
+unique_iterations = sorted({int(r["iteration"]) for r in rows})
+unique_checkpoint_iterations = [iteration for iteration in unique_iterations if iteration % save_interval == 0]
+unique_normal_iterations = [iteration for iteration in unique_iterations if iteration % save_interval != 0]
+first_iteration_by_phase = {}
+for row in rows:
+    phase = row["phase"]
+    iteration = int(row["iteration"])
+    first_iteration_by_phase[phase] = min(iteration, first_iteration_by_phase.get(phase, iteration))
+steady_normal = [
+    r["elapsed_time_per_iteration_ms"]
+    for r in rows
+    if not r["checkpoint_iteration"] and int(r["iteration"]) > first_iteration_by_phase[r["phase"]] + 1
+]
 normal_stats = stats(normal)
+steady_normal_stats = stats(steady_normal)
 all_stats = stats(all_iters)
 
 summary = [
@@ -256,10 +275,18 @@ summary = [
     "",
     f"- 原始日志目录: `{log_root}`",
     f"- iteration 明细: `{state_dir / 'iteration_times.csv'}`",
-    f"- 正常训练 iteration 数: `{normal_stats['count']}`",
-    f"- 正常训练每 iteration 平均耗时: `{normal_stats['avg']} ms`",
-    f"- 正常训练 p50/p95: `{normal_stats['p50']} / {normal_stats['p95']} ms`",
-    f"- 全部 iteration 平均耗时: `{all_stats['avg']} ms`",
+    f"- 唯一训练 iteration 数: `{len(unique_iterations)}`",
+    f"- 唯一非 checkpoint iteration 数: `{len(unique_normal_iterations)}`",
+    f"- 唯一 checkpoint iteration 数: `{len(unique_checkpoint_iterations)}`",
+    f"- iteration 时间日志样本数: `{len(rows)}`",
+    f"- 非 checkpoint 日志样本数: `{normal_stats['count']}`",
+    f"- 非 checkpoint 样本平均耗时: `{normal_stats['avg']} ms`",
+    f"- 非 checkpoint 样本 p50/p95: `{normal_stats['p50']} / {normal_stats['p95']} ms`",
+    f"- 稳态非 checkpoint 样本数: `{steady_normal_stats['count']}`",
+    f"- 稳态训练每 iteration 平均耗时: `{steady_normal_stats['avg']} ms`",
+    f"- 稳态训练 p50/p95: `{steady_normal_stats['p50']} / {steady_normal_stats['p95']} ms`",
+    f"- 全部日志样本平均耗时: `{all_stats['avg']} ms`",
+    "- 说明: 日志样本数可能大于唯一 iteration 数；kill marker 从 node0 传播前，其他节点可能多打印少量边界 iteration。",
     f"- 观察到 RACER store 次数: `{len(stores)}`",
     f"- 观察到 RACER restart load 次数: `{len(loads)}`",
 ]
@@ -457,7 +484,7 @@ if [[ "${RACER_CSD_CLEANUP_AFTER}" == "1" && "${DRY_RUN}" != "1" ]]; then
 fi
 
 if (( NODE_RANK == 0 )); then
-  summarize_node0_logs
+  summarize_cluster_logs
   echo "summary: ${STATE_DIR}/summary.md"
   echo "iteration_times: ${STATE_DIR}/iteration_times.csv"
 fi
