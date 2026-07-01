@@ -77,11 +77,15 @@ class CostModel:
     total_bytes_sent: int = 0
     num_messages: int = 0
     compute_bytes_on_train_ranks: int = 0
+    compute_bytes_on_spare_ranks: int = 0
     compute_bytes_on_accelerators: int = 0
     xor_bytes_on_train_ranks: int = 0
+    xor_bytes_on_spare_ranks: int = 0
     xor_bytes_on_accelerators: int = 0
     max_train_rank_compute_bytes: int = 0
+    max_spare_rank_compute_bytes: int = 0
     max_spare_compute_bytes: int = 0
+    final_result_return_bytes: int = 0
     skipped_virtual_zero_bytes: int = 0
     estimated_critical_path: int = 0
 
@@ -102,6 +106,7 @@ class _CostAccumulator:
         self.compute_spare: dict[int, int] = {}
         self.xor_train: dict[int, int] = {}
         self.xor_spare: dict[int, int] = {}
+        self.final_result_return_bytes = 0
         self.skipped_virtual_zero_bytes = 0
 
     def transfer(self, num_bytes: int) -> None:
@@ -119,6 +124,9 @@ class _CostAccumulator:
     def skip_virtual_zero(self, num_bytes: int) -> None:
         self.skipped_virtual_zero_bytes += int(num_bytes)
 
+    def final_result_return(self, num_bytes: int) -> None:
+        self.final_result_return_bytes += int(num_bytes)
+
     def build(self) -> CostModel:
         train_compute = sum(self.compute_train.values())
         spare_compute = sum(self.compute_spare.values())
@@ -130,11 +138,15 @@ class _CostAccumulator:
             total_bytes_sent=self.total_bytes_sent,
             num_messages=self.num_messages,
             compute_bytes_on_train_ranks=train_compute,
+            compute_bytes_on_spare_ranks=spare_compute,
             compute_bytes_on_accelerators=spare_compute,
             xor_bytes_on_train_ranks=train_xor,
+            xor_bytes_on_spare_ranks=spare_xor,
             xor_bytes_on_accelerators=spare_xor,
             max_train_rank_compute_bytes=max_train,
+            max_spare_rank_compute_bytes=max_spare,
             max_spare_compute_bytes=max_spare,
+            final_result_return_bytes=self.final_result_return_bytes,
             skipped_virtual_zero_bytes=self.skipped_virtual_zero_bytes,
             estimated_critical_path=max(self.total_bytes_sent, max_train, max_spare),
         )
@@ -219,6 +231,7 @@ class SpareComputePlanner:
                 if compute_rank != owner:
                     transfers.append(self._transfer(group[0], compute_rank, owner, parity_id, 1, chunk_nbytes, "parity result to train-rank chunk owner"))
                     cost.transfer(chunk_nbytes)
+                    cost.final_result_return(chunk_nbytes)
 
         return RoutingPlan(tuple(transfers), tuple(computes), tuple(reductions), cost.build())
 

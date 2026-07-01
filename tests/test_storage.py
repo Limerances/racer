@@ -1,7 +1,7 @@
 import pytest
 
 import racer
-from racer import storage
+import racer.storage as storage
 
 
 def test_legacy_storage_classes_are_not_public_exports():
@@ -11,18 +11,11 @@ def test_legacy_storage_classes_are_not_public_exports():
     assert not hasattr(racer, "FdMmapHostBackend")
 
 
-@pytest.mark.parametrize(
-    "cls",
-    [
-        storage.InProcessCudaStorage,
-        storage.CpuPinnedStorage,
-        storage.EgmStorage,
-        storage.InProcessStorage,
-    ],
-)
-def test_legacy_storage_constructors_raise(cls):
-    with pytest.raises(RuntimeError, match="daemon-owned"):
-        cls()
+def test_legacy_storage_classes_are_removed_from_storage_module():
+    assert not hasattr(storage, "InProcessCudaStorage")
+    assert not hasattr(storage, "CpuPinnedStorage")
+    assert not hasattr(storage, "EgmStorage")
+    assert not hasattr(storage, "InProcessStorage")
 
 
 @pytest.mark.parametrize("backend", ["cuda", "cuda_legacy", "cpu_pinned", "egm", "csd_pinned", "fd_mmap_host"])

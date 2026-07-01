@@ -24,14 +24,14 @@ import base64
 from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
 import hashlib
+import importlib
 import json
 from dataclasses import dataclass
-import mmap
 import multiprocessing as mp
 from multiprocessing.connection import AuthenticationError, Client, Listener
-from multiprocessing.reduction import recv_handle, send_handle
 import os
 from pathlib import Path
+import sys
 import threading
 import time
 import uuid
@@ -42,6 +42,9 @@ import torch
 
 from .csd_manifest import CsdManifestStore
 
+if __name__ == "__main__":  # keep default EGM factory imports from loading a second CSD module copy
+    sys.modules.setdefault("racer.csd", sys.modules[__name__])
+
 try:
     import xxhash as _xxhash
 except ImportError:  # pragma: no cover - optional performance dependency
@@ -49,9 +52,6 @@ except ImportError:  # pragma: no cover - optional performance dependency
 
 
 _CUDART: Any | None = None
-_LIBC: Any | None = None
-_CUDA_MEMCPY_HOST_TO_DEVICE = 1
-_CUDA_MEMCPY_DEVICE_TO_HOST = 2
 _CUDA_MEMCPY_DEVICE_TO_DEVICE = 3
 _CUDA_MEMCPY_DEFAULT = 4
 _CUDA_EVENT_DISABLE_TIMING = 2
@@ -149,83 +149,6 @@ def _load_cudart() -> Any | None:
         except OSError:
             continue
     return None
-
-
-def _load_libc() -> Any | None:
-    global _LIBC
-    if _LIBC is not None:
-        return _LIBC
-    try:
-        libc = ctypes.CDLL("libc.so.6")
-        libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-        libc.mlock.restype = ctypes.c_int
-        libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-        libc.munlock.restype = ctypes.c_int
-        _LIBC = libc
-        return libc
-    except OSError:
-        return None
-
-
-def _cuda_host_register_buffer(buffer: Any, nbytes: int) -> int | None:
-    if int(nbytes) <= 0 or not torch.cuda.is_available():
-        return None
-    cudart = _load_cudart()
-    if cudart is None:
-        return None
-    ptr = _buffer_pointer(buffer)
-    if ptr is None:
-        return None
-    err = int(cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(int(nbytes)), 0))
-    if err != 0:
-        return None
-    return int(ptr)
-
-
-def _cuda_host_unregister_pointer(ptr: int | None) -> None:
-    if ptr is None:
-        return
-    cudart = _load_cudart()
-    if cudart is None:
-        return
-    try:
-        cudart.cudaHostUnregister(ctypes.c_void_p(int(ptr)))
-    except Exception:
-        pass
-
-
-def _mlock_buffer(buffer: Any, nbytes: int) -> int | None:
-    if int(nbytes) <= 0:
-        return None
-    libc = _load_libc()
-    if libc is None:
-        return None
-    ptr = _buffer_pointer(buffer)
-    if ptr is None:
-        return None
-    err = int(libc.mlock(ctypes.c_void_p(ptr), ctypes.c_size_t(int(nbytes))))
-    if err != 0:
-        return None
-    return int(ptr)
-
-
-def _munlock_pointer(ptr: int | None, nbytes: int) -> None:
-    if ptr is None or int(nbytes) <= 0:
-        return
-    libc = _load_libc()
-    if libc is None:
-        return
-    try:
-        libc.munlock(ctypes.c_void_p(int(ptr)), ctypes.c_size_t(int(nbytes)))
-    except Exception:
-        pass
-
-
-def _buffer_pointer(buffer: Any) -> int | None:
-    try:
-        return int(ctypes.addressof(ctypes.c_char.from_buffer(buffer)))
-    except (TypeError, ValueError):
-        return None
 
 
 def _cuda_memcpy(dst_ptr: int, src_ptr: int, nbytes: int, kind: int) -> None:
@@ -741,17 +664,21 @@ def _sample64_checksum_view(view: memoryview, *, sample_count: int = 4096) -> st
     return f"sample64-v1:{nbytes}:{samples}:{total:016x}:{first:02x}:{last:02x}"
 
 
+def _infer_checksum_type_from_value(value: str) -> str:
+    checksum = str(value or "")
+    if checksum.startswith(("sample64-v1:", "sum64-v1:")):
+        return "sample64"
+    if checksum.startswith("sha256-v1:"):
+        return "sha256"
+    return ""
+
+
 @dataclass
 class BackendChunk:
     tensor: torch.Tensor
     metadata: dict[str, Any]
     nbytes: int
     capacity_nbytes: int | None = None
-    slot_id: str | None = None
-    fd: int | None = None
-    mapping: mmap.mmap | None = None
-    registered_ptr: int | None = None
-    locked_ptr: int | None = None
     host_ptr: int | None = None
     segment_id: str | None = None
     offset: int = 0
@@ -845,245 +772,6 @@ class StorageBackend:
             self.free(tag, chunk_id)
 
 
-class FdMmapHostBackend(StorageBackend):
-    """Disabled historical fd/mmap host backend."""
-
-    name = "fd_mmap_host"
-
-    def __init__(
-        self,
-        *,
-        pin_memory: bool | None = None,
-        lock_fd_memory: bool = True,
-        cuda_register_fd: bool = False,
-        fd_pool_slot_size: int = 0,
-        fd_pool_slot_count: int = 0,
-        fd_pool_max_free: int = 64,
-    ) -> None:
-        raise RuntimeError(
-            "FdMmapHostBackend is disabled. RACER CSD storage must be "
-            "daemon-owned native_pinned or daemon-owned EGM."
-        )
-        self.pin_memory = torch.cuda.is_available() if pin_memory is None else bool(pin_memory)
-        self.lock_fd_memory = bool(lock_fd_memory)
-        self.cuda_register_fd = bool(cuda_register_fd)
-        self.fd_pool_max_free = int(fd_pool_max_free)
-        self._chunks: dict[str, dict[str, BackendChunk]] = {}
-        self._free_fd_chunks: list[BackendChunk] = []
-        self._next_fd_slot_id = 0
-        self._lock = threading.RLock()
-        slot_size = int(fd_pool_slot_size)
-        slot_count = int(fd_pool_slot_count)
-        if slot_size > 0 and slot_count > 0:
-            for index in range(slot_count):
-                self._free_fd_chunks.append(
-                    self._create_fd_chunk(
-                        tag="pool",
-                        chunk_id=f"slot_{index:06d}",
-                        capacity_nbytes=slot_size,
-                    )
-                )
-
-    def capabilities(self) -> dict[str, Any]:
-        return {
-            "backend": self.name,
-            "restart_aware": True,
-            "daemon_owned": True,
-            "cuda_native_pinned": False,
-            "uses_cudaHostAlloc": False,
-            "uses_memfd_mmap": True,
-            "supports_cuda_ipc": False,
-            "supports_async_copy": False,
-        }
-
-    def _allocate_host(self, nbytes: int) -> torch.Tensor:
-        if self.pin_memory:
-            try:
-                return torch.empty(int(nbytes), dtype=torch.uint8, device="cpu", pin_memory=True)
-            except RuntimeError:
-                self.pin_memory = False
-        return torch.empty(int(nbytes), dtype=torch.uint8, device="cpu")
-
-    def _release_chunk(self, chunk: BackendChunk) -> None:
-        _cuda_host_unregister_pointer(chunk.registered_ptr)
-        _munlock_pointer(chunk.locked_ptr, chunk.capacity_nbytes or chunk.nbytes)
-        chunk.tensor = torch.empty(0, dtype=torch.uint8)
-        if chunk.mapping is not None:
-            try:
-                chunk.mapping.close()
-            except BufferError:
-                pass
-        if chunk.fd is not None:
-            try:
-                os.close(int(chunk.fd))
-            except OSError:
-                pass
-
-    def _create_fd_chunk(self, *, tag: str, chunk_id: str, capacity_nbytes: int) -> BackendChunk:
-        if not hasattr(os, "memfd_create"):
-            raise RuntimeError("pinned fd transport requires os.memfd_create")
-        fd = os.memfd_create(
-            f"racer-csd-{_safe_tag(tag)}-{_safe_tag(chunk_id)}",
-            flags=getattr(os, "MFD_CLOEXEC", 0),
-        )
-        os.ftruncate(fd, int(capacity_nbytes))
-        mapping = mmap.mmap(fd, int(capacity_nbytes), access=mmap.ACCESS_WRITE)
-        tensor = torch.frombuffer(mapping, dtype=torch.uint8, count=int(capacity_nbytes))
-        locked_ptr = _mlock_buffer(mapping, int(capacity_nbytes)) if self.lock_fd_memory else None
-        registered_ptr = (
-            _cuda_host_register_buffer(mapping, int(capacity_nbytes)) if self.cuda_register_fd else None
-        )
-        with self._lock:
-            slot_id = f"fdslot_{self._next_fd_slot_id:08d}"
-            self._next_fd_slot_id += 1
-        return BackendChunk(
-            tensor=tensor,
-            metadata={},
-            nbytes=0,
-            capacity_nbytes=int(capacity_nbytes),
-            slot_id=slot_id,
-            fd=fd,
-            mapping=mapping,
-            registered_ptr=registered_ptr,
-            locked_ptr=locked_ptr,
-        )
-
-    def _fd_record_metadata(
-        self,
-        metadata: dict[str, Any] | None,
-        *,
-        chunk: BackendChunk,
-        nbytes: int,
-    ) -> dict[str, Any]:
-        record_metadata = dict(metadata or {})
-        record_metadata.update(
-            {
-                "storage_backend": self.name,
-                "storage_transport": "fd_mmap_host",
-                "stored_device": "cpu",
-                "is_pinned_host": chunk.locked_ptr is not None or chunk.registered_ptr is not None,
-                "cuda_native_pinned": False,
-                "uses_memfd_mmap": True,
-                "daemon_host_locked": chunk.locked_ptr is not None,
-                "daemon_cuda_registered": chunk.registered_ptr is not None,
-                "daemon_owned": True,
-                "nbytes": int(nbytes),
-                "capacity_nbytes": int(chunk.capacity_nbytes or nbytes),
-                "fd_slot_id": chunk.slot_id,
-            }
-        )
-        return record_metadata
-
-    def _take_fd_chunk(self, nbytes: int) -> BackendChunk | None:
-        with self._lock:
-            for index, chunk in enumerate(self._free_fd_chunks):
-                if int(chunk.capacity_nbytes or 0) >= int(nbytes):
-                    return self._free_fd_chunks.pop(index)
-        return None
-
-    def _return_fd_chunk_to_pool(self, chunk: BackendChunk) -> bool:
-        if chunk.fd is None or chunk.mapping is None or int(chunk.capacity_nbytes or 0) <= 0:
-            return False
-        with self._lock:
-            if self.fd_pool_max_free >= 0 and len(self._free_fd_chunks) >= self.fd_pool_max_free:
-                return False
-            chunk.metadata = {}
-            chunk.nbytes = 0
-            self._free_fd_chunks.append(chunk)
-            return True
-
-    def allocate(self, tag: str, chunk_id: str, nbytes: int, metadata: dict[str, Any] | None = None) -> torch.Tensor:
-        record_metadata = dict(metadata or {})
-        record_metadata.update(
-            {
-                "storage_backend": self.name,
-                "stored_device": "cpu",
-                "is_pinned_host": bool(self.pin_memory),
-                "cuda_native_pinned": False,
-                "uses_memfd_mmap": False,
-                "daemon_owned": True,
-                "nbytes": int(nbytes),
-            }
-        )
-        tensor = self._allocate_host(int(nbytes))
-        with self._lock:
-            old = self._chunks.setdefault(str(tag), {}).pop(str(chunk_id), None)
-            if old is not None:
-                self._release_chunk(old)
-            self._chunks.setdefault(str(tag), {})[str(chunk_id)] = BackendChunk(
-                tensor=tensor,
-                metadata=record_metadata,
-                nbytes=int(nbytes),
-                capacity_nbytes=int(nbytes),
-            )
-        return tensor
-
-    def prepare_fd_region(
-        self,
-        tag: str,
-        chunk_id: str,
-        nbytes: int,
-        metadata: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], int]:
-        chunk = self._take_fd_chunk(int(nbytes))
-        if chunk is None:
-            chunk = self._create_fd_chunk(
-                tag=str(tag),
-                chunk_id=str(chunk_id),
-                capacity_nbytes=int(nbytes),
-            )
-        chunk.nbytes = int(nbytes)
-        record_metadata = self._fd_record_metadata(metadata, chunk=chunk, nbytes=int(nbytes))
-        chunk.metadata = record_metadata
-        with self._lock:
-            old = self._chunks.setdefault(str(tag), {}).pop(str(chunk_id), None)
-            if old is not None:
-                if not self._return_fd_chunk_to_pool(old):
-                    self._release_chunk(old)
-            self._chunks.setdefault(str(tag), {})[str(chunk_id)] = chunk
-        return dict(record_metadata), int(chunk.fd)
-
-    def export_fd_region(self, tag: str, chunk_id: str) -> tuple[dict[str, Any], int]:
-        try:
-            with self._lock:
-                chunk = self._chunks[str(tag)][str(chunk_id)]
-        except KeyError as exc:
-            raise KeyError(f"CSD pinned chunk {chunk_id!r} for tag {tag!r} is not resident") from exc
-        if chunk.fd is None:
-            raise RuntimeError(f"CSD fd_mmap_host chunk {chunk_id!r} is not backed by fd transport")
-        return dict(chunk.metadata), int(chunk.fd)
-
-    def read_to_bytes(self, tag: str, chunk_id: str) -> bytes:
-        try:
-            with self._lock:
-                chunk = self._chunks[str(tag)][str(chunk_id)]
-        except KeyError as exc:
-            raise KeyError(f"CSD pinned chunk {chunk_id!r} for tag {tag!r} is not resident") from exc
-        return chunk.tensor.detach().narrow(0, 0, int(chunk.nbytes)).contiguous().numpy().tobytes()
-
-    def metadata(self, tag: str, chunk_id: str) -> dict[str, Any]:
-        try:
-            with self._lock:
-                return dict(self._chunks[str(tag)][str(chunk_id)].metadata)
-        except KeyError as exc:
-            raise KeyError(f"CSD pinned chunk metadata {chunk_id!r} for tag {tag!r} is not resident") from exc
-
-    def list_chunks(self, tag: str) -> list[str]:
-        with self._lock:
-            return sorted(self._chunks.get(str(tag), {}))
-
-    def free(self, tag: str, chunk_id: str) -> None:
-        with self._lock:
-            chunks = self._chunks.get(str(tag))
-            if chunks is None:
-                return
-            chunk = chunks.pop(str(chunk_id), None)
-            if chunk is not None:
-                if not self._return_fd_chunk_to_pool(chunk):
-                    self._release_chunk(chunk)
-            if not chunks:
-                self._chunks.pop(str(tag), None)
-
 @dataclass
 class _NativeSegment:
     segment_id: str
@@ -1124,6 +812,7 @@ class _NativeCopyOp:
     done: bool = False
     error: str | None = None
     resources_released: bool = False
+    in_completion: bool = False
 
 
 class NativePinnedMemoryBackend(StorageBackend):
@@ -1157,8 +846,10 @@ class NativePinnedMemoryBackend(StorageBackend):
         self._ops: dict[str, _NativeCopyOp] = {}
         self._ipc_mem_cache: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
+        self._op_condition = threading.Condition(self._lock)
         self._ipc_lock = threading.RLock()
         self._stream_lock = threading.RLock()
+        self._ipc_mem_cache_max_entries = int(os.environ.get("RACER_CSD_IPC_MEM_CACHE_MAX_ENTRIES", "128"))
         self._copy_stream_pool_size = max(1, int(os.environ.get("RACER_CSD_COPY_STREAMS_PER_DEVICE", "4")))
         self._copy_streams: dict[int, list[int]] = {}
         self._copy_stream_next: dict[int, int] = {}
@@ -1391,6 +1082,7 @@ class NativePinnedMemoryBackend(StorageBackend):
                 cached = self._ipc_mem_cache.get(cache_key)
                 if cached is not None:
                     cached["refcount"] = int(cached.get("refcount", 0)) + 1
+                    cached["last_used_ns"] = time.monotonic_ns()
                     remote_ptr_value = int(cached["ptr"])
                 else:
                     remote_ptr = ctypes.c_void_p()
@@ -1412,6 +1104,7 @@ class NativePinnedMemoryBackend(StorageBackend):
                         "ptr": remote_ptr_value,
                         "refcount": 1,
                         "device": int(view["device"]),
+                        "last_used_ns": time.monotonic_ns(),
                     }
                     opened_new = True
         else:
@@ -1493,6 +1186,45 @@ class NativePinnedMemoryBackend(StorageBackend):
             "cudaEventCreateWithFlags failed",
         )
         return stream, int(wait_start.value), int(copy_start.value), int(complete.value), False
+
+    def _release_ipc_cache_ref(self, cache_key: str | None) -> None:
+        if not cache_key:
+            return
+        cudart = _load_cudart()
+        if cudart is None:
+            return
+        with self._ipc_lock:
+            cached = self._ipc_mem_cache.get(str(cache_key))
+            if cached is None:
+                return
+            cached["refcount"] = max(0, int(cached.get("refcount", 0)) - 1)
+            cached["last_used_ns"] = time.monotonic_ns()
+            self._evict_idle_ipc_cache_locked(cudart)
+
+    def _evict_idle_ipc_cache_locked(self, cudart: Any) -> None:
+        max_entries = int(self._ipc_mem_cache_max_entries)
+        if max_entries < 0:
+            return
+        idle = [
+            (str(key), int(value.get("last_used_ns", 0)), int(value.get("ptr", 0)))
+            for key, value in self._ipc_mem_cache.items()
+            if int(value.get("refcount", 0)) <= 0
+        ]
+        if max_entries == 0:
+            victims = idle
+        else:
+            excess = len(self._ipc_mem_cache) - max_entries
+            if excess <= 0:
+                return
+            victims = sorted(idle, key=lambda item: item[1])[:excess]
+        for key, _last_used_ns, ptr in victims:
+            if key not in self._ipc_mem_cache:
+                continue
+            try:
+                cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(int(ptr)))
+            except Exception:
+                pass
+            self._ipc_mem_cache.pop(key, None)
 
     def write_from_cuda_ipc(
         self,
@@ -1603,6 +1335,12 @@ class NativePinnedMemoryBackend(StorageBackend):
     def read_to_cuda_ipc(self, tag: str, chunk_id: str, view: dict[str, Any]) -> str:
         with self._lock:
             chunk = self._chunks[str(tag)][str(chunk_id)]
+        dst_nbytes = int(view.get("nbytes", 0) or 0)
+        if dst_nbytes < int(chunk.nbytes):
+            raise ValueError(
+                f"destination CUDA IPC buffer for chunk {chunk_id!r} is too small: "
+                f"dst_nbytes={dst_nbytes}, chunk_nbytes={int(chunk.nbytes)}"
+            )
         remote_ptr, remote_event, cache_key, ipc_open_us, event_open_us, opened_new, set_device_ms = self._open_ipc_mem(view)
         stream, wait_start, copy_start, complete, stream_owned = self._new_stream_and_events(int(view["device"]))
         cudart = _load_cudart()
@@ -1693,6 +1431,8 @@ class NativePinnedMemoryBackend(StorageBackend):
                     cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(int(op.remote_ptr)))
                 except Exception:
                     pass
+            elif op.cache_key:
+                self._release_ipc_cache_ref(op.cache_key)
             if op.stream_owned:
                 try:
                     cudart.cudaStreamDestroy(ctypes.c_void_p(int(op.stream)))
@@ -1703,7 +1443,11 @@ class NativePinnedMemoryBackend(StorageBackend):
     def wait(self, op_id: str) -> None:
         cudart = _load_cudart()
         assert cudart is not None
-        with self._lock:
+        op_key = str(op_id)
+        with self._op_condition:
+            op = self._ops[op_key]
+            while op.in_completion and not op.done:
+                self._op_condition.wait()
             op = self._ops[str(op_id)]
             if op.error:
                 raise RuntimeError(op.error)
@@ -1711,6 +1455,7 @@ class NativePinnedMemoryBackend(StorageBackend):
                 if op.error:
                     raise RuntimeError(op.error)
                 return
+            op.in_completion = True
         _cuda_set_device(int(op.device))
         wait_start = time.perf_counter()
         try:
@@ -1719,43 +1464,62 @@ class NativePinnedMemoryBackend(StorageBackend):
             profile = dict(op.profile or {})
             profile["daemon_memcpy_ms_wall"] = wait_wall_ms
             op.profile = profile
-            with self._lock:
+            with self._op_condition:
                 if not op.done:
                     self._complete_op_locked(op)
         except BaseException as exc:
-            with self._lock:
+            with self._op_condition:
                 op.error = str(exc)
             raise
+        finally:
+            with self._op_condition:
+                op.in_completion = False
+                self._op_condition.notify_all()
 
     def poll(self, op_id: str) -> str:
-        with self._lock:
+        op_key = str(op_id)
+        with self._op_condition:
             op = self._ops[str(op_id)]
+            if op.in_completion and not op.done:
+                return "RUNNING"
+            if not op.done:
+                op.in_completion = True
         if op.done:
             return "FAILED" if op.error else "DONE"
         cudart = _load_cudart()
         assert cudart is not None
-        _cuda_set_device(int(op.device))
-        err = int(cudart.cudaEventQuery(ctypes.c_void_p(int(op.complete_event))))
-        if err == 0:
-            with self._lock:
-                self._complete_op_locked(op)
-            return "DONE"
-        if err == _CUDA_ERROR_NOT_PERMITTED:
-            with self._lock:
-                profile = dict(op.profile or {})
-                profile["daemon_event_query_deferred_error_code"] = err
-                op.profile = profile
+        try:
+            _cuda_set_device(int(op.device))
+            err = int(cudart.cudaEventQuery(ctypes.c_void_p(int(op.complete_event))))
+            if err == 0:
+                with self._op_condition:
+                    self._complete_op_locked(op)
+                return "DONE"
+            if err == _CUDA_ERROR_NOT_PERMITTED:
+                with self._op_condition:
+                    profile = dict(op.profile or {})
+                    profile["daemon_event_query_deferred_error_code"] = err
+                    op.profile = profile
+                return "RUNNING"
+            if err != _CUDA_ERROR_NOT_READY:
+                message = f"cudaEventQuery failed for native pinned op {op_id}: CUDA error code {err}"
+                with self._op_condition:
+                    op.error = message
+                return "FAILED"
             return "RUNNING"
-        if err != _CUDA_ERROR_NOT_READY:
-            message = f"cudaEventQuery failed for native pinned op {op_id}: CUDA error code {err}"
-            with self._lock:
-                op.error = message
-            return "FAILED"
-        return "RUNNING"
+        finally:
+            with self._op_condition:
+                op.in_completion = False
+                self._op_condition.notify_all()
 
     def profile(self, op_id: str) -> dict[str, Any]:
+        op_key = str(op_id)
         with self._lock:
-            return dict(self._ops[str(op_id)].profile or {})
+            op = self._ops[op_key]
+            profile = dict(op.profile or {})
+            if op.done:
+                self._ops.pop(op_key, None)
+            return profile
 
     def _poll_loop(self) -> None:
         while not self._stop_poller.is_set():
@@ -1983,6 +1747,7 @@ class EgmBackend(StorageBackend):
                 "offset": offset,
                 "location": location,
                 "committed": bool(record_metadata.get("committed", False)),
+                "checksum_type": record_metadata.get("checksum_type", record_metadata.get("requested_checksum_type", "")),
                 "checksum": record_metadata.get("checksum", ""),
             }
         )
@@ -2013,6 +1778,19 @@ class EgmBackend(StorageBackend):
 
     def read_to_cuda(self, tag: str, chunk_id: str, device: torch.device | str) -> torch.Tensor:
         raise NotImplementedError("EgmBackend forbids copy-style CUDA get; use read_to_cuda_ipc")
+
+    def checksum(self, tag: str, chunk_id: str, checksum_type: str = "sha256") -> str:
+        checksum_fn = getattr(self.runtime, "checksum", None)
+        if callable(checksum_fn):
+            try:
+                return str(checksum_fn(str(tag), str(chunk_id), checksum_type=str(checksum_type)))
+            except TypeError:
+                return str(checksum_fn(str(tag), str(chunk_id), str(checksum_type)))
+        metadata = self.metadata(str(tag), str(chunk_id))
+        checksum = str(metadata.get("checksum", "") or "")
+        if checksum:
+            return checksum
+        raise NotImplementedError("EgmBackend requires a runtime-provided checksum; CPU byte reads are forbidden")
 
     def export_fd_region(self, tag: str, chunk_id: str) -> tuple[dict[str, Any], int]:
         raise NotImplementedError("EgmBackend does not support fd/mmap fallback transport")
@@ -2206,18 +1984,6 @@ class CheckpointStorageDaemon:
     def put_chunk(self, tag: str, chunk_id: str, data: bytes, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         raise RuntimeError("CSD socket byte put is disabled; use put_cuda_tensor/CUDA IPC")
 
-    def prepare_fd_chunk(
-        self,
-        tag: str,
-        chunk_id: str,
-        nbytes: int,
-        metadata: dict[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], int]:
-        raise RuntimeError("CSD fd/mmap put transport is disabled; use put_cuda_tensor/CUDA IPC")
-
-    def seal_fd_chunk(self, tag: str, chunk_id: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
-        raise RuntimeError("CSD fd/mmap seal is disabled; use put_cuda_tensor/CUDA IPC")
-
     def put_manifest(self, tag: str, manifest: dict[str, Any]) -> None:
         actual = str(tag)
         with self._lock:
@@ -2311,16 +2077,14 @@ class CheckpointStorageDaemon:
                 manifest = {}
         if self.manifest_store is not None:
             manifest = self.manifest_store.manifest_for_tag(actual)
-            manifest["data_resident"] = bool(self.backend.list_chunks(actual))
+            expected_chunks = int(manifest.get("expected_chunks", len(list(manifest.get("chunks", [])))) or 0)
+            manifest["data_resident"] = expected_chunks == 0 or bool(self.backend.list_chunks(actual))
             manifest["daemon_owned"] = True
             manifest["backend_capabilities"] = self.backend.capabilities()
         return manifest
 
     def get_chunk(self, tag: str, chunk_id: str) -> tuple[bytes, dict[str, Any]]:
         raise RuntimeError("CSD socket byte get is disabled; use read_into_cuda_tensor/CUDA IPC")
-
-    def get_chunk_fd(self, tag: str, chunk_id: str) -> tuple[dict[str, Any], int]:
-        raise RuntimeError("CSD fd/mmap get transport is disabled; use read_into_cuda_tensor/CUDA IPC")
 
     def get_metadata(self, tag: str, chunk_id: str) -> dict[str, Any]:
         self.get_manifest(str(tag))
@@ -2338,21 +2102,34 @@ class CheckpointStorageDaemon:
             raise RuntimeError(f"CSD backend {self.backend.name!r} does not support CUDA IPC put")
         actual = str(tag)
         chunk = str(chunk_id)
+        metadata_dict = dict(metadata or {})
+        committed_update = bool(metadata_dict.get("committed_checkpoint_update", False))
         sqlite_ms = 0.0
         if self.manifest_store is not None:
             sqlite_start = time.perf_counter()
-            self.manifest_store.reserve_chunk(actual, chunk, metadata or {}, backend=self.backend.name)
+            if committed_update:
+                self.manifest_store.begin_committed_chunk_update(
+                    actual,
+                    chunk,
+                    metadata_dict,
+                    backend=self.backend.name,
+                )
+                op_type = "REPAIR_PUT"
+            else:
+                self.manifest_store.reserve_chunk(actual, chunk, metadata_dict, backend=self.backend.name)
+                op_type = "PUT"
             op_id = str(uuid.uuid4())
-            self.manifest_store.begin_operation(op_id, actual, chunk, "PUT")
+            self.manifest_store.begin_operation(op_id, actual, chunk, op_type)
             self.manifest_store.mark_operation_running(op_id)
-            self.manifest_store.mark_chunk_copying(actual, chunk, op_id)
+            if not committed_update:
+                self.manifest_store.mark_chunk_copying(actual, chunk, op_id)
             sqlite_ms = (time.perf_counter() - sqlite_start) * 1000.0
         else:
             op_id = str(uuid.uuid4())
 
         def _run_backend_write() -> tuple[str, dict[str, Any], dict[str, Any]]:
             backend_write_start = time.perf_counter()
-            backend_op_id, record_metadata = self.backend.write_from_cuda_ipc(actual, chunk, view, metadata)  # type: ignore[attr-defined]
+            backend_op_id, record_metadata = self.backend.write_from_cuda_ipc(actual, chunk, view, metadata_dict)  # type: ignore[attr-defined]
             backend_write_ms = (time.perf_counter() - backend_write_start) * 1000.0
             return (
                 backend_op_id,
@@ -2378,7 +2155,7 @@ class CheckpointStorageDaemon:
                 "op_type": "PUT",
                 "tag": actual,
                 "chunk_id": chunk,
-                "metadata": dict(metadata or {}),
+                "metadata": dict(metadata_dict),
                 "profile": put_profile,
             }
             entry = self._entries.setdefault(
@@ -2393,11 +2170,11 @@ class CheckpointStorageDaemon:
                     "backend_capabilities": self.backend.capabilities(),
                 },
             )
-            entry.setdefault("chunks", {}).setdefault(chunk, dict(metadata or {}))
+            entry.setdefault("chunks", {}).setdefault(chunk, dict(metadata_dict))
         return {
             "op_id": op_id,
             "backend_op_id": None,
-            "metadata": dict(metadata or {}),
+            "metadata": dict(metadata_dict),
             "profile": put_profile,
         }
 
@@ -2437,6 +2214,14 @@ class CheckpointStorageDaemon:
             raise RuntimeError(f"CSD backend {self.backend.name!r} does not support CUDA IPC read")
         actual = str(tag)
         chunk = str(chunk_id)
+        metadata = self.backend.metadata(actual, chunk)
+        chunk_nbytes = int(metadata.get("nbytes", metadata.get("num_bytes", 0)) or 0)
+        dst_nbytes = int(view.get("nbytes", 0) or 0)
+        if chunk_nbytes and dst_nbytes < chunk_nbytes:
+            raise ValueError(
+                f"destination CUDA IPC buffer for chunk {chunk!r} is too small: "
+                f"dst_nbytes={dst_nbytes}, chunk_nbytes={chunk_nbytes}"
+            )
         op_id = str(uuid.uuid4())
         if self.manifest_store is not None:
             self.manifest_store.begin_operation(op_id, actual, chunk, "GET")
@@ -2448,7 +2233,7 @@ class CheckpointStorageDaemon:
                 "op_type": "GET",
                 "tag": actual,
                 "chunk_id": chunk,
-                "metadata": self.backend.metadata(actual, chunk),
+                "metadata": metadata,
             }
         return {"op_id": op_id, "backend_op_id": backend_op_id}
 
@@ -2456,6 +2241,7 @@ class CheckpointStorageDaemon:
         op_id = str(op_id)
         with self._lock:
             op = dict(self._async_ops[op_id])
+        remove_async_op = True
         try:
             op = self._resolve_backend_future(op_id, op)
             self.backend.wait(op["backend_op_id"])  # type: ignore[attr-defined]
@@ -2464,31 +2250,42 @@ class CheckpointStorageDaemon:
                 profile.update(self.backend.profile(op["backend_op_id"]))  # type: ignore[attr-defined]
             if op["op_type"] == "PUT":
                 metadata = dict(self.backend.metadata(op["tag"], op["chunk_id"]))
-                checksum_type = str(metadata.get("checksum_type", metadata.get("requested_checksum_type", "sha256"))).lower()
+                requested_checksum_type = str(
+                    metadata.get("checksum_type", metadata.get("requested_checksum_type", "sha256"))
+                ).lower()
                 checksum_ms = 0.0
-                if checksum_type in {"none", "off", "disabled"}:
+                existing_checksum = str(metadata.get("checksum", "") or "")
+                existing_checksum_type = str(metadata.get("checksum_type", "") or "").lower()
+                if requested_checksum_type in {"none", "off", "disabled"}:
                     checksum = ""
                     metadata.update({"checksum_type": "none", "checksum": ""})
-                elif checksum_type in {"sample64", "sample64_v1", "fast", "sampled"}:
-                    checksum_start = time.perf_counter()
-                    checksum = self.backend.checksum(op["tag"], op["chunk_id"], checksum_type="sample64")
-                    checksum_ms = (time.perf_counter() - checksum_start) * 1000.0
-                    metadata.update({"checksum_type": "sample64", "checksum": checksum})
-                elif checksum_type in {"xxh64", "xxhash64", "xxh64_v1"}:
-                    checksum_start = time.perf_counter()
-                    checksum = self.backend.checksum(op["tag"], op["chunk_id"], checksum_type="xxh64")
-                    checksum_ms = (time.perf_counter() - checksum_start) * 1000.0
-                    metadata.update({"checksum_type": "xxh64", "checksum": checksum})
-                elif checksum_type in {"crc32", "crc32_v1"}:
-                    checksum_start = time.perf_counter()
-                    checksum = self.backend.checksum(op["tag"], op["chunk_id"], checksum_type="crc32")
-                    checksum_ms = (time.perf_counter() - checksum_start) * 1000.0
-                    metadata.update({"checksum_type": "crc32", "checksum": checksum})
                 else:
-                    checksum_start = time.perf_counter()
-                    checksum = self.backend.checksum(op["tag"], op["chunk_id"], checksum_type="sha256")
-                    checksum_ms = (time.perf_counter() - checksum_start) * 1000.0
-                    metadata.update({"checksum_type": "sha256", "checksum": checksum})
+                    checksum_kind = "sha256"
+                    if requested_checksum_type in {"sample64", "sample64_v1", "fast", "sampled"}:
+                        checksum_kind = "sample64"
+                    elif requested_checksum_type in {"xxh64", "xxhash64", "xxh64_v1"}:
+                        checksum_kind = "xxh64"
+                    elif requested_checksum_type in {"crc32", "crc32_v1"}:
+                        checksum_kind = "crc32"
+                    try:
+                        checksum_start = time.perf_counter()
+                        checksum = self.backend.checksum(op["tag"], op["chunk_id"], checksum_type=checksum_kind)
+                        checksum_ms = (time.perf_counter() - checksum_start) * 1000.0
+                        if existing_checksum and checksum == existing_checksum:
+                            checksum_kind = existing_checksum_type or _infer_checksum_type_from_value(existing_checksum) or checksum_kind
+                        metadata.update({"checksum_type": checksum_kind, "checksum": checksum})
+                    except NotImplementedError:
+                        if existing_checksum:
+                            checksum = existing_checksum
+                            checksum_kind = (
+                                existing_checksum_type
+                                or _infer_checksum_type_from_value(existing_checksum)
+                                or "runtime"
+                            )
+                            metadata.update({"checksum_type": checksum_kind, "checksum": checksum})
+                        else:
+                            checksum = ""
+                            metadata.update({"checksum_type": "none", "checksum": ""})
                 profile["checksum_ms"] = checksum_ms
                 with self._lock:
                     self._entries[op["tag"]].setdefault("chunks", {})[op["chunk_id"]] = metadata
@@ -2533,6 +2330,10 @@ class CheckpointStorageDaemon:
             if self.manifest_store is not None:
                 self.manifest_store.mark_operation_failed(op_id, str(exc))
             return {"op_id": op_id, "state": "FAILED", "error": str(exc)}
+        finally:
+            if remove_async_op:
+                with self._lock:
+                    self._async_ops.pop(op_id, None)
 
     def poll(self, op_id: str) -> dict[str, Any]:
         op_id = str(op_id)
@@ -2583,6 +2384,46 @@ def _backend_from_name(name: str, options: dict[str, Any] | None = None) -> Stor
     )
 
 
+def _load_object(spec: str) -> Any:
+    module_name, sep, attr = str(spec).partition(":")
+    if not sep or not module_name or not attr:
+        raise ValueError(f"object spec must be module:attribute, got {spec!r}")
+    obj: Any = importlib.import_module(module_name)
+    for part in attr.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _json_config_arg(value: str | None) -> dict[str, Any]:
+    if value in (None, ""):
+        return {}
+    raw = str(value)
+    if raw.startswith("@"):
+        raw = Path(raw[1:]).read_text(encoding="utf-8")
+    loaded = json.loads(raw)
+    if not isinstance(loaded, dict):
+        raise TypeError("EGM runtime config must decode to a JSON object")
+    return dict(loaded)
+
+
+def _load_egm_runtime(factory_spec: str | None, config: dict[str, Any] | None = None) -> Any:
+    if not factory_spec:
+        return None
+    factory = _load_object(str(factory_spec))
+    if not callable(factory):
+        if config:
+            raise TypeError("EGM runtime factory config was provided but the loaded object is not callable")
+        return factory
+    cfg = dict(config or {})
+    try:
+        return factory(**cfg)
+    except TypeError as kwargs_exc:
+        try:
+            return factory(cfg)
+        except TypeError:
+            raise kwargs_exc
+
+
 def _serve(address, authkey: bytes, backend_name: str, backend_options: dict[str, Any], metadata_dir: str | None, ready_conn=None) -> None:
     daemon = CheckpointStorageDaemon(
         _backend_from_name(backend_name, backend_options),
@@ -2628,22 +2469,8 @@ def _serve(address, authkey: bytes, backend_name: str, backend_options: dict[str
                             request.get("manifest_base"),
                             expected_chunks=request.get("expected_chunks"),
                         )
-                    elif op == "prepare_fd_chunk":
-                        result, fd = daemon.prepare_fd_chunk(
-                            request["tag"],
-                            request["chunk_id"],
-                            int(request["nbytes"]),
-                            request.get("metadata"),
-                        )
-                        conn.send({"ok": True, "result": result})
-                        send_handle(conn, fd, int(request["pid"]))
-                        continue
-                    elif op == "seal_fd_chunk":
-                        result = daemon.seal_fd_chunk(
-                            request["tag"],
-                            request["chunk_id"],
-                            request.get("metadata"),
-                        )
+                    elif op in {"prepare_fd_chunk", "seal_fd_chunk"}:
+                        raise RuntimeError("CSD fd/mmap put transport is disabled; use put_cuda_tensor/CUDA IPC")
                     elif op == "put_chunk":
                         result = daemon.put_chunk(
                             request["tag"],
@@ -2663,10 +2490,7 @@ def _serve(address, authkey: bytes, backend_name: str, backend_options: dict[str
                         data, metadata = daemon.get_chunk(request["tag"], request["chunk_id"])
                         result = {"data": data, "metadata": metadata}
                     elif op == "get_chunk_fd":
-                        result, fd = daemon.get_chunk_fd(request["tag"], request["chunk_id"])
-                        conn.send({"ok": True, "result": result})
-                        send_handle(conn, fd, int(request["pid"]))
-                        continue
+                        raise RuntimeError("CSD fd/mmap get transport is disabled; use read_into_cuda_tensor/CUDA IPC")
                     elif op == "get_metadata":
                         result = daemon.get_metadata(request["tag"], request["chunk_id"])
                     elif op == "put_cuda_ipc":
@@ -2750,8 +2574,6 @@ def _serve(address, authkey: bytes, backend_name: str, backend_options: dict[str
 class CheckpointStorageDaemonClient:
     """Client implementing RACER chunk-storage methods over CSD IPC."""
 
-    fd_threshold_bytes = 1
-
     def __init__(
         self,
         address: Any,
@@ -2759,10 +2581,10 @@ class CheckpointStorageDaemonClient:
         authkey: bytes | str | None = None,
         cuda_register_fd_mappings: bool = False,
     ) -> None:
+        if cuda_register_fd_mappings:
+            raise RuntimeError("CSD fd/mmap client mappings are disabled; use CUDA IPC")
         self.address = address
         self.authkey = _authkey(authkey)
-        self.cuda_register_fd_mappings = bool(cuda_register_fd_mappings)
-        self._fd_mapping_cache: dict[str, dict[str, Any]] = {}
         self._pending_cuda_views: dict[str, CudaIpcView] = {}
         self._conn = None
         self._conn_pid = os.getpid()
@@ -2814,141 +2636,6 @@ class CheckpointStorageDaemonClient:
     def close(self) -> None:
         with self._conn_lock:
             self._close_cached_conn_locked()
-
-    def _request_with_fd(self, payload: dict[str, Any]) -> tuple[Any, int]:
-        if not isinstance(self.address, str):
-            raise RuntimeError("CSD fd transport requires a Unix-domain socket address")
-        conn = Client(self.address, authkey=self.authkey)
-        try:
-            request = dict(payload)
-            request["pid"] = os.getpid()
-            conn.send(request)
-            response = conn.recv()
-            if not response.get("ok", False):
-                message = response.get("message", "unknown CSD error")
-                error_type = response.get("error_type", "RuntimeError")
-                if error_type == "KeyError":
-                    raise KeyError(message)
-                raise RuntimeError(message)
-            fd = recv_handle(conn)
-            return response.get("result"), int(fd)
-        finally:
-            conn.close()
-
-    def _map_fd_region(
-        self,
-        fd: int,
-        nbytes: int,
-        metadata: dict[str, Any] | None,
-        *,
-        register_for_cuda: bool,
-    ) -> tuple[mmap.mmap, int | None, bool]:
-        meta = dict(metadata or {})
-        slot_id = meta.get("fd_slot_id")
-        capacity = int(meta.get("capacity_nbytes") or nbytes)
-        if slot_id is not None:
-            cached = self._fd_mapping_cache.get(str(slot_id))
-            if cached is not None and int(cached["capacity_nbytes"]) >= int(nbytes):
-                os.close(int(fd))
-                if (
-                    register_for_cuda
-                    and self.cuda_register_fd_mappings
-                    and cached.get("registered_ptr") is None
-                ):
-                    cached["registered_ptr"] = _cuda_host_register_buffer(
-                        cached["mapping"],
-                        int(cached["capacity_nbytes"]),
-                    )
-                return cached["mapping"], cached.get("registered_ptr"), True
-        mapping = mmap.mmap(int(fd), capacity, access=mmap.ACCESS_WRITE)
-        os.close(int(fd))
-        registered_ptr = (
-            _cuda_host_register_buffer(mapping, capacity)
-            if register_for_cuda and self.cuda_register_fd_mappings
-            else None
-        )
-        if slot_id is not None:
-            self._fd_mapping_cache[str(slot_id)] = {
-                "mapping": mapping,
-                "registered_ptr": registered_ptr,
-                "capacity_nbytes": capacity,
-            }
-            return mapping, registered_ptr, True
-        return mapping, registered_ptr, False
-
-    def _copy_tensor_to_fd(
-        self,
-        fd: int,
-        nbytes: int,
-        source: torch.Tensor,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        mapping, registered_ptr, cached = self._map_fd_region(
-            fd,
-            int(nbytes),
-            metadata,
-            register_for_cuda=source.device.type == "cuda",
-        )
-        try:
-            if source.device.type == "cuda":
-                host_ptr = _buffer_pointer(mapping)
-                if host_ptr is None:
-                    raise RuntimeError("could not resolve native CSD fd mapping pointer")
-                _cuda_memcpy(host_ptr, int(source.data_ptr()), int(nbytes), _CUDA_MEMCPY_DEVICE_TO_HOST)
-            else:
-                target = torch.frombuffer(mapping, dtype=torch.uint8, count=int(nbytes))
-                try:
-                    target.copy_(source, non_blocking=False)
-                finally:
-                    del target
-        finally:
-            if not cached:
-                _cuda_host_unregister_pointer(registered_ptr)
-                mapping.close()
-
-    def _tensor_from_fd(
-        self,
-        fd: int,
-        nbytes: int,
-        target: torch.device,
-        metadata: dict[str, Any] | None = None,
-    ) -> torch.Tensor:
-        if int(nbytes) <= 0:
-            os.close(int(fd))
-            return torch.empty(0, dtype=torch.uint8, device=target)
-        mapping, registered_ptr, cached = self._map_fd_region(
-            fd,
-            int(nbytes),
-            metadata,
-            register_for_cuda=target.type == "cuda",
-        )
-        try:
-            if target.type == "cpu":
-                source = torch.frombuffer(mapping, dtype=torch.uint8, count=int(nbytes))
-                try:
-                    result = source.clone()
-                finally:
-                    del source
-                return result
-            if registered_ptr is None:
-                registered_ptr = (
-                    _cuda_host_register_buffer(mapping, int(nbytes))
-                    if self.cuda_register_fd_mappings
-                    else None
-                )
-                slot_id = dict(metadata or {}).get("fd_slot_id")
-                if cached and registered_ptr is not None and slot_id is not None:
-                    self._fd_mapping_cache[str(slot_id)]["registered_ptr"] = registered_ptr
-            host_ptr = _buffer_pointer(mapping)
-            if host_ptr is None:
-                raise RuntimeError("could not resolve native CSD fd mapping pointer")
-            out = torch.empty(int(nbytes), dtype=torch.uint8, device=target)
-            _cuda_memcpy(int(out.data_ptr()), host_ptr, int(nbytes), _CUDA_MEMCPY_HOST_TO_DEVICE)
-            return out
-        finally:
-            if not cached:
-                _cuda_host_unregister_pointer(registered_ptr)
-                mapping.close()
 
     def begin(
         self,
@@ -3185,6 +2872,14 @@ def main() -> None:
     parser.add_argument("--native-pinned-total-bytes", type=int, default=0)
     parser.add_argument("--native-pinned-segment-bytes", type=int, default=256 * 1024 * 1024)
     parser.add_argument("--native-pinned-device", type=int, default=0)
+    parser.add_argument("--egm-runtime-factory", default="racer.egm_runtime:create_runtime")
+    parser.add_argument("--egm-runtime-config", default=None)
+    parser.add_argument("--egm-pool-id", default=None)
+    parser.add_argument("--egm-owner-node", default=None)
+    parser.add_argument("--egm-owner-tray", default=None)
+    parser.add_argument("--egm-home-device", type=int, default=0)
+    parser.add_argument("--egm-numa-id", type=int, default=None)
+    parser.add_argument("--egm-accessing-devices", default=None)
     args = parser.parse_args()
     backend_options: dict[str, Any] = {}
     if args.backend == "native_pinned":
@@ -3192,6 +2887,20 @@ def main() -> None:
             "total_bytes": int(args.native_pinned_total_bytes),
             "segment_bytes": int(args.native_pinned_segment_bytes),
             "device": int(args.native_pinned_device),
+        }
+    elif args.backend == "egm":
+        backend_options = {
+            "runtime": _load_egm_runtime(args.egm_runtime_factory, _json_config_arg(args.egm_runtime_config)),
+            "pool_id": args.egm_pool_id,
+            "owner_node": args.egm_owner_node,
+            "owner_tray": args.egm_owner_tray,
+            "home_device": int(args.egm_home_device),
+            "numa_id": args.egm_numa_id,
+            "accessing_devices": (
+                [int(item) for item in str(args.egm_accessing_devices).split(",") if item.strip()]
+                if args.egm_accessing_devices
+                else None
+            ),
         }
     _serve(
         str(args.socket_path) if args.socket_path else (args.host, int(args.port)),

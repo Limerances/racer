@@ -28,3 +28,7 @@ def test_spare_compute_plan_skips_virtual_zero_and_returns_parity_to_train_owner
     assert plan.cost.skipped_virtual_zero_bytes == 2 * 1024
     assert plan.cost.compute_bytes_on_train_ranks == 0
     assert plan.cost.compute_bytes_on_accelerators > 0
+    assert plan.cost.compute_bytes_on_spare_ranks == plan.cost.compute_bytes_on_accelerators
+    assert plan.cost.xor_bytes_on_spare_ranks == plan.cost.xor_bytes_on_accelerators
+    assert plan.cost.max_spare_rank_compute_bytes == plan.cost.max_spare_compute_bytes
+    assert plan.cost.final_result_return_bytes == 2 * 1024

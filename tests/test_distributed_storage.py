@@ -7,6 +7,101 @@ from racer.config import RacerConfig
 from racer.layout import ElasticLayout
 
 
+def _storage_manifest_for_config(config: RacerConfig) -> dict:
+    layout = ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m)
+    matrix = cauchy.generate_systematic_matrix(config.k, config.m, config.w)
+    group_sizes = {group[0].relative_index: 4 for group in layout.reduction_groups}
+    packet_sizes = {int(rank): 4 for rank in config.train_ranks}
+    plan = routing.make_planner(config).plan(layout, matrix, 4)
+    return distributed._build_storage_manifest(
+        tag="dist",
+        config=config,
+        layout=layout,
+        matrix=matrix,
+        plan=plan,
+        group_nbytes=group_sizes,
+        packet_sizes=packet_sizes,
+    )
+
+
+def test_per_node_csd_rank_ranges_and_expected_chunk_counts():
+    config = RacerConfig(k=6, m=2, train_ranks=tuple(range(8)), spare_ranks=(8,))
+    manifest = _storage_manifest_for_config(config)
+
+    assert distributed._csv_ints("0-3,5,7-6") == [0, 1, 2, 3, 5, 7, 6]
+
+    global_count = distributed._expected_storage_chunk_count(manifest)
+    first_node_count = distributed._expected_storage_chunk_count_for_ranks(manifest, {0, 1, 2, 3})
+    second_node_count = distributed._expected_storage_chunk_count_for_ranks(manifest, {4, 5, 6, 7})
+    spare_node_count = distributed._expected_storage_chunk_count_for_ranks(manifest, {8})
+
+    assert global_count > 0
+    assert first_node_count > 0
+    assert second_node_count > 0
+    assert spare_node_count == 0
+    assert first_node_count + second_node_count == global_count
+
+
+def test_per_node_csd_begin_commit_only_runs_on_local_coordinator(monkeypatch):
+    config = RacerConfig(k=6, m=2, train_ranks=tuple(range(8)), spare_ranks=(8,))
+    manifest = _storage_manifest_for_config(config)
+    state = distributed.DistributedStoreResult(
+        tag="dist",
+        config=config,
+        layout=ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m),
+        matrix=cauchy.generate_systematic_matrix(config.k, config.m, config.w),
+        plan=routing.make_planner(config).plan(
+            ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m),
+            cauchy.generate_systematic_matrix(config.k, config.m, config.w),
+            4,
+        ),
+        local_chunks={},
+        packet_nbytes_by_rank={int(rank): 4 for rank in config.train_ranks},
+        manifest=manifest,
+    )
+
+    class FakeStorage:
+        def __init__(self):
+            self.begin_calls = []
+            self.manifests = []
+            self.commits = []
+
+        def begin(self, tag, *, manifest_base, expected_chunks):
+            self.begin_calls.append((tag, int(expected_chunks)))
+
+        def put_manifest(self, tag, manifest):
+            self.manifests.append((tag, manifest))
+
+        def commit(self, tag):
+            self.commits.append(tag)
+
+    monkeypatch.setenv("RACER_CSD_PER_NODE", "1")
+    monkeypatch.setenv("RACER_CSD_LOCAL_RANKS", "4-7")
+    monkeypatch.setenv("RACER_CSD_LOCAL_COORDINATOR_RANK", "4")
+    monkeypatch.setattr(distributed, "_barrier", lambda process_group=None: None)
+
+    expected_local_count = distributed._expected_storage_chunk_count_for_ranks(manifest, {4, 5, 6, 7})
+    storage = FakeStorage()
+
+    distributed._begin_storage_checkpoint(chunk_storage=storage, state=state, rank=4)
+    distributed._commit_storage_checkpoint(chunk_storage=storage, state=state, rank=4)
+
+    assert storage.begin_calls == [("dist", expected_local_count)]
+    assert storage.manifests == [("dist", manifest)]
+    assert storage.commits == ["dist"]
+
+    storage = FakeStorage()
+    distributed._begin_storage_checkpoint(chunk_storage=storage, state=state, rank=5)
+    distributed._commit_storage_checkpoint(chunk_storage=storage, state=state, rank=5)
+    assert storage.begin_calls == []
+    assert storage.manifests == []
+    assert storage.commits == []
+
+    storage = FakeStorage()
+    distributed._commit_storage_checkpoint(chunk_storage=storage, state=state, rank=0)
+    assert storage.commits == []
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_pad_exact_size_reuses_cuda_payload_storage():
     payload = torch.arange(128, dtype=torch.uint8, device="cuda:0")
@@ -58,6 +153,7 @@ def test_distributed_state_from_storage_rejects_cpu_fake_storage(monkeypatch):
         group_nbytes=group_sizes,
         packet_sizes=packet_sizes,
     )
+    manifest.update({"committed": True, "daemon_owned": True, "data_resident": True})
 
     class FakeStorage:
         def get_manifest(self, tag):
@@ -152,6 +248,7 @@ def test_distributed_store_writes_each_reduction_group_before_next_group(monkeyp
     monkeypatch.setattr(distributed, "_require_nccl", lambda process_group=None: None)
     monkeypatch.setattr(distributed, "_rank", lambda process_group=None: 0)
     monkeypatch.setattr(distributed, "_barrier", lambda process_group=None: None)
+    monkeypatch.setattr(distributed, "_current_cuda_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(distributed, "_cuda_payload", lambda local_packet: local_packet)
     monkeypatch.setattr(
         distributed,
@@ -272,6 +369,7 @@ def test_distributed_state_from_storage_rejects_cpu_fake_storage_with_zero_rows(
         group_nbytes=group_sizes,
         packet_sizes=packet_sizes,
     )
+    manifest.update({"committed": True, "daemon_owned": True, "data_resident": True})
 
     class FakeStorage:
         def get_manifest(self, tag):
@@ -290,6 +388,39 @@ def test_distributed_state_from_storage_rejects_cpu_fake_storage_with_zero_rows(
             tag="dist",
             chunk_storage=storage,
         )
+
+
+def test_distributed_load_defaults_failed_rank_output_to_first_spare(monkeypatch):
+    config = RacerConfig(k=1, m=1, train_ranks=(0, 1), spare_ranks=(2,))
+    layout = ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m)
+    matrix = cauchy.generate_systematic_matrix(config.k, config.m, config.w)
+    plan = routing.make_planner(config).plan(layout, matrix, 4)
+    state = distributed.DistributedStoreResult(
+        tag="dist",
+        config=config,
+        layout=layout,
+        matrix=matrix,
+        plan=plan,
+        local_chunks={},
+        packet_nbytes_by_rank={0: 4, 1: 4},
+    )
+
+    monkeypatch.setattr(distributed, "_require_nccl", lambda process_group=None: None)
+    monkeypatch.setattr(distributed, "_rank", lambda process_group=None: 2)
+    monkeypatch.setattr(distributed, "_current_cuda_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(distributed, "_barrier", lambda process_group=None: None)
+    monkeypatch.setattr(distributed, "_recv_tensor", lambda nbytes, src, *, device=None, process_group=None: torch.arange(int(nbytes), dtype=torch.uint8))
+    monkeypatch.setattr(distributed.codec_cuda, "decode_blocks", lambda chunks, rows, matrix: [chunks[0]])
+
+    result = distributed.distributed_load(
+        state=state,
+        failed_train_ranks=[0],
+        requested_train_ranks=[0],
+        replacement_mapping=None,
+    )
+
+    assert result.decode_rank == 2
+    assert torch.equal(result.recovered[0], torch.arange(4, dtype=torch.uint8))
 
 
 def test_store_data_rows_skips_virtual_zero_without_allocating_zero_buffer(monkeypatch):

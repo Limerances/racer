@@ -8,11 +8,11 @@
 
 1. 启动 CSD daemon，后端默认 `native_pinned`。
 2. 启动 Megatron 训练进程。
-3. 训练到指定 iteration 后保存 RACER checkpoint。
-4. 杀掉第一轮训练进程，CSD daemon 保持存活。
-5. 重新启动 Megatron 训练进程。
-6. 新训练进程从 CSD 读取 committed checkpoint 并恢复训练。
-7. 继续训练并再次保存 checkpoint。
+3. 每 5 个 iteration 保存一次 RACER checkpoint。
+4. 每 20 个 iteration 在 checkpoint commit 后杀掉训练进程，CSD daemon 保持存活。
+5. 连续杀 3 次，分别覆盖 iter 20 / 40 / 60。
+6. 每次重新启动 Megatron，新进程从 CSD 读取 committed checkpoint 并恢复训练。
+7. 最后一次 kill 后继续跑 20 个 iteration，到 iter 80 正常结束并再次保存 checkpoint。
 
 这里的 chunk 固定为 `1073741824` bytes，也就是 1GiB。
 
@@ -33,19 +33,20 @@ some_parent/
 
 ```bash
 cd /path/to/racer
-SAVE_INTERVAL=1 KILL_AFTER_ITER=1 RESUME_TRAIN_ITERS=2 examples/run_megatron_csd_restart_1_5b.sh
+examples/run_megatron_csd_restart_1_5b.sh
 ```
 
 ```bash
 cd /path/to/racer
-SAVE_INTERVAL=1 KILL_AFTER_ITER=1 RESUME_TRAIN_ITERS=2 examples/run_megatron_csd_restart_5_3b.sh
+examples/run_megatron_csd_restart_5_3b.sh
 ```
 
 常用参数通过环境变量控制：
 
 - `SAVE_INTERVAL`: 每多少个 iteration 保存一次 checkpoint。
-- `KILL_AFTER_ITER`: 第一轮训练保存到哪个 iteration 后杀掉训练进程，用来模拟重启。
-- `RESUME_TRAIN_ITERS`: 重启后的训练总 iteration 数。
+- `KILL_INTERVAL_ITERS`: 每多少个 iteration 杀一次训练进程，默认 `20`。
+- `KILL_COUNT`: 一共杀几次，默认 `3`。
+- `POST_KILL_TRAIN_ITERS`: 最后一次 kill 后继续训练多少个 iteration，默认 `20`。
 - `GLOBAL_BATCH_SIZE`: 全局 batch size，5.3B wrapper 默认是 `8`。
 - `CUDA_VISIBLE_DEVICES`: 默认 `0,1,2,3,4`，其中 4 个 train rank，1 个 spare rank。
 - `RACER_BUFFER_SIZE`: RACER chunk 大小，默认固定 `1073741824`。
@@ -66,7 +67,6 @@ MEGATRON_ROOT=/path/to/Megatron-LM-FT \
 DATA_PATH=/path/to/data/my_shakespeare_text_document \
 GPT2_VOCAB_FILE=/path/to/gpt2_vocab/vocab.json \
 GPT2_MERGE_FILE=/path/to/gpt2_vocab/merges.txt \
-SAVE_INTERVAL=1 KILL_AFTER_ITER=1 RESUME_TRAIN_ITERS=2 \
 examples/run_megatron_csd_restart_1_5b.sh
 ```
 
@@ -81,10 +81,11 @@ $RACER_ROOT/results/megatron_csd_restart/gpt2_5.3b_YYYYMMDD_HHMMSS
 
 关键文件：
 
-- `first_run.log`: 第一轮训练日志。
-- `resume_run.log`: 重启后训练日志。
+- `run_00.log` 到 `run_03.log`: 四段 Megatron 训练日志；前三段在 checkpoint 后被杀，最后一段正常结束。
 - `csd.log`: CSD daemon 日志。
 - `parsed_log_events.csv`: 最重要的汇总事件表。
+- `iteration_times.csv`: 每条 Megatron iteration 日志里的正常训练耗时。
+- `iteration_time_summary.csv`: 按阶段和整体聚合的 iteration 平均、P50、P95、最大值。
 - `per_rank_profile_events.csv`: 每个 rank 的更细 profile。
 - `csd_profile_summary.csv`: CSD 后端 put/get 的分解汇总。
 - `summary.json`: 机器可读 summary。
@@ -98,30 +99,31 @@ $RACER_ROOT/results/megatron_csd_restart/gpt2_5.3b_YYYYMMDD_HHMMSS
 python scripts/summarize_megatron_csd_restart.py results/megatron_csd_restart/gpt2_1.5b_YYYYMMDD_HHMMSS
 ```
 
-输出里重点看四块：
+输出里重点看这些块：
 
-1. `Normal training iteration time from raw Megatron logs`
-   - 这是 Megatron 原始日志里的正常 iteration 时间。
-   - 字段 `elapsed_per_iter` 是每个 iteration 的 wall time。
+1. `每迭代训练耗时摘要`
+   - 这是 Megatron 原始日志里的 `elapsed time per iteration (ms)`。
+   - `non_checkpoint` 是排除保存点 iteration 后的训练耗时。
+   - 每个 iteration 的明细在 `iteration_times.csv`；命令行需要展开时加 `--show-iteration-details`。
 
-2. `Megatron checkpoint blocking events`
-   - `save_fn_total` 是训练进程真正被 checkpoint 阻塞的总时间。
-   - `racer_adapter_save` 在 `save_fn_total` 里面，不要和它相加。
-   - `state_dict` 和 `optimizer_capture` 也是 `save_fn_total` 的内部阶段。
+2. `Megatron 保存阻塞耗时`
+   - `save总耗时` 是训练进程真正被 checkpoint 阻塞的总时间。
+   - `RACER保存` 在 `save总耗时` 里面，不要和它相加。
+   - `state_dict` 和 `optimizer` 也是 `save总耗时` 的内部阶段。
 
-3. `RACER store events`
-   - `adapter_store` 是 RACER adapter 的 store 总耗时，属于 `save_fn_total` 内部。
-   - `racer_calls` 是所有 RACER distributed store 调用的累计时间。
-   - `max_chunk_store` 是最慢的单个 logical chunk store。
-   - `data_rows` 是 data row 传输/归位阶段。
-   - `parity` 是 spare GPU 计算 parity 和传回 train rank 的阶段。
-   - `csd_storage` 是把最终 data/parity row 写到 CSD 的阶段。
-   - `csd_wait` 是等待 CSD 异步 put 完成的时间。
-   - 这些是内部诊断字段，不要和 `adapter_store` 简单相加。
+3. `RACER 保存耗时摘要` 和 `RACER 保存事件短表`
+   - 这两张表是给人看的窄表，只保留 `store`、`CSD wait`、payload、chunks 和最慢 iteration。
+   - `store` 是 RACER adapter 的保存耗时，属于 `save总耗时` 内部。
+   - `CSD wait` 是等待 CSD 异步 put 完成的时间。
+   - 更细的 `racer_calls`、`parity`、`data_rows`、`client_rpc`、`daemon_backend_write` 等字段在 `parsed_log_events.csv`。
 
-4. `RACER restart/load events`
-   - `load_total` 是重启后读取 RACER checkpoint 的总时间。
-   - `racer_fetch` 是从 CSD 取回 encoded rows 并恢复所需数据的阶段。
+4. `RACER 恢复读取事件`
+   - `总耗时` 是重启后读取 RACER checkpoint 的总时间。
+   - `fetch` 是从 CSD 取回 encoded rows 并恢复所需数据的阶段。
+
+5. `CSD 后端摘要`
+   - 重点看 `dynamic_alloc`。
+   - `dynamic_alloc=0` 表示这轮没有临时 `cudaHostAlloc` pinned memory 分配，性能更稳定。
    - `read_wait` 是等待 CSD read op 完成的时间。
    - `materialize` 是把恢复出的 byte payload 变回 Megatron state_dict tensor 的阶段。
    - `tree_decode` 是恢复 tensor tree 结构的阶段。
@@ -137,7 +139,7 @@ Restart checks: load_observed=True  post_resume_checkpoint_observed=True
 也可以手动查：
 
 ```bash
-grep -n "RACER distributed memory checkpoint loaded" results/megatron_csd_restart/gpt2_*/resume_run.log
+grep -n "RACER distributed memory checkpoint loaded" results/megatron_csd_restart/gpt2_*/run_*.log
 ```
 
 如果没有这行，说明没有实际 load resident checkpoint。
@@ -171,6 +173,6 @@ event=load 的 total_ms
 ## 8. 常见失败判断
 
 - CSD 启动失败：看 `csd.log`，确认 CUDA 权限和 pinned pool 大小。
-- 没有 restart load：看 `resume_run.log` 是否有 `RACER distributed memory checkpoint loaded`。
+- 没有 restart load：看 `run_01.log` / `run_02.log` / `run_03.log` 是否有 `RACER distributed memory checkpoint loaded`。
 - OOM：降低 `RACER_BUFFER_SIZE` 或 `GLOBAL_BATCH_SIZE`，并确认 `CSD_NATIVE_PINNED_TOTAL_BYTES` 足够。
 - 性能异常：先看 `save_fn_total`，再看 `adapter_store`，最后看 `csd_profile_summary.csv` 里的 allocation / copy / checksum / sqlite。

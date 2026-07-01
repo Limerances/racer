@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import threading
+import types
 
 import pytest
 import torch
@@ -21,6 +22,8 @@ def test_csd_client_rejects_socket_bytes_and_fd_compat_paths():
     client = CheckpointStorageDaemonClient("unused.sock", authkey="racer-csd")
     payload = torch.arange(16, dtype=torch.uint8)
 
+    with pytest.raises(RuntimeError, match="fd/mmap client mappings are disabled"):
+        CheckpointStorageDaemonClient("unused.sock", authkey="racer-csd", cuda_register_fd_mappings=True)
     with pytest.raises(RuntimeError, match="put_chunk is disabled"):
         client.put_chunk("tag", "c0", payload)
     with pytest.raises(RuntimeError, match="put is disabled"):
@@ -132,6 +135,31 @@ def test_native_pinned_backend_reuses_freed_pool_blocks(monkeypatch):
     assert len(fake.buffers) == 2
 
 
+def test_native_pinned_read_rejects_undersized_cuda_ipc_view(monkeypatch):
+    monkeypatch.setenv("RACER_CSD_PREWARM_CUDA_CONTEXTS", "0")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(csd_mod, "_load_cudart", lambda: object())
+    monkeypatch.setattr(csd_mod, "_cuda_set_device", lambda device: None)
+
+    backend = NativePinnedMemoryBackend(total_bytes=0, segment_bytes=1024)
+    backend._chunks = {
+        "tag": {
+            "c0": csd_mod.BackendChunk(
+                tensor=torch.empty(0, dtype=torch.uint8),
+                metadata={"nbytes": 128},
+                nbytes=128,
+                capacity_nbytes=128,
+                host_ptr=1234,
+                segment_id="seg0",
+                offset=0,
+            )
+        }
+    }
+
+    with pytest.raises(ValueError, match="too small"):
+        backend.read_to_cuda_ipc("tag", "c0", {"nbytes": 127})
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 5, reason="requires train GPUs 0-3 plus spare GPU 4")
 def test_native_pinned_checkpoint_survives_training_context_restart(tmp_path):
     daemon = racer.start_checkpoint_storage_daemon(
@@ -211,6 +239,77 @@ def test_egm_backend_rejects_mempool_without_native_transport():
         EgmBackend(mem_pool=object())
 
 
+def test_egm_runtime_factory_can_be_loaded_from_module_spec(monkeypatch):
+    class FakeEgmRuntime:
+        def __init__(self, runtime_name):
+            self.runtime_name = runtime_name
+
+        def capabilities(self):
+            return {"runtime_name": self.runtime_name}
+
+        def write_from_cuda_ipc(self, tag, chunk_id, view, metadata):
+            return "put-op", {"nbytes": int(view["nbytes"]), "checksum_type": "none"}
+
+        def read_to_cuda_ipc(self, tag, chunk_id, view):
+            return "get-op"
+
+    module = types.ModuleType("fake_egm_runtime_module")
+
+    def make_runtime(runtime_name):
+        return FakeEgmRuntime(runtime_name)
+
+    module.make_runtime = make_runtime
+    monkeypatch.setitem(sys.modules, "fake_egm_runtime_module", module)
+
+    runtime = csd_mod._load_egm_runtime(
+        "fake_egm_runtime_module:make_runtime",
+        {"runtime_name": "gb200-test"},
+    )
+    backend = csd_mod._backend_from_name("egm", {"runtime": runtime, "pool_id": "pool0"})
+
+    caps = backend.capabilities()
+    assert caps["backend"] == "egm"
+    assert caps["runtime_name"] == "gb200-test"
+    assert caps["pool_id"] == "pool0"
+
+
+def test_metadata_only_csd_manifest_is_resident_when_expected_chunks_zero(tmp_path):
+    class MetadataOnlyBackend:
+        name = "fake"
+
+        def capabilities(self):
+            return {
+                "backend": self.name,
+                "restart_aware": True,
+                "daemon_owned": True,
+                "supports_cuda_ipc": True,
+                "supports_async_copy": True,
+            }
+
+        def list_chunks(self, tag):
+            return []
+
+    daemon = csd_mod.CheckpointStorageDaemon(MetadataOnlyBackend(), metadata_dir=tmp_path)
+    manifest = {
+        "tag": "dist",
+        "k": 6,
+        "m": 2,
+        "train_ranks": list(range(8)),
+        "spare_ranks": [8],
+        "chunks": [{"chunk_id": "rg_000000_row_000", "owner_rank": 0}],
+    }
+
+    daemon.begin("dist", manifest, expected_chunks=0)
+    daemon.put_manifest("dist", manifest)
+    daemon.commit("dist")
+    loaded = daemon.get_manifest("dist")
+
+    assert loaded["committed"] is True
+    assert loaded["daemon_owned"] is True
+    assert loaded["data_resident"] is True
+    assert loaded["expected_chunks"] == 0
+
+
 def test_egm_backend_delegates_to_native_transport_runtime():
     class FakeEgmRuntime:
         def __init__(self):
@@ -263,3 +362,220 @@ def test_egm_backend_delegates_to_native_transport_runtime():
 
     with pytest.raises(NotImplementedError, match="CPU/socket byte put"):
         backend.write_from_bytes("tag", "c1", b"abc")
+
+
+def test_egm_put_wait_does_not_checksum_via_cpu_byte_read(monkeypatch):
+    monkeypatch.setattr(csd_mod, "_visible_cuda_device_count", lambda: 0)
+
+    class FakeEgmRuntime:
+        def capabilities(self):
+            return {"supports_zero_copy_region": True, "runtime": "fake"}
+
+        def write_from_cuda_ipc(self, tag, chunk_id, view, metadata):
+            return "put-op", {"nbytes": int(view["nbytes"])}
+
+        def read_to_cuda_ipc(self, tag, chunk_id, view):
+            return "get-op"
+
+        def wait(self, op_id):
+            pass
+
+    backend = EgmBackend(runtime=FakeEgmRuntime())
+    daemon = csd_mod.CheckpointStorageDaemon(backend)
+    daemon._entries["tag"] = {
+        "tag": "tag",
+        "manifest": {},
+        "chunks": {},
+        "committed": False,
+        "data_resident": True,
+        "storage_backend": "egm",
+    }
+    backend.write_from_cuda_ipc("tag", "c0", {"nbytes": 16}, {})
+    daemon._async_ops["op0"] = {
+        "backend_op_id": "put-op",
+        "op_type": "PUT",
+        "tag": "tag",
+        "chunk_id": "c0",
+        "metadata": {},
+        "profile": {},
+    }
+
+    result = daemon.wait("op0")
+
+    assert result["state"] == "DONE"
+    assert "op0" not in daemon._async_ops
+    chunk = daemon._entries["tag"]["chunks"]["c0"]
+    assert chunk["checksum_type"] == "none"
+    assert chunk["checksum"] == ""
+
+
+def test_native_backend_profile_pops_completed_op():
+    backend = NativePinnedMemoryBackend.__new__(NativePinnedMemoryBackend)
+    backend._lock = threading.RLock()
+    backend._op_condition = threading.Condition(backend._lock)
+    backend._ops = {
+        "op0": csd_mod._NativeCopyOp(
+            op_id="op0",
+            device=0,
+            stream=0,
+            wait_start_event=1,
+            copy_start_event=2,
+            complete_event=3,
+            remote_ptr=None,
+            remote_event=None,
+            profile={"daemon_memcpy_ms_wall": 1.25},
+            done=True,
+            resources_released=True,
+        )
+    }
+
+    assert backend.profile("op0") == {"daemon_memcpy_ms_wall": 1.25}
+    assert "op0" not in backend._ops
+
+
+def test_native_backend_poll_skips_op_claimed_by_wait():
+    backend = NativePinnedMemoryBackend.__new__(NativePinnedMemoryBackend)
+    backend._lock = threading.RLock()
+    backend._op_condition = threading.Condition(backend._lock)
+    backend._ops = {
+        "op0": csd_mod._NativeCopyOp(
+            op_id="op0",
+            device=0,
+            stream=0,
+            wait_start_event=1,
+            copy_start_event=2,
+            complete_event=3,
+            remote_ptr=None,
+            remote_event=None,
+            in_completion=True,
+        )
+    }
+
+    assert backend.poll("op0") == "RUNNING"
+
+
+def test_native_ipc_cache_refcount_decrements_and_evicts_idle(monkeypatch):
+    closed_ptrs = []
+
+    class FakeCudaRuntime:
+        def cudaIpcCloseMemHandle(self, ptr):
+            closed_ptrs.append(int(ptr.value))
+            return 0
+
+    backend = NativePinnedMemoryBackend.__new__(NativePinnedMemoryBackend)
+    backend._ipc_lock = threading.RLock()
+    backend._ipc_mem_cache_max_entries = 1
+    backend._ipc_mem_cache = {
+        "old": {"ptr": 11, "refcount": 0, "device": 0, "last_used_ns": 1},
+        "active": {"ptr": 22, "refcount": 1, "device": 0, "last_used_ns": 2},
+    }
+    monkeypatch.setattr(csd_mod, "_load_cudart", lambda: FakeCudaRuntime())
+
+    backend._release_ipc_cache_ref("active")
+
+    assert backend._ipc_mem_cache["active"]["refcount"] == 0
+    assert "old" not in backend._ipc_mem_cache
+    assert closed_ptrs == [11]
+
+
+def test_csd_allows_explicit_repair_put_after_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(csd_mod, "_visible_cuda_device_count", lambda: 0)
+
+    class FakeCudaBackend:
+        name = "fake_cuda"
+
+        def __init__(self):
+            self.metadata_by_tag = {}
+            self.waited = []
+
+        def capabilities(self):
+            return {
+                "backend": self.name,
+                "restart_aware": True,
+                "daemon_owned": True,
+                "supports_cuda_ipc": True,
+            }
+
+        def write_from_cuda_ipc(self, tag, chunk_id, view, metadata):
+            record = dict(metadata)
+            record.update(
+                {
+                    "storage_backend": self.name,
+                    "location": {"backend": self.name, "offset": len(self.waited), "nbytes": int(view["nbytes"])},
+                    "nbytes": int(view["nbytes"]),
+                    "valid_nbytes": int(view["nbytes"]),
+                }
+            )
+            self.metadata_by_tag.setdefault(tag, {})[chunk_id] = record
+            return f"backend-{len(self.waited)}", record
+
+        def wait(self, op_id):
+            self.waited.append(op_id)
+
+        def profile(self, op_id):
+            return {}
+
+        def metadata(self, tag, chunk_id):
+            return dict(self.metadata_by_tag[tag][chunk_id])
+
+        def checksum(self, tag, chunk_id, checksum_type="sha256"):
+            return f"{checksum_type}-sealed-{len(self.waited)}"
+
+        def list_chunks(self, tag):
+            return sorted(self.metadata_by_tag.get(tag, {}))
+
+        def free_tag(self, tag):
+            self.metadata_by_tag.pop(tag, None)
+
+    daemon = csd_mod.CheckpointStorageDaemon(FakeCudaBackend(), metadata_dir=tmp_path)
+    manifest = {
+        "tag": "repairable",
+        "k": 1,
+        "m": 0,
+        "chunks": [{"chunk_id": "c0", "row": 0, "owner_rank": 0, "checksum": "stale"}],
+    }
+    daemon.begin("repairable", manifest, expected_chunks=1)
+    put = daemon.put_cuda_ipc(
+        "repairable",
+        "c0",
+        {"nbytes": 4},
+        {"row": 0, "owner_rank": 0, "writer_rank": 0, "nbytes": 4, "checksum_type": "sample64"},
+    )
+    assert daemon.wait(put["op_id"])["state"] == "DONE"
+    daemon.put_manifest("repairable", manifest)
+    daemon.commit("repairable")
+
+    repair_manifest = {
+        "tag": "repairable",
+        "k": 1,
+        "m": 0,
+        "chunks": [
+            {
+                "chunk_id": "c0",
+                "row": 0,
+                "owner_rank": 4,
+                "checksum_type": "sample64",
+                "checksum": "repair-stale",
+            }
+        ],
+    }
+    repair_put = daemon.put_cuda_ipc(
+        "repairable",
+        "c0",
+        {"nbytes": 4},
+        {
+            "row": 0,
+            "owner_rank": 4,
+            "writer_rank": 4,
+            "nbytes": 4,
+            "checksum_type": "sample64",
+            "committed_checkpoint_update": True,
+        },
+    )
+    assert daemon.wait(repair_put["op_id"])["state"] == "DONE"
+    daemon.put_manifest("repairable", repair_manifest)
+
+    updated = daemon.get_manifest("repairable")
+    assert updated["chunks"][0]["owner_rank"] == 4
+    assert updated["chunks"][0]["checksum"] != "repair-stale"
+    assert updated["chunks"][0]["checksum"].startswith("sample64-sealed")

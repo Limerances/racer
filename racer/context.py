@@ -1034,7 +1034,9 @@ class RacerContext:
                     chunk["num_bytes"] = int(repaired.numel())
                     chunk["checksum"] = self._checksum(repaired)
                     if self._chunk_storage_supports_cuda_ipc() and repaired.device.type == "cuda":
-                        op_id = self.chunk_storage.put_cuda_tensor(checkpoint.tag, chunk_id, repaired, chunk)
+                        repair_metadata = dict(chunk)
+                        repair_metadata["committed_checkpoint_update"] = True
+                        op_id = self.chunk_storage.put_cuda_tensor(checkpoint.tag, chunk_id, repaired, repair_metadata)
                         self.chunk_storage.wait(op_id)
                     else:
                         raise RuntimeError(

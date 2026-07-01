@@ -60,6 +60,46 @@ def test_manifest_commit_succeeds_after_all_chunks_sealed(tmp_path):
     assert manifest["chunks"][0]["checksum"] == "abc"
 
 
+def test_manifest_update_preserves_sealed_checksum(tmp_path):
+    store = CsdManifestStore(tmp_path / "csd.sqlite")
+    manifest = {
+        "tag": "sealed",
+        "chunks": [{"chunk_id": "c0", "row": 0, "owner_rank": 0, "checksum": "stale-prewrite"}],
+    }
+    store.begin_checkpoint("sealed", manifest, expected_chunks=1, backend="native_pinned")
+    store.reserve_chunk("sealed", "c0", {"row": 0, "owner_rank": 0, "nbytes": 3}, backend="native_pinned")
+    store.mark_chunk_copying("sealed", "c0", "op0")
+    store.seal_chunk(
+        "sealed",
+        "c0",
+        location={"backend": "native_pinned", "offset": 0, "nbytes": 3},
+        checksum_type="sha256",
+        checksum="sealed-sha",
+        nbytes=3,
+        valid_nbytes=3,
+    )
+    store.update_manifest(
+        "sealed",
+        {
+            "tag": "sealed",
+            "chunks": [
+                {
+                    "chunk_id": "c0",
+                    "row": 0,
+                    "owner_rank": 0,
+                    "checksum_type": "sample64",
+                    "checksum": "stale-sampled",
+                }
+            ],
+        },
+    )
+    store.commit_checkpoint("sealed")
+
+    stored = store.manifest_for_tag("sealed")
+    assert stored["chunks"][0]["checksum_type"] == "sha256"
+    assert stored["chunks"][0]["checksum"] == "sealed-sha"
+
+
 def test_manifest_reopens_committed_metadata(tmp_path):
     path = tmp_path / "csd.sqlite"
     store = CsdManifestStore(path)

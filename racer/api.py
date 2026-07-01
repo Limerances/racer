@@ -11,7 +11,6 @@ from typing import Any
 
 from .config import RacerConfig
 from .context import RacerContext
-from .csd import CheckpointStorageDaemonClient
 from .handles import RepairHandle, StoreHandle
 
 _DEFAULT_CONTEXT: RacerContext | None = None
@@ -77,6 +76,8 @@ def init(
         if client is not None:
             chunk_storage = client
         else:
+            from .csd import CheckpointStorageDaemonClient
+
             address = options.pop("address", None)
             if address is None:
                 host = options.pop("host", "127.0.0.1")

@@ -53,6 +53,92 @@ def _fmt_gib(value: int | None) -> str:
     return f"{value / 1024**3:.2f} GiB"
 
 
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * percentile
+    low = int(rank)
+    high = min(low + 1, len(ordered) - 1)
+    weight = rank - low
+    return ordered[low] * (1.0 - weight) + ordered[high] * weight
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _iteration_from_tag(tag: str) -> str:
+    match = re.search(r"iter_([0-9]+)$", str(tag or ""))
+    return str(int(match.group(1))) if match else "-"
+
+
+def _summarize_store_events(stores: list[dict[str, str]]) -> list[list[str]]:
+    groups: list[tuple[str, list[dict[str, str]]]] = [("all", stores)]
+    phases = sorted({str(row.get("phase", "")) for row in stores if row.get("phase")})
+    groups.extend((phase, [row for row in stores if str(row.get("phase", "")) == phase]) for phase in phases)
+    rows: list[list[str]] = []
+    for phase, items in groups:
+        if not items:
+            continue
+        store_values = [value for value in (_float(row, "store_ms") for row in items) if value is not None]
+        wait_values = [value for value in (_float(row, "storage_wait_ms") for row in items) if value is not None]
+        slowest = max(items, key=lambda row: _float(row, "store_ms") or 0.0)
+        rows.append(
+            [
+                phase,
+                str(len(items)),
+                _fmt_ms(_mean(store_values)),
+                _fmt_ms(_percentile(store_values, 0.50)),
+                _fmt_ms(max(store_values) if store_values else None),
+                _fmt_ms(_percentile(wait_values, 0.50)),
+                _fmt_ms(max(wait_values) if wait_values else None),
+                _fmt_gib(_int(items[0], "local_bytes")),
+                str(items[0].get("chunks", "")),
+                _iteration_from_tag(str(slowest.get("tag", ""))),
+            ]
+        )
+    return rows
+
+
+def _summarize_csd_totals(csd: list[dict[str, str]]) -> list[list[str]]:
+    totals = {
+        "groups": len(csd),
+        "ops": 0,
+        "dynamic": 0,
+        "pool": 0,
+        "free": 0,
+        "alloc_ms": 0.0,
+        "checksum_ms": 0.0,
+        "sqlite_ms": 0.0,
+        "copy_wall_ms": 0.0,
+    }
+    for row in csd:
+        totals["ops"] += _int(row, "op_count") or 0
+        totals["dynamic"] += _int(row, "allocate_source_dynamic_cudaHostAlloc_count") or 0
+        totals["pool"] += _int(row, "allocate_source_pool_bump_count") or 0
+        totals["free"] += _int(row, "allocate_source_free_list_count") or 0
+        totals["alloc_ms"] += _float(row, "daemon_allocate_ms_sum") or 0.0
+        totals["checksum_ms"] += _float(row, "checksum_ms_sum") or 0.0
+        totals["sqlite_ms"] += _float(row, "sqlite_ms_sum") or 0.0
+        totals["copy_wall_ms"] += _float(row, "daemon_memcpy_ms_wall_sum") or 0.0
+    return [
+        [
+            str(totals["groups"]),
+            str(totals["ops"]),
+            str(totals["dynamic"]),
+            str(totals["pool"]),
+            str(totals["free"]),
+            _fmt_ms(float(totals["alloc_ms"])),
+            _fmt_ms(float(totals["checksum_ms"])),
+            _fmt_ms(float(totals["sqlite_ms"])),
+            _fmt_ms(float(totals["copy_wall_ms"])),
+        ]
+    ]
+
+
 def _iter_times(log_path: Path) -> list[tuple[int, float]]:
     if not log_path.exists():
         return []
@@ -78,42 +164,109 @@ def _print_table(headers: list[str], rows: list[list[str]]) -> None:
         print("  ".join(item.ljust(widths[idx]) for idx, item in enumerate(row)))
 
 
-def summarize(result_dir: Path) -> None:
+def summarize(result_dir: Path, *, show_iteration_details: bool = False) -> None:
     result_dir = result_dir.resolve()
     summary_path = result_dir / "summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
     events = _read_csv(result_dir / "parsed_log_events.csv")
     csd = _read_csv(result_dir / "csd_profile_summary.csv")
 
-    print(f"Result directory: {result_dir}")
+    print(f"结果目录: {result_dir}")
     if summary:
         metadata = summary.get("metadata", {}) if isinstance(summary.get("metadata"), dict) else {}
         print(
-            f"Model: {metadata.get('model', summary.get('model'))}  "
-            f"target_tag: {metadata.get('target_tag', summary.get('target_tag'))}  "
-            f"resume_tag: {metadata.get('resume_tag', summary.get('resume_tag'))}"
+            f"模型: {metadata.get('model', summary.get('model'))}  "
+            f"杀进程 iter: {[ _iteration_from_tag(tag) for tag in metadata.get('kill_target_tags', [metadata.get('target_tag', summary.get('target_tag'))]) ]}  "
+            f"最终 iter: {_iteration_from_tag(str(metadata.get('final_tag', metadata.get('resume_tag', summary.get('resume_tag')))))}"
         )
         print(
-            "Restart checks: "
-            f"load_observed={summary.get('restart_load_observed')}  "
-            f"post_resume_checkpoint_observed={summary.get('post_resume_checkpoint_observed')}"
+            "正确性检查: "
+            f"三次恢复 load={summary.get('restart_load_observed')}  "
+            f"最终 checkpoint={summary.get('post_resume_checkpoint_observed')}"
         )
-        print(
-            "Run wall time: "
-            f"first_until_kill={_fmt_ms(_float(summary.get('first_run', {}), 'wall_ms_until_kill'))}  "
-            f"resume={_fmt_ms(_float(summary.get('resume_run', {}), 'wall_ms'))}"
-        )
+        if metadata:
+            print(
+                "测试节奏: "
+                f"保存间隔={metadata.get('save_interval')}  "
+                f"杀进程间隔={metadata.get('kill_interval_iters')}  "
+                f"杀进程次数={metadata.get('kill_count')}  "
+                f"最终迭代={metadata.get('final_train_iters')}"
+            )
+        run_results = summary.get("run_results")
+        if isinstance(run_results, list):
+            print("运行分段")
+            run_rows = []
+            for item in run_results:
+                if not isinstance(item, dict):
+                    continue
+                wall = _float(item, "wall_ms_until_kill")
+                if wall is None:
+                    wall = _float(item, "wall_ms")
+                run_rows.append(
+                    [
+                        str(item.get("phase", "")),
+                        str(item.get("action", "")),
+                        _iteration_from_tag(str(item.get("target_tag", ""))),
+                        _iteration_from_tag(str(item.get("expected_load_tag", ""))),
+                        str(item.get("returncode", "")),
+                        _fmt_ms(wall),
+                    ]
+                )
+            _print_table(["阶段", "动作", "目标iter", "期望load", "返回码", "墙钟"], run_rows)
+        else:
+            print(
+                "运行墙钟时间: "
+                f"first_until_kill={_fmt_ms(_float(summary.get('first_run', {}), 'wall_ms_until_kill'))}  "
+                f"resume={_fmt_ms(_float(summary.get('resume_run', {}), 'wall_ms'))}"
+            )
     print()
 
-    print("Normal training iteration time from raw Megatron logs")
-    iter_rows: list[list[str]] = []
-    for phase, name in (("first", "first_run.log"), ("resume", "resume_run.log")):
-        for iteration, ms in _iter_times(result_dir / name):
-            iter_rows.append([phase, str(iteration), f"{ms:.2f} ms"])
-    _print_table(["phase", "iteration", "elapsed_per_iter"], iter_rows)
+    iteration_summary = _read_csv(result_dir / "iteration_time_summary.csv")
+    if iteration_summary:
+        print("每迭代训练耗时摘要")
+        _print_table(
+            ["阶段", "范围", "样本数", "平均", "P50", "P95", "最大"],
+            [
+                [
+                    row.get("phase", ""),
+                    row.get("bucket", ""),
+                    row.get("count", ""),
+                    _fmt_ms(_float(row, "mean_ms")),
+                    _fmt_ms(_float(row, "p50_ms")),
+                    _fmt_ms(_float(row, "p95_ms")),
+                    _fmt_ms(_float(row, "max_ms")),
+                ]
+                for row in iteration_summary
+            ],
+        )
+        print()
+
+    iter_csv = _read_csv(result_dir / "iteration_times.csv")
+    if iter_csv and not show_iteration_details:
+        print(f"每迭代训练耗时明细: 已写入 {result_dir / 'iteration_times.csv'}")
+        print("需要在命令行展开时加 `--show-iteration-details`。")
+    else:
+        print("每迭代训练耗时明细")
+        iter_rows: list[list[str]] = []
+        if iter_csv:
+            for row in iter_csv:
+                iter_rows.append(
+                    [
+                        row.get("phase", ""),
+                        row.get("iteration", ""),
+                        _fmt_ms(_float(row, "elapsed_time_per_iteration_ms")),
+                        row.get("checkpoint_iteration", ""),
+                    ]
+                )
+            _print_table(["阶段", "iter", "每迭代耗时", "是否保存点"], iter_rows)
+        else:
+            for phase, name in (("first", "first_run.log"), ("resume", "resume_run.log")):
+                for iteration, ms in _iter_times(result_dir / name):
+                    iter_rows.append([phase, str(iteration), f"{ms:.2f} ms"])
+            _print_table(["阶段", "iter", "每迭代耗时"], iter_rows)
     print()
 
-    print("Megatron checkpoint blocking events")
+    print("Megatron 保存阻塞耗时")
     blocking_rows = []
     for row in events:
         if row.get("event") != "blocking":
@@ -129,50 +282,50 @@ def summarize(result_dir: Path) -> None:
             ]
         )
     _print_table(
-        ["phase", "iter", "save_fn_total", "racer_adapter_save", "state_dict", "optimizer_capture"],
+        ["阶段", "iter", "save总耗时", "RACER保存", "state_dict", "optimizer"],
         blocking_rows,
     )
     print()
 
-    print("RACER store events")
+    stores = [row for row in events if row.get("event") == "store"]
+    print("RACER 保存耗时摘要")
+    _print_table(
+        [
+            "阶段",
+            "次数",
+            "store平均",
+            "storeP50",
+            "store最大",
+            "waitP50",
+            "wait最大",
+            "payload",
+            "chunks",
+            "最慢iter",
+        ],
+        _summarize_store_events(stores),
+    )
+    print()
+
+    print("RACER 保存事件短表")
     store_rows = []
-    for row in events:
-        if row.get("event") != "store":
-            continue
+    for row in stores:
         store_rows.append(
             [
                 row.get("phase", ""),
-                row.get("tag", ""),
+                _iteration_from_tag(row.get("tag", "")),
                 _fmt_ms(_float(row, "store_ms")),
-                _fmt_ms(_float(row, "racer_calls_ms")),
-                _fmt_ms(_float(row, "chunk_store_max_ms")),
-                _fmt_ms(_float(row, "data_rows_ms")),
-                _fmt_ms(_float(row, "parity_ms")),
-                _fmt_ms(_float(row, "storage_ms")),
                 _fmt_ms(_float(row, "storage_wait_ms")),
                 _fmt_gib(_int(row, "local_bytes")),
                 str(row.get("chunks", "")),
             ]
         )
     _print_table(
-        [
-            "phase",
-            "tag",
-            "adapter_store",
-            "racer_calls",
-            "max_chunk_store",
-            "data_rows",
-            "parity",
-            "csd_storage",
-            "csd_wait",
-            "local_payload",
-            "chunks",
-        ],
+        ["阶段", "iter", "store", "CSD wait", "payload", "chunks"],
         store_rows,
     )
     print()
 
-    print("RACER restart/load events")
+    print("RACER 恢复读取事件")
     load_rows = []
     for row in events:
         if row.get("event") != "load":
@@ -180,7 +333,7 @@ def summarize(result_dir: Path) -> None:
         load_rows.append(
             [
                 row.get("phase", ""),
-                row.get("tag", ""),
+                _iteration_from_tag(row.get("tag", "")),
                 _fmt_ms(_float(row, "total_ms")),
                 _fmt_ms(_float(row, "racer_fetch_ms")),
                 _fmt_ms(_float(row, "load_read_wait_ms")),
@@ -190,45 +343,31 @@ def summarize(result_dir: Path) -> None:
             ]
         )
     _print_table(
-        ["phase", "tag", "load_total", "racer_fetch", "read_wait", "materialize", "tree_decode", "prewarm"],
+        ["阶段", "load iter", "总耗时", "fetch", "read wait", "materialize", "tree decode", "prewarm"],
         load_rows,
     )
     print()
 
-    print("CSD backend summary")
-    csd_rows = []
-    for row in csd:
-        csd_rows.append(
-            [
-                row.get("tag", ""),
-                str(row.get("op_count", "")),
-                _fmt_ms(_float(row, "daemon_allocate_ms_sum")),
-                _fmt_ms(_float(row, "daemon_memcpy_ms_cuda_event_sum")),
-                _fmt_ms(_float(row, "checksum_ms_sum")),
-                _fmt_ms(_float(row, "sqlite_ms_sum")),
-                str(row.get("allocate_source_dynamic_cudaHostAlloc_count", "0")),
-                str(row.get("allocate_source_pool_bump_count", "0")),
-                str(row.get("allocate_source_free_list_count", "0")),
-            ]
-        )
+    print("CSD 后端摘要")
     _print_table(
-        ["tag", "ops", "alloc_sum", "copy_event_sum", "checksum_sum", "sqlite_sum", "dynamic_alloc", "pool_bump", "free_list"],
-        csd_rows,
+        ["profile组", "ops", "dynamic_alloc", "pool_bump", "free_list", "alloc", "checksum", "sqlite", "copy wall"],
+        _summarize_csd_totals(csd),
     )
     print()
 
-    print("Notes")
-    print("- save_fn_total is the Megatron training-process blocking time for save_checkpoint().")
-    print("- adapter_store is inside save_fn_total; do not add them together.")
-    print("- data_rows/parity/csd_storage are RACER internal phases inside adapter_store; they are for diagnosis.")
-    print("- load_total is measured in the restarted training process before resumed training continues.")
+    print("说明")
+    print("- save总耗时是训练进程里 save_checkpoint() 的阻塞时间。")
+    print("- store 是 RACER adapter 的保存耗时，包含在 save总耗时里，不要相加。")
+    print("- 保存短表只保留人读的关键字段；完整字段在 parsed_log_events.csv。")
+    print("- dynamic_alloc 为 0 时，表示本轮没有临时 cudaHostAlloc pinned memory 分配。")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("result_dir", type=Path)
+    parser.add_argument("--show-iteration-details", action="store_true", help="Print every iteration timing row.")
     args = parser.parse_args()
-    summarize(args.result_dir)
+    summarize(args.result_dir, show_iteration_details=args.show_iteration_details)
 
 
 if __name__ == "__main__":

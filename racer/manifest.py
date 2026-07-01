@@ -236,12 +236,26 @@ def write_chunks_and_manifest(
     return metrics
 
 
+def validate_committed_daemon_manifest(manifest: dict[str, Any], *, tag: str) -> None:
+    missing = [
+        key
+        for key in ("committed", "daemon_owned", "data_resident")
+        if not bool(manifest.get(key, False))
+    ]
+    if missing:
+        raise RuntimeError(
+            f"RACER checkpoint {tag!r} is not a committed daemon-resident checkpoint; "
+            f"missing/false flags: {', '.join(missing)}"
+        )
+
+
 def checkpoint_from_chunk_storage(
     *,
     tag: str,
     chunk_storage: Any,
 ) -> StoredCheckpoint:
     manifest = chunk_storage.get_manifest(tag)
+    validate_committed_daemon_manifest(manifest, tag=tag)
     use_cuda_ipc_read = False
     strict_daemon_storage = False
     if hasattr(chunk_storage, "read_into_cuda_tensor") and hasattr(chunk_storage, "wait"):

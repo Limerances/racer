@@ -29,9 +29,10 @@ python examples/run_megatron_csd_restart_test.py \
   --csd-native-pinned-segment-bytes "${CSD_NATIVE_PINNED_SEGMENT_BYTES:-1073741824}" \
   --racer-buffer-size "${RACER_BUFFER_SIZE:-1073741824}" \
   --cuda-visible-devices "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4}" \
-  --save-interval "${SAVE_INTERVAL:-1}" \
-  --kill-after-iter "${KILL_AFTER_ITER:-1}" \
-  --resume-train-iters "${RESUME_TRAIN_ITERS:-2}" \
+  --save-interval "${SAVE_INTERVAL:-5}" \
+  --kill-interval-iters "${KILL_INTERVAL_ITERS:-20}" \
+  --kill-count "${KILL_COUNT:-3}" \
+  --post-kill-train-iters "${POST_KILL_TRAIN_ITERS:-20}" \
   --global-batch-size "${GLOBAL_BATCH_SIZE:-8}" \
   --csd-ready-timeout-seconds "${CSD_READY_TIMEOUT_SECONDS:-180}" \
   --timeout-seconds "${TIMEOUT_SECONDS:-10800}"

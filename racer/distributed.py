@@ -18,6 +18,7 @@ import torch.distributed as dist
 from . import cauchy, codec_cuda, routing
 from .config import RacerConfig
 from .layout import ElasticLayout
+from .manifest import validate_committed_daemon_manifest
 from .routing import RoutingPlan
 
 
@@ -191,6 +192,52 @@ def _expected_storage_chunk_count(manifest: dict[str, Any] | None) -> int:
     return sum(1 for chunk in manifest.get("chunks", []) if str(chunk.get("chunk_id")) not in zero_chunks)
 
 
+def _csv_ints(value: str | None) -> list[int]:
+    if not value:
+        return []
+    out: list[int] = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            left, right = item.split("-", 1)
+            start = int(left.strip())
+            end = int(right.strip())
+            step = 1 if end >= start else -1
+            out.extend(range(start, end + step, step))
+        else:
+            out.append(int(item))
+    return out
+
+
+def _per_node_csd_enabled() -> bool:
+    return os.environ.get("RACER_CSD_PER_NODE", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _local_csd_owner_ranks(default_rank: int) -> set[int]:
+    ranks = _csv_ints(os.environ.get("RACER_CSD_LOCAL_RANKS"))
+    return set(ranks if ranks else [int(default_rank)])
+
+
+def _local_csd_coordinator_rank(default_rank: int) -> int:
+    value = os.environ.get("RACER_CSD_LOCAL_COORDINATOR_RANK")
+    if value not in (None, ""):
+        return int(value)
+    return min(_local_csd_owner_ranks(default_rank))
+
+
+def _expected_storage_chunk_count_for_ranks(manifest: dict[str, Any] | None, owner_ranks: set[int]) -> int:
+    if not manifest:
+        return 0
+    zero_chunks = _zero_data_chunk_ids(manifest)
+    return sum(
+        1
+        for chunk in manifest.get("chunks", [])
+        if str(chunk.get("chunk_id")) not in zero_chunks and int(chunk.get("owner_rank", -1)) in owner_ranks
+    )
+
+
 def _storage_supports_cuda_ipc(chunk_storage: Any) -> bool:
     if not hasattr(chunk_storage, "put_cuda_tensor") or not hasattr(chunk_storage, "wait"):
         return False
@@ -222,9 +269,15 @@ def _begin_storage_checkpoint(
         "storage_begin_ms": 0.0,
         "storage_begin_barrier_ms": 0.0,
     }
-    if rank == coordinator:
-        begin_start = time.perf_counter()
+    if _per_node_csd_enabled():
+        local_owner_ranks = _local_csd_owner_ranks(rank)
+        should_begin = rank == _local_csd_coordinator_rank(rank)
+        expected_chunks = _expected_storage_chunk_count_for_ranks(state.manifest, local_owner_ranks)
+    else:
+        should_begin = rank == coordinator
         expected_chunks = _expected_storage_chunk_count(state.manifest)
+    if should_begin:
+        begin_start = time.perf_counter()
         chunk_storage.begin(
             state.tag,
             manifest_base=state.manifest or {},
@@ -308,7 +361,11 @@ def _commit_storage_checkpoint(
     commit_pre_barrier_start = time.perf_counter()
     _barrier(process_group)
     storage_profile["storage_commit_pre_barrier_ms"] = (time.perf_counter() - commit_pre_barrier_start) * 1000.0
-    if rank == coordinator:
+    if _per_node_csd_enabled():
+        should_commit = rank == _local_csd_coordinator_rank(rank)
+    else:
+        should_commit = rank == coordinator
+    if should_commit:
         commit_start = time.perf_counter()
         chunk_storage.put_manifest(state.tag, state.manifest or {})
         chunk_storage.commit(state.tag)
@@ -939,6 +996,7 @@ def distributed_state_from_storage(
     device = _current_cuda_device()
     manifest_start = time.perf_counter()
     manifest = chunk_storage.get_manifest(tag)
+    validate_committed_daemon_manifest(manifest, tag=tag)
     manifest_ms = (time.perf_counter() - manifest_start) * 1000.0
     setup_start = time.perf_counter()
     layout = ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m)
@@ -1085,6 +1143,7 @@ def distributed_load_local_payload_from_storage(
     requested = int(requested_train_rank)
     manifest_start = time.perf_counter()
     manifest = chunk_storage.get_manifest(tag)
+    validate_committed_daemon_manifest(manifest, tag=tag)
     manifest_ms = (time.perf_counter() - manifest_start) * 1000.0
     setup_start = time.perf_counter()
     layout = ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m)
@@ -1237,6 +1296,18 @@ def distributed_load(
     recovered: dict[int, torch.Tensor] = {}
     load_start = time.perf_counter()
 
+    def output_rank_for(requested_rank: int) -> int:
+        requested_rank = int(requested_rank)
+        if requested_rank in replacement:
+            return int(replacement[requested_rank])
+        if requested_rank in failed_set:
+            if not config.spare_ranks:
+                raise RuntimeError(
+                    f"failed train rank {requested_rank} has no replacement mapping and no spare rank fallback"
+                )
+            return int(config.spare_ranks[0])
+        return requested_rank
+
     if requested_train_ranks is None:
         requested = list(failed)
     else:
@@ -1292,12 +1363,12 @@ def distributed_load(
             decoded = codec_cuda.decode_blocks(survivor_chunks, chosen_rows, state.matrix)
             valid = state.packet_nbytes_by_rank[requested_rank]
             payload = decoded[slot.data_group_id][:valid].contiguous()
-            output_rank = int(replacement.get(requested_rank, requested_rank))
+            output_rank = output_rank_for(requested_rank)
             if output_rank == decode_rank:
                 recovered[requested_rank] = payload
             else:
                 _send_tensor(payload, output_rank, process_group)
-        elif rank == int(replacement.get(requested_rank, requested_rank)):
+        elif rank == output_rank_for(requested_rank):
             recovered[requested_rank] = _recv_tensor(
                 state.packet_nbytes_by_rank[requested_rank],
                 decode_rank,

@@ -251,6 +251,24 @@ int launch_blocks(int64_t size, int threads) {
   return static_cast<int>((size + threads - 1) / threads);
 }
 
+void* device_pointer_table(size_t count, const void* host_ptrs, cudaStream_t stream) {
+  void* table = nullptr;
+  C10_CUDA_CHECK(cudaMallocAsync(&table, sizeof(void*) * count, stream));
+  C10_CUDA_CHECK(cudaMemcpyAsync(
+      table,
+      host_ptrs,
+      sizeof(void*) * count,
+      cudaMemcpyHostToDevice,
+      stream));
+  return table;
+}
+
+void free_device_pointer_table(void* table, cudaStream_t stream) {
+  if (table != nullptr) {
+    C10_CUDA_CHECK(cudaFreeAsync(table, stream));
+  }
+}
+
 }  // namespace
 
 torch::Tensor gf256_matmul_cuda(torch::Tensor data, torch::Tensor matrix) {
@@ -434,12 +452,10 @@ std::vector<torch::Tensor> apply_matrix_cuda(
     h_outputs.push_back(output.data_ptr<unsigned char>());
   }
 
-  const unsigned char** d_inputs = nullptr;
-  unsigned char** d_outputs = nullptr;
-  cudaMalloc(&d_inputs, sizeof(unsigned char*) * h_inputs.size());
-  cudaMalloc(&d_outputs, sizeof(unsigned char*) * h_outputs.size());
-  cudaMemcpyAsync(d_inputs, h_inputs.data(), sizeof(unsigned char*) * h_inputs.size(), cudaMemcpyHostToDevice, stream);
-  cudaMemcpyAsync(d_outputs, h_outputs.data(), sizeof(unsigned char*) * h_outputs.size(), cudaMemcpyHostToDevice, stream);
+  auto d_inputs = reinterpret_cast<const unsigned char**>(
+      device_pointer_table(h_inputs.size(), h_inputs.data(), stream));
+  auto d_outputs = reinterpret_cast<unsigned char**>(
+      device_pointer_table(h_outputs.size(), h_outputs.data(), stream));
 
   apply_matrix_vector_kernel<<<blocks, threads, 0, stream>>>(
       d_inputs,
@@ -448,8 +464,8 @@ std::vector<torch::Tensor> apply_matrix_cuda(
       static_cast<int>(outputs.size()),
       static_cast<int>(inputs.size()),
       size);
-  cudaFree(d_inputs);
-  cudaFree(d_outputs);
+  free_device_pointer_table(const_cast<unsigned char**>(d_inputs), stream);
+  free_device_pointer_table(d_outputs, stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return outputs;
 }
@@ -521,12 +537,10 @@ std::vector<torch::Tensor> apply_matrix_cuda_vector_table(
     h_outputs.push_back(output.data_ptr<unsigned char>());
   }
 
-  const unsigned char** d_inputs = nullptr;
-  unsigned char** d_outputs = nullptr;
-  cudaMalloc(&d_inputs, sizeof(unsigned char*) * h_inputs.size());
-  cudaMalloc(&d_outputs, sizeof(unsigned char*) * h_outputs.size());
-  cudaMemcpyAsync(d_inputs, h_inputs.data(), sizeof(unsigned char*) * h_inputs.size(), cudaMemcpyHostToDevice, stream);
-  cudaMemcpyAsync(d_outputs, h_outputs.data(), sizeof(unsigned char*) * h_outputs.size(), cudaMemcpyHostToDevice, stream);
+  auto d_inputs = reinterpret_cast<const unsigned char**>(
+      device_pointer_table(h_inputs.size(), h_inputs.data(), stream));
+  auto d_outputs = reinterpret_cast<unsigned char**>(
+      device_pointer_table(h_outputs.size(), h_outputs.data(), stream));
 
   apply_matrix_vector_table_kernel<<<blocks, threads, 0, stream>>>(
       d_inputs,
@@ -536,8 +550,8 @@ std::vector<torch::Tensor> apply_matrix_cuda_vector_table(
       static_cast<int>(outputs.size()),
       static_cast<int>(inputs.size()),
       size);
-  cudaFree(d_inputs);
-  cudaFree(d_outputs);
+  free_device_pointer_table(const_cast<unsigned char**>(d_inputs), stream);
+  free_device_pointer_table(d_outputs, stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return outputs;
 }
@@ -588,12 +602,10 @@ std::vector<torch::Tensor> apply_bitmatrix_cuda(
     h_outputs.push_back(output.data_ptr<unsigned char>());
   }
 
-  const unsigned char** d_inputs = nullptr;
-  unsigned char** d_outputs = nullptr;
-  cudaMalloc(&d_inputs, sizeof(unsigned char*) * h_inputs.size());
-  cudaMalloc(&d_outputs, sizeof(unsigned char*) * h_outputs.size());
-  cudaMemcpyAsync(d_inputs, h_inputs.data(), sizeof(unsigned char*) * h_inputs.size(), cudaMemcpyHostToDevice, stream);
-  cudaMemcpyAsync(d_outputs, h_outputs.data(), sizeof(unsigned char*) * h_outputs.size(), cudaMemcpyHostToDevice, stream);
+  auto d_inputs = reinterpret_cast<const unsigned char**>(
+      device_pointer_table(h_inputs.size(), h_inputs.data(), stream));
+  auto d_outputs = reinterpret_cast<unsigned char**>(
+      device_pointer_table(h_outputs.size(), h_outputs.data(), stream));
 
   apply_bitmatrix_vector_kernel<<<launch_blocks(total, threads), threads, 0, stream>>>(
       d_inputs,
@@ -602,8 +614,8 @@ std::vector<torch::Tensor> apply_bitmatrix_cuda(
       static_cast<int>(outputs.size()),
       static_cast<int>(inputs.size()),
       size);
-  cudaFree(d_inputs);
-  cudaFree(d_outputs);
+  free_device_pointer_table(const_cast<unsigned char**>(d_inputs), stream);
+  free_device_pointer_table(d_outputs, stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return outputs;
 }

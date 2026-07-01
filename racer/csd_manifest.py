@@ -206,8 +206,10 @@ class CsdManifestStore:
                         location = dict(chunk["location"])
                     nbytes = int(chunk.get("nbytes", chunk.get("num_bytes", current[6])) or 0)
                     valid_nbytes = int(chunk.get("valid_nbytes", nbytes if current[7] is None else current[7]) or 0)
-                    checksum_type = str(chunk.get("checksum_type", current[8] or ""))
-                    checksum = str(chunk.get("checksum", current[9] or ""))
+                    sealed_checksum_type = str(current[8] or "")
+                    sealed_checksum = str(current[9] or "")
+                    checksum_type = sealed_checksum_type or str(chunk.get("checksum_type", ""))
+                    checksum = sealed_checksum or str(chunk.get("checksum", ""))
                     self._conn.execute(
                         """
                         UPDATE chunks
@@ -261,6 +263,29 @@ class CsdManifestStore:
                         int(meta.get("valid_nbytes", meta.get("nbytes", meta.get("num_bytes", 0))) or 0),
                     ),
                 )
+
+    def begin_committed_chunk_update(
+        self,
+        tag: str,
+        chunk_id: str,
+        metadata: dict[str, Any],
+        *,
+        backend: str,
+    ) -> None:
+        tag = str(tag)
+        chunk_id = str(chunk_id)
+        with self._lock:
+            state_row = self._conn.execute("SELECT state FROM checkpoints WHERE tag=?", (tag,)).fetchone()
+            if state_row is None:
+                raise KeyError(f"unknown CSD checkpoint tag {tag!r}")
+            if str(state_row[0]) != "COMMITTED":
+                raise RuntimeError(f"CSD checkpoint {tag!r} is not committed; state={state_row[0]}")
+            current = self._conn.execute(
+                "SELECT 1 FROM chunks WHERE tag=? AND chunk_id=?",
+                (tag, chunk_id),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"unknown CSD chunk {chunk_id!r} for committed checkpoint {tag!r}")
 
     def mark_chunk_copying(self, tag: str, chunk_id: str, op_id: str) -> None:
         with self._lock:
@@ -468,6 +493,7 @@ class CsdManifestStore:
         manifest["committed"] = True
         manifest["checkpoint_state"] = "COMMITTED"
         manifest["storage_backend"] = checkpoint.get("backend")
+        manifest["expected_chunks"] = int(checkpoint.get("expected_chunks") or 0)
         manifest["total_valid_bytes"] = int(checkpoint.get("total_valid_bytes") or 0)
         return manifest
 
