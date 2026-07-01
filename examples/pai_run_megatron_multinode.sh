@@ -359,6 +359,34 @@ RACER_MANIFEST_DIR="${RACER_MANIFEST_DIR:-${OUTPUT_ROOT}/racer_manifests/${RUN_I
 RACER_PROFILE_DIR="${RACER_PROFILE_DIR:-${OUTPUT_ROOT}/racer_profiles/${RUN_ID}}"
 LOG_FILE="${LOG_ROOT}/${RUN_ID}.node${NODE_RANK}.log"
 
+compute_racer_extension_cache_key() {
+  RACER_ROOT_FOR_HASH="${RACER_ROOT}" python - <<'PY'
+import hashlib
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(os.environ["RACER_ROOT_FOR_HASH"]).resolve()
+h = hashlib.sha256()
+h.update(str(sys.implementation.cache_tag).encode())
+h.update(os.environ.get("CUDA_HOME", "").encode())
+try:
+    import torch
+
+    h.update(str(torch.__version__).encode())
+    h.update(str(torch.version.cuda).encode())
+except Exception as exc:
+    h.update(f"torch-unavailable:{type(exc).__name__}:{exc}".encode())
+
+for rel in ["setup.py", "racer/csrc/binding.cpp", "racer/csrc/racer_cuda.cu"]:
+    path = root / rel
+    h.update(rel.encode())
+    h.update(path.read_bytes())
+
+print(h.hexdigest()[:16])
+PY
+}
+
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
@@ -367,6 +395,23 @@ export PYTHONPATH="${RACER_ROOT}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
 export RACER_CSD_PROFILE_LOG
 export RACER_CSD_CHECKSUM_TYPE
 export RACER_CSD_MANIFEST_UPDATE_MODE
+RACER_EXTENSION_CHECK="${RACER_EXTENSION_CHECK:-1}"
+RACER_EXTENSION_COORDINATOR_NODE_RANK="${RACER_EXTENSION_COORDINATOR_NODE_RANK:-0}"
+RACER_EXTENSION_READY_TIMEOUT_SECONDS="${RACER_EXTENSION_READY_TIMEOUT_SECONDS:-900}"
+if [[ "${MODE}" != "baseline" ]]; then
+  export RACER_JIT_COMPILE="${RACER_JIT_COMPILE:-1}"
+  RACER_EXTENSION_CACHE_KEY="${RACER_EXTENSION_CACHE_KEY:-$(compute_racer_extension_cache_key)}"
+  RACER_EXTENSION_BUILD_DIR="${RACER_EXTENSION_BUILD_DIR:-${OUTPUT_ROOT}/torch_extensions/racer_cuda_ext/${RACER_EXTENSION_CACHE_KEY}}"
+  RACER_EXTENSION_READY_FILE="${RACER_EXTENSION_READY_FILE:-${RACER_EXTENSION_BUILD_DIR}.ready}"
+  RACER_EXTENSION_ERROR_FILE="${RACER_EXTENSION_ERROR_FILE:-${RACER_EXTENSION_BUILD_DIR}.error}"
+  export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${RACER_EXTENSION_BUILD_DIR}}"
+else
+  export RACER_JIT_COMPILE="${RACER_JIT_COMPILE:-}"
+  RACER_EXTENSION_CACHE_KEY="${RACER_EXTENSION_CACHE_KEY:-}"
+  RACER_EXTENSION_BUILD_DIR="${RACER_EXTENSION_BUILD_DIR:-}"
+  RACER_EXTENSION_READY_FILE="${RACER_EXTENSION_READY_FILE:-}"
+  RACER_EXTENSION_ERROR_FILE="${RACER_EXTENSION_ERROR_FILE:-}"
+fi
 
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   export CUDA_VISIBLE_DEVICES
@@ -374,6 +419,73 @@ fi
 
 RACER_ARGS=()
 CSD_PID=""
+
+prepare_racer_cuda_extension() {
+  if [[ "${MODE}" == "baseline" ]]; then
+    return
+  fi
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "DRY_RUN=1: 跳过 RACER CUDA extension 检查。"
+    return
+  fi
+  if [[ "${RACER_EXTENSION_CHECK}" == "0" ]]; then
+    echo "WARNING: RACER_EXTENSION_CHECK=0，跳过 RACER CUDA extension 检查。"
+    return
+  fi
+
+  mkdir -p "${TORCH_EXTENSIONS_DIR}"
+  if [[ "${NODE_RANK}" == "${RACER_EXTENSION_COORDINATOR_NODE_RANK}" ]]; then
+    rm -f "${RACER_EXTENSION_ERROR_FILE}"
+    echo "编译/检查 RACER CUDA extension: coordinator_node=${NODE_RANK}, RACER_JIT_COMPILE=${RACER_JIT_COMPILE}, TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR}"
+    local output rc
+    set +e
+    output="$(PYTHONPATH="${PYTHONPATH}" python - <<'PY' 2>&1
+import torch
+from racer.codec import _ext
+
+if not torch.cuda.is_available():
+    raise RuntimeError("RACER CUDA extension check requires CUDA, but torch.cuda.is_available() is false")
+
+fn = _ext.extension_function("apply_matrix_cuda")
+print(f"RACER CUDA extension ready: apply_matrix_cuda={getattr(fn, '__name__', type(fn).__name__)}")
+PY
+)"
+    rc="$?"
+    set -e
+    if [[ "${rc}" != "0" ]]; then
+      printf '%s\n' "${output}" > "${RACER_EXTENSION_ERROR_FILE}"
+      echo "ERROR: RACER CUDA extension 编译/检查失败，日志: ${RACER_EXTENSION_ERROR_FILE}" >&2
+      printf '%s\n' "${output}" >&2
+      exit 4
+    fi
+    printf '%s\n' "${output}"
+    printf 'ready node=%s time=%s\n' "${NODE_RANK}" "$(date -u +%FT%TZ)" > "${RACER_EXTENSION_READY_FILE}"
+    return
+  fi
+
+  echo "等待 RACER CUDA extension: coordinator_node=${RACER_EXTENSION_COORDINATOR_NODE_RANK}, ready=${RACER_EXTENSION_READY_FILE}"
+  local deadline
+  deadline=$((SECONDS + RACER_EXTENSION_READY_TIMEOUT_SECONDS))
+  while [[ ! -f "${RACER_EXTENSION_READY_FILE}" ]]; do
+    if [[ -f "${RACER_EXTENSION_ERROR_FILE}" ]]; then
+      echo "ERROR: RACER CUDA extension 编译失败，来自 coordinator 的错误如下:" >&2
+      cat "${RACER_EXTENSION_ERROR_FILE}" >&2 || true
+      exit 4
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "ERROR: 等待 RACER CUDA extension ready 超时: ${RACER_EXTENSION_READY_FILE}" >&2
+      exit 4
+    fi
+    sleep 2
+  done
+
+  PYTHONPATH="${PYTHONPATH}" python - <<'PY'
+from racer.codec import _ext
+
+fn = _ext.extension_function("apply_matrix_cuda")
+print(f"RACER CUDA extension loaded: apply_matrix_cuda={getattr(fn, '__name__', type(fn).__name__)}")
+PY
+}
 
 launch_csd_process() {
   if [[ "${RACER_CSD_MODE}" == "persistent" ]]; then
@@ -555,6 +667,7 @@ MSG
   export RACER_CSD_LOCAL_RANKS
   export RACER_CSD_LOCAL_COORDINATOR_RANK
 
+  prepare_racer_cuda_extension
   start_local_csd "${csd_backend}"
   RACER_ARGS=(
     --racer-checkpoint
@@ -593,6 +706,7 @@ run_remote_spare_worker() {
   export RACER_CSD_PER_NODE
   export RACER_CSD_LOCAL_RANKS
   export RACER_CSD_LOCAL_COORDINATOR_RANK
+  prepare_racer_cuda_extension
   start_local_csd "${csd_backend}"
 
   SPARE_LOG_FILE="${LOG_ROOT}/${RUN_ID}.node${NODE_RANK}.remote_spare.log"
@@ -611,6 +725,12 @@ run_remote_spare_worker() {
   echo "CSD_NATIVE_PINNED_DEVICE=${CSD_NATIVE_PINNED_DEVICE}"
   echo "RACER_CSD_CHECKSUM_TYPE=${RACER_CSD_CHECKSUM_TYPE}"
   echo "RACER_CSD_MANIFEST_UPDATE_MODE=${RACER_CSD_MANIFEST_UPDATE_MODE}"
+  echo "RACER_JIT_COMPILE=${RACER_JIT_COMPILE}"
+  echo "RACER_EXTENSION_CACHE_KEY=${RACER_EXTENSION_CACHE_KEY}"
+  echo "TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-}"
+  echo "RACER_EXTENSION_COORDINATOR_NODE_RANK=${RACER_EXTENSION_COORDINATOR_NODE_RANK}"
+  echo "RACER_EXTENSION_READY_FILE=${RACER_EXTENSION_READY_FILE:-}"
+  echo "RACER_EXTENSION_ERROR_FILE=${RACER_EXTENSION_ERROR_FILE:-}"
   echo "CSD_EGM_RUNTIME_FACTORY=${CSD_EGM_RUNTIME_FACTORY}"
   echo "CSD_EGM_RUNTIME_CONFIG=${CSD_EGM_RUNTIME_CONFIG}"
   echo "CSD_EGM_POOL_ID=${CSD_EGM_POOL_ID}"
@@ -714,6 +834,12 @@ echo "CSD_NATIVE_PINNED_SEGMENT_BYTES=${CSD_NATIVE_PINNED_SEGMENT_BYTES}"
 echo "CSD_NATIVE_PINNED_DEVICE=${CSD_NATIVE_PINNED_DEVICE}"
 echo "RACER_CSD_CHECKSUM_TYPE=${RACER_CSD_CHECKSUM_TYPE}"
 echo "RACER_CSD_MANIFEST_UPDATE_MODE=${RACER_CSD_MANIFEST_UPDATE_MODE}"
+echo "RACER_JIT_COMPILE=${RACER_JIT_COMPILE}"
+echo "RACER_EXTENSION_CACHE_KEY=${RACER_EXTENSION_CACHE_KEY}"
+echo "TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-}"
+echo "RACER_EXTENSION_COORDINATOR_NODE_RANK=${RACER_EXTENSION_COORDINATOR_NODE_RANK}"
+echo "RACER_EXTENSION_READY_FILE=${RACER_EXTENSION_READY_FILE:-}"
+echo "RACER_EXTENSION_ERROR_FILE=${RACER_EXTENSION_ERROR_FILE:-}"
 echo "CSD_EGM_RUNTIME_FACTORY=${CSD_EGM_RUNTIME_FACTORY}"
 echo "CSD_EGM_RUNTIME_CONFIG=${CSD_EGM_RUNTIME_CONFIG}"
 echo "CSD_EGM_POOL_ID=${CSD_EGM_POOL_ID}"

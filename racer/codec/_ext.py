@@ -6,6 +6,12 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
+_LOAD_ERRORS: list[str] = []
+
+
+def _record_load_error(source: str, exc: Exception) -> None:
+    _LOAD_ERRORS.append(f"{source}: {type(exc).__name__}: {exc}")
+
 
 @lru_cache(maxsize=1)
 def extension():
@@ -21,14 +27,16 @@ def extension():
                 extra_cflags=["-O3"],
                 verbose=False,
             )
-        except Exception:
+        except Exception as exc:
+            _record_load_error("jit", exc)
             pass
 
     try:
         from racer import _C  # type: ignore
 
         return _C
-    except Exception:
+    except Exception as exc:
+        _record_load_error("package", exc)
         return None
 
 
@@ -39,9 +47,13 @@ def extension_available() -> bool:
 def extension_function(name: str):
     ext = extension()
     if ext is None or not hasattr(ext, name):
+        details = ""
+        if _LOAD_ERRORS:
+            details = "; load errors: " + " | ".join(_LOAD_ERRORS)
         raise RuntimeError(
             f"RACER CUDA extension function {name!r} is required; rebuild the package "
             "or set RACER_JIT_COMPILE=1 in a CUDA build environment"
+            f"{details}"
         )
     return getattr(ext, name)
 

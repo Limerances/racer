@@ -71,6 +71,8 @@ def test_pai_multinode_dry_run_assigns_train_and_remote_spare_roles(tmp_path):
     assert "RACER_CSD_LOCAL_RANKS=0-3" in node0.stdout
     assert "RACER_CSD_CHECKSUM_TYPE=sample64" in node0.stdout
     assert "RACER_CSD_MANIFEST_UPDATE_MODE=batch" in node0.stdout
+    assert "RACER_JIT_COMPILE=1" in node0.stdout
+    assert "DRY_RUN=1: 跳过 RACER CUDA extension 检查。" in node0.stdout
     assert "CSD_NATIVE_PINNED_TOTAL_BYTES=103079215104" in node0.stdout
 
     node1 = _run_script("examples/pai_run_megatron_multinode.sh", tmp_path, NODE_RANK="1", **common)
@@ -80,6 +82,8 @@ def test_pai_multinode_dry_run_assigns_train_and_remote_spare_roles(tmp_path):
     node2 = _run_script("examples/pai_run_megatron_multinode.sh", tmp_path, NODE_RANK="2", **common)
     assert "NODE_ROLE=spare" in node2.stdout
     assert "RACER_CSD_LOCAL_RANKS=8" in node2.stdout
+    assert "RACER_JIT_COMPILE=1" in node2.stdout
+    assert "DRY_RUN=1: 跳过 RACER CUDA extension 检查。" in node2.stdout
     assert "CSD_NATIVE_PINNED_TOTAL_BYTES=0" in node2.stdout
     assert "DRY_RUN=1: 参数校验完成，跳过 remote spare worker。" in node2.stdout
 
