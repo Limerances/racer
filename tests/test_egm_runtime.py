@@ -56,6 +56,7 @@ def test_builtin_egm_runtime_uses_host_numa_pool(monkeypatch):
     assert caps["supports_egm_native_transport"] is True
     assert caps["uses_cuda_mempool"] is True
     assert caps["uses_cudaHostAlloc"] is False
+    assert runtime.dynamic_allocation_source == "dynamic_cuda_mempool"
 
 
 def test_racer_package_lazily_exports_csd_symbols():

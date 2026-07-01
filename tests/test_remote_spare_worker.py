@@ -72,6 +72,8 @@ def test_pai_multinode_dry_run_assigns_train_and_remote_spare_roles(tmp_path):
     assert "RACER_CSD_CHECKSUM_TYPE=sample64" in node0.stdout
     assert "RACER_CSD_MANIFEST_UPDATE_MODE=batch" in node0.stdout
     assert "RACER_DISTRIBUTED_DIRECT_STORAGE_LOAD=0" in node0.stdout
+    assert "RACER_CSD_DIRECT_WRITE_IPC=0" in node0.stdout
+    assert "RACER_CSD_DIRECT_READ_IPC=0" in node0.stdout
     assert "RACER_JIT_COMPILE=1" in node0.stdout
     assert f"TORCH_EXTENSIONS_DIR={Path(__file__).resolve().parents[1]}/.cache/torch_extensions/racer_cuda_ext/" in node0.stdout
     assert "DRY_RUN=1: 跳过 RACER CUDA extension 检查。" in node0.stdout
@@ -144,6 +146,9 @@ def test_pai_multinode_dry_run_accepts_default_egm_remote_spare_factory(tmp_path
     assert "MODE=racer_egm_remote_spare" in result.stdout
     assert "RACER_SPARE_LAUNCH_MODE=remote" in result.stdout
     assert "CSD_EGM_RUNTIME_FACTORY=racer.egm_runtime:create_runtime" in result.stdout
+    assert "RACER_CSD_DIRECT_WRITE_IPC=1" in result.stdout
+    assert "RACER_CSD_DIRECT_READ_IPC=1" in result.stdout
+    assert "CSD_EGM_MAX_POOL_BYTES=103079215104" in result.stdout
 
 
 def test_pai_multinode_dry_run_rejects_noncanonical_remote_spare_rank(tmp_path):
@@ -221,6 +226,30 @@ def test_pai_restart_driver_dry_run_uses_persistent_then_existing_csd(tmp_path):
     assert "RACER_DISTRIBUTED_DIRECT_STORAGE_LOAD=auto" in config.read_text(encoding="utf-8")
 
 
+def test_pai_restart_driver_writes_failure_summary_on_node0_exit(tmp_path):
+    result = _run_script(
+        "examples/pai_run_megatron_restart_driver.sh",
+        tmp_path,
+        check=False,
+        MODE="racer_pinned_remote_spare",
+        NODE_RANK="0",
+        NNODES="2",
+        NPROC_PER_NODE="4",
+        BASE_RUN_ID="pytest_restart_driver_failure_summary",
+        RESTART_OVERWRITE="1",
+        PAI_TOTAL_NODES="2",
+        PHASE_TIMEOUT_SECONDS="1",
+        MARKER_POLL_SECONDS="1",
+    )
+
+    assert result.returncode != 0
+    summary = tmp_path / "restart_state" / "pytest_restart_driver_failure_summary" / "summary.md"
+    assert summary.exists()
+    summary_text = summary.read_text(encoding="utf-8")
+    assert "状态: `未完成`" in summary_text
+    assert "退出原因: `driver exit" in summary_text
+
+
 def test_pai_restart_driver_dry_run_passes_egm_runtime_settings_to_phases(tmp_path):
     result = _run_script(
         "examples/pai_run_megatron_restart_driver.sh",
@@ -252,6 +281,8 @@ def test_pai_restart_driver_dry_run_passes_egm_runtime_settings_to_phases(tmp_pa
     assert "CSD_EGM_RUNTIME_FACTORY=racer.egm_runtime:create_runtime" in text
     assert "RACER_CSD_CHECKSUM_TYPE=sample64" in text
     assert "RACER_CSD_MANIFEST_UPDATE_MODE=batch" in text
+    assert "RACER_CSD_DIRECT_WRITE_IPC=1" in text
+    assert "RACER_CSD_DIRECT_READ_IPC=1" in text
     assert "CSD_EGM_POOL_ID=pool-a" in text
     assert "CSD_EGM_OWNER_NODE=node-a" in text
     assert "CSD_EGM_OWNER_TRAY=tray-a" in text
@@ -265,6 +296,8 @@ def test_pai_restart_driver_dry_run_passes_egm_runtime_settings_to_phases(tmp_pa
     assert "CSD_EGM_POOL_ID=pool-a" in config
     assert "CSD_EGM_HOME_DEVICE=2" in config
     assert "CSD_EGM_NUMA_ID=7" in config
+    assert "RACER_CSD_DIRECT_WRITE_IPC=1" in config
+    assert "RACER_CSD_DIRECT_READ_IPC=1" in config
 
 
 def test_pai_restart_driver_dry_run_coordinates_three_nodes(tmp_path):

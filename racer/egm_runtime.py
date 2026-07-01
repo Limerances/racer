@@ -164,6 +164,7 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
     """EGM runtime backed by CUDA Host NUMA stream-ordered memory pools."""
 
     name = "cuda_mempool_egm_runtime"
+    dynamic_allocation_source = "dynamic_cuda_mempool"
 
     def __init__(
         self,

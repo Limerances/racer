@@ -824,6 +824,7 @@ class NativePinnedMemoryBackend(StorageBackend):
     """
 
     name = "native_pinned"
+    dynamic_allocation_source = "dynamic_cudaHostAlloc"
 
     def __init__(
         self,
@@ -970,7 +971,7 @@ class NativePinnedMemoryBackend(StorageBackend):
                 segment=segment,
                 offset=0,
                 nbytes=nbytes,
-                source="dynamic_cudaHostAlloc",
+                source=self.dynamic_allocation_source,
                 allocate_ms=(time.perf_counter() - allocate_start) * 1000.0,
             )
 

@@ -136,6 +136,15 @@ preflight 通过后，把 pinned 命令里的 `MODE` 改成 `racer_egm_remote_sp
 
 脚本启动 CSD 后会先检查 daemon capabilities；如果 EGM mempool、NUMA 或 backend 不匹配，训练开始前就会失败。这个失败不是 fallback，说明 EGM 后端没有真正起来。
 
+当前 EGM 模式默认打开直接 CUDA IPC 读写：
+
+```text
+RACER_CSD_DIRECT_WRITE_IPC=1
+RACER_CSD_DIRECT_READ_IPC=1
+```
+
+如果日志里 `export_profile` 仍然显示 `direct_ipc_error=disabled` 或 `staging_kind=persistent_slab`，说明没有走直接 EGM 传输路径，checkpoint 时间会明显偏慢。
+
 restart driver 会把 `CSD_EGM_*`、`CSD_NATIVE_PINNED_*`、`RACER_BUFFER_SIZE` 等关键参数写入 `restart_state/<BASE_RUN_ID>/config.txt`，每个 phase 的日志也会打印 resolved 配置。
 
 如果你们已有更专门的 EGM runtime，可以覆盖默认 factory：
