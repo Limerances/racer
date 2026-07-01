@@ -71,13 +71,16 @@ def test_pai_multinode_dry_run_assigns_train_and_remote_spare_roles(tmp_path):
     assert "RACER_CSD_LOCAL_RANKS=0-3" in node0.stdout
     assert "RACER_CSD_CHECKSUM_TYPE=sample64" in node0.stdout
     assert "RACER_CSD_MANIFEST_UPDATE_MODE=batch" in node0.stdout
+    assert "RACER_DISTRIBUTED_DIRECT_STORAGE_LOAD=0" in node0.stdout
     assert "RACER_JIT_COMPILE=1" in node0.stdout
+    assert f"TORCH_EXTENSIONS_DIR={Path(__file__).resolve().parents[1]}/.cache/torch_extensions/racer_cuda_ext/" in node0.stdout
     assert "DRY_RUN=1: 跳过 RACER CUDA extension 检查。" in node0.stdout
     assert "CSD_NATIVE_PINNED_TOTAL_BYTES=103079215104" in node0.stdout
 
     node1 = _run_script("examples/pai_run_megatron_multinode.sh", tmp_path, NODE_RANK="1", **common)
     assert "NODE_ROLE=train" in node1.stdout
     assert "RACER_CSD_LOCAL_RANKS=4-7" in node1.stdout
+    assert "RACER_DISTRIBUTED_DIRECT_STORAGE_LOAD=0" in node1.stdout
 
     node2 = _run_script("examples/pai_run_megatron_multinode.sh", tmp_path, NODE_RANK="2", **common)
     assert "NODE_ROLE=spare" in node2.stdout
@@ -187,6 +190,7 @@ def test_pai_multinode_dry_run_supports_single_node_local_spare(tmp_path):
     assert "RACER_RUNTIME_WORLD_SIZE=5" in result.stdout
     assert "RACER_SPARE_LAUNCH_MODE=local" in result.stdout
     assert "RACER_SPARE_RANKS=4" in result.stdout
+    assert "RACER_DISTRIBUTED_DIRECT_STORAGE_LOAD=1" in result.stdout
 
 
 def test_pai_restart_driver_dry_run_uses_persistent_then_existing_csd(tmp_path):
@@ -205,12 +209,16 @@ def test_pai_restart_driver_dry_run_uses_persistent_then_existing_csd(tmp_path):
     assert "FINAL_TRAIN_ITERS=80" in result.stdout
     phase0 = tmp_path / "logs" / "pytest_restart_driver_phase00.driver.node0.log"
     phase1 = tmp_path / "logs" / "pytest_restart_driver_phase01.driver.node0.log"
+    config = tmp_path / "restart_state" / "pytest_restart_driver" / "config.txt"
     summary = tmp_path / "restart_state" / "pytest_restart_driver" / "summary.md"
     assert phase0.exists()
     assert phase1.exists()
     assert summary.exists()
     assert "RACER_CSD_MODE=persistent" in phase0.read_text(encoding="utf-8")
-    assert "RACER_CSD_MODE=existing" in phase1.read_text(encoding="utf-8")
+    phase1_text = phase1.read_text(encoding="utf-8")
+    assert "RACER_CSD_MODE=existing" in phase1_text
+    assert "RACER_DISTRIBUTED_DIRECT_STORAGE_LOAD=0" in phase1_text
+    assert "RACER_DISTRIBUTED_DIRECT_STORAGE_LOAD=auto" in config.read_text(encoding="utf-8")
 
 
 def test_pai_restart_driver_dry_run_passes_egm_runtime_settings_to_phases(tmp_path):
