@@ -223,16 +223,20 @@ def test_distributed_store_writes_each_reduction_group_before_next_group(monkeyp
     events: list[str] = []
 
     def fake_store_data_rows_for_group(**kwargs):
+        assert kwargs["row_sink"] is None
         group = kwargs["group"]
         chunks = kwargs["local_chunks"]
         group_id = int(group[0].relative_index)
+        events.append(f"group{group_id}:data_rows")
         chunks[f"rg_{group_id:06d}_row_000"] = torch.ones(4, dtype=torch.uint8)
         return 0
 
     def fake_store_parity_for_group(**kwargs):
+        assert kwargs["row_sink"] is None
         group = kwargs["group"]
         chunks = kwargs["local_chunks"]
         group_id = int(group[0].relative_index)
+        events.append(f"group{group_id}:parity")
         chunks[f"rg_{group_id:06d}_row_003"] = torch.ones(4, dtype=torch.uint8)
         return 0
 
@@ -243,11 +247,12 @@ def test_distributed_store_writes_each_reduction_group_before_next_group(monkeyp
         group_ids = {chunk_id.split("_row_", 1)[0] for chunk_id in chunk_ids}
         assert len(group_ids) == 1
         observed_puts.append(chunk_ids)
+        events.append(f"{next(iter(group_ids))}:put")
         return sum(int(chunk.numel()) for chunk in chunks.values()), len(chunks), {"storage_wait_ms": 1.0}
 
     monkeypatch.setattr(distributed, "_require_nccl", lambda process_group=None: None)
     monkeypatch.setattr(distributed, "_rank", lambda process_group=None: 0)
-    monkeypatch.setattr(distributed, "_barrier", lambda process_group=None: None)
+    monkeypatch.setattr(distributed, "_barrier", lambda process_group=None: events.append("barrier"))
     monkeypatch.setattr(distributed, "_current_cuda_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(distributed, "_cuda_payload", lambda local_packet: local_packet)
     monkeypatch.setattr(
@@ -269,7 +274,20 @@ def test_distributed_store_writes_each_reduction_group_before_next_group(monkeyp
         packet_sizes_by_rank={0: 4, 1: 4, 2: 4, 3: 4},
     )
 
-    assert events == ["begin", "commit"]
+    assert events == [
+        "begin",
+        "group0:data_rows",
+        "group0:parity",
+        "barrier",
+        "rg_000000:put",
+        "barrier",
+        "group1:data_rows",
+        "group1:parity",
+        "barrier",
+        "rg_000001:put",
+        "barrier",
+        "commit",
+    ]
     assert observed_puts == [
         ("rg_000000_row_000", "rg_000000_row_003"),
         ("rg_000001_row_000", "rg_000001_row_003"),
@@ -277,6 +295,8 @@ def test_distributed_store_writes_each_reduction_group_before_next_group(monkeyp
     assert result.local_chunks == {}
     assert result.profile["local_chunks_released_count"] == 4
     assert result.profile["local_storage_chunk_count"] == 4
+    assert "group_transfer_barrier_ms" in result.profile
+    assert "group_storage_barrier_ms" in result.profile
 
 
 def test_store_data_rows_receives_into_preallocated_slot_and_flushes(monkeypatch):

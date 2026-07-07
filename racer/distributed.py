@@ -841,6 +841,8 @@ def distributed_store(
             "final_barrier_ms": 0.0,
             "manifest_ms": manifest_ms,
             "storage_ms": 0.0,
+            "group_transfer_barrier_ms": 0.0,
+            "group_storage_barrier_ms": 0.0,
             "data_rows_bytes_sent": 0,
             "parity_bytes_sent": 0,
             "local_storage_nbytes": 0,
@@ -858,6 +860,8 @@ def distributed_store(
     parity_ms = 0.0
     data_bytes_sent = 0
     parity_bytes_sent = 0
+    group_transfer_barrier_ms = 0.0
+    group_storage_barrier_ms = 0.0
     stored_nbytes = 0
     stored_count = 0
     released_nbytes = 0
@@ -911,9 +915,6 @@ def distributed_store(
         stored_count += int(group_stored_count)
         _accumulate_profile(storage_profile, group_storage_profile)
 
-    def store_received_row(chunk_id: str, tensor: torch.Tensor) -> None:
-        flush_ready({str(chunk_id): tensor})
-
     for group in layout.reduction_groups:
         group_chunks: dict[str, torch.Tensor] = {}
         data_rows_start = time.perf_counter()
@@ -926,7 +927,7 @@ def distributed_store(
             local_chunks=group_chunks,
             receive_slot=receive_slot_for(group, after_source_send=False),
             zero_send_slot=recv_slot4,
-            row_sink=store_received_row,
+            row_sink=None,
             process_group=process_group,
         )
         data_rows_ms += (time.perf_counter() - data_rows_start) * 1000.0
@@ -946,12 +947,18 @@ def distributed_store(
                 and int(group[0].relative_index) == int(local_source_group),
             ),
             zero_send_slot=recv_slot4,
-            row_sink=store_received_row,
+            row_sink=None,
             process_group=process_group,
         )
         parity_ms += (time.perf_counter() - parity_start) * 1000.0
+        transfer_barrier_start = time.perf_counter()
+        _barrier(process_group)
+        group_transfer_barrier_ms += (time.perf_counter() - transfer_barrier_start) * 1000.0
         flush_ready(group_chunks)
         group_chunks.clear()
+        storage_barrier_start = time.perf_counter()
+        _barrier(process_group)
+        group_storage_barrier_ms += (time.perf_counter() - storage_barrier_start) * 1000.0
         if local_source_group is not None and int(group[0].relative_index) == int(local_source_group):
             source_group_completed = True
 
@@ -966,6 +973,8 @@ def distributed_store(
         state.profile["storage_ms"] = (time.perf_counter() - storage_start) * 1000.0
         state.profile["data_rows_ms"] = data_rows_ms
         state.profile["parity_ms"] = parity_ms
+        state.profile["group_transfer_barrier_ms"] = group_transfer_barrier_ms
+        state.profile["group_storage_barrier_ms"] = group_storage_barrier_ms
         state.profile["data_rows_bytes_sent"] = int(data_bytes_sent)
         state.profile["parity_bytes_sent"] = int(parity_bytes_sent)
         state.profile["local_storage_nbytes"] = int(stored_nbytes)

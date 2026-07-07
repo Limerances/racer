@@ -148,7 +148,24 @@ def test_pai_multinode_dry_run_accepts_default_egm_remote_spare_factory(tmp_path
     assert "CSD_EGM_RUNTIME_FACTORY=racer.egm_runtime:create_runtime" in result.stdout
     assert "RACER_CSD_DIRECT_WRITE_IPC=1" in result.stdout
     assert "RACER_CSD_DIRECT_READ_IPC=1" in result.stdout
+    assert "RACER_EGM_DIRECT_IPC=1" in result.stdout
     assert "CSD_EGM_MAX_POOL_BYTES=103079215104" in result.stdout
+
+
+def test_pai_multinode_dry_run_disables_egm_direct_ipc_when_requested(tmp_path):
+    result = _run_script(
+        "examples/pai_run_megatron_multinode.sh",
+        tmp_path,
+        MODE="racer_egm_remote_spare",
+        NODE_RANK="0",
+        NNODES="2",
+        NPROC_PER_NODE="4",
+        RACER_EGM_DIRECT_IPC="0",
+    )
+
+    assert "RACER_EGM_DIRECT_IPC=0" in result.stdout
+    assert "RACER_CSD_DIRECT_WRITE_IPC=0" in result.stdout
+    assert "RACER_CSD_DIRECT_READ_IPC=0" in result.stdout
 
 
 def test_pai_multinode_dry_run_rejects_noncanonical_remote_spare_rank(tmp_path):
@@ -283,6 +300,7 @@ def test_pai_restart_driver_dry_run_passes_egm_runtime_settings_to_phases(tmp_pa
     assert "RACER_CSD_MANIFEST_UPDATE_MODE=batch" in text
     assert "RACER_CSD_DIRECT_WRITE_IPC=1" in text
     assert "RACER_CSD_DIRECT_READ_IPC=1" in text
+    assert "RACER_EGM_DIRECT_IPC=1" in text
     assert "CSD_EGM_POOL_ID=pool-a" in text
     assert "CSD_EGM_OWNER_NODE=node-a" in text
     assert "CSD_EGM_OWNER_TRAY=tray-a" in text
@@ -298,6 +316,35 @@ def test_pai_restart_driver_dry_run_passes_egm_runtime_settings_to_phases(tmp_pa
     assert "CSD_EGM_NUMA_ID=7" in config
     assert "RACER_CSD_DIRECT_WRITE_IPC=1" in config
     assert "RACER_CSD_DIRECT_READ_IPC=1" in config
+    assert "RACER_EGM_DIRECT_IPC=1" in config
+
+
+def test_pai_restart_driver_dry_run_allows_egm_direct_ipc_opt_out(tmp_path):
+    result = _run_script(
+        "examples/pai_run_megatron_restart_driver.sh",
+        tmp_path,
+        MODE="racer_egm_remote_spare",
+        NODE_RANK="0",
+        NNODES="2",
+        NPROC_PER_NODE="4",
+        BASE_RUN_ID="pytest_restart_driver_egm_no_direct",
+        RESTART_OVERWRITE="1",
+        PAI_TOTAL_NODES="1",
+        RACER_EGM_DIRECT_IPC="0",
+    )
+
+    assert "FINAL_TRAIN_ITERS=80" in result.stdout
+    phase0 = tmp_path / "logs" / "pytest_restart_driver_egm_no_direct_phase00.driver.node0.log"
+    config_path = tmp_path / "restart_state" / "pytest_restart_driver_egm_no_direct" / "config.txt"
+    assert phase0.exists()
+    text = phase0.read_text(encoding="utf-8")
+    assert "RACER_EGM_DIRECT_IPC=0" in text
+    assert "RACER_CSD_DIRECT_WRITE_IPC=0" in text
+    assert "RACER_CSD_DIRECT_READ_IPC=0" in text
+    config = config_path.read_text(encoding="utf-8")
+    assert "RACER_EGM_DIRECT_IPC=0" in config
+    assert "RACER_CSD_DIRECT_WRITE_IPC=0" in config
+    assert "RACER_CSD_DIRECT_READ_IPC=0" in config
 
 
 def test_pai_restart_driver_dry_run_coordinates_three_nodes(tmp_path):

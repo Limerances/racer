@@ -136,14 +136,23 @@ preflight 通过后，把 pinned 命令里的 `MODE` 改成 `racer_egm_remote_sp
 
 脚本启动 CSD 后会先检查 daemon capabilities；如果 EGM mempool、NUMA 或 backend 不匹配，训练开始前就会失败。这个失败不是 fallback，说明 EGM 后端没有真正起来。
 
-当前 EGM 模式默认打开直接 CUDA IPC 读写：
+当前 EGM 模式默认走 direct IPC 快路径：
 
 ```text
+RACER_EGM_DIRECT_IPC=1
 RACER_CSD_DIRECT_WRITE_IPC=1
 RACER_CSD_DIRECT_READ_IPC=1
 ```
 
-如果日志里 `export_profile` 仍然显示 `direct_ipc_error=disabled` 或 `staging_kind=persistent_slab`，说明没有走直接 EGM 传输路径，checkpoint 时间会明显偏慢。
+`distributed_store` 会在每个 reduction group 的 NCCL P2P 完成后再写 CSD，避免一部分 rank 已经进入 commit barrier，另一部分 rank 还卡在 recv。
+
+如果只想临时排查 CSD direct IPC，可以显式关掉：
+
+```text
+RACER_EGM_DIRECT_IPC=0
+```
+
+这不会退回 pinned，仍然是 EGM CSD，只是 GPU chunk 到 daemon memory 的传输会经过 staging slab。如果默认快路径生效，日志应显示 `RACER_CSD_DIRECT_WRITE_IPC=1` 和 `RACER_CSD_DIRECT_READ_IPC=1`；如果 `export_profile` 显示 `direct_ipc_error=disabled` 或 `staging_kind=persistent_slab`，说明没有走直接 EGM 传输路径。
 
 restart driver 会把 `CSD_EGM_*`、`CSD_NATIVE_PINNED_*`、`RACER_BUFFER_SIZE` 等关键参数写入 `restart_state/<BASE_RUN_ID>/config.txt`，每个 phase 的日志也会打印 resolved 配置。
 
