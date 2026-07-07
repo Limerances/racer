@@ -52,6 +52,10 @@ except ImportError:  # pragma: no cover - optional performance dependency
 
 
 _CUDART: Any | None = None
+_CUDA_DRIVER: Any | None = None
+_CUDA_MEM_GET_ADDRESS_RANGE: Any | None = None
+_CUDA_MEMCPY_HOST_TO_DEVICE = 1
+_CUDA_MEMCPY_DEVICE_TO_HOST = 2
 _CUDA_MEMCPY_DEVICE_TO_DEVICE = 3
 _CUDA_MEMCPY_DEFAULT = 4
 _CUDA_EVENT_DISABLE_TIMING = 2
@@ -151,6 +155,40 @@ def _load_cudart() -> Any | None:
     return None
 
 
+def _load_cuda_driver() -> Any | None:
+    global _CUDA_DRIVER, _CUDA_MEM_GET_ADDRESS_RANGE
+    if _CUDA_DRIVER is not None:
+        return _CUDA_DRIVER
+    for name in ("libcuda.so", "libcuda.so.1"):
+        try:
+            cuda = ctypes.CDLL(name)
+        except OSError:
+            continue
+        try:
+            cuda.cuInit.argtypes = [ctypes.c_uint]
+            cuda.cuInit.restype = ctypes.c_int
+            get_address_range = getattr(cuda, "cuMemGetAddressRange_v2", None) or getattr(cuda, "cuMemGetAddressRange", None)
+            if get_address_range is None:
+                continue
+            get_address_range.argtypes = [
+                ctypes.POINTER(ctypes.c_ulonglong),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_ulonglong,
+            ]
+            get_address_range.restype = ctypes.c_int
+            err = int(cuda.cuInit(ctypes.c_uint(0)))
+            if err != 0:
+                raise RuntimeError(f"cuInit failed with CUDA driver error code {err}")
+            _CUDA_DRIVER = cuda
+            _CUDA_MEM_GET_ADDRESS_RANGE = get_address_range
+            return cuda
+        except Exception:
+            _CUDA_DRIVER = None
+            _CUDA_MEM_GET_ADDRESS_RANGE = None
+            raise
+    return None
+
+
 def _cuda_memcpy(dst_ptr: int, src_ptr: int, nbytes: int, kind: int) -> None:
     cudart = _load_cudart()
     if cudart is None:
@@ -170,6 +208,22 @@ def _cuda_memcpy(dst_ptr: int, src_ptr: int, nbytes: int, kind: int) -> None:
 def _cuda_check(err: int, message: str) -> None:
     if int(err) != 0:
         raise RuntimeError(f"{message}: CUDA error code {int(err)}")
+
+
+def _cuda_allocation_range(ptr: int) -> tuple[int, int]:
+    cuda = _load_cuda_driver()
+    get_address_range = _CUDA_MEM_GET_ADDRESS_RANGE
+    if cuda is None or get_address_range is None:
+        raise RuntimeError("CUDA driver cuMemGetAddressRange is required for direct CUDA IPC allocation-base export")
+    base = ctypes.c_ulonglong()
+    size = ctypes.c_size_t()
+    err = int(get_address_range(ctypes.byref(base), ctypes.byref(size), ctypes.c_ulonglong(int(ptr))))
+    _cuda_check(err, "cuMemGetAddressRange failed")
+    base_ptr = int(base.value)
+    nbytes = int(size.value)
+    if base_ptr <= 0 or nbytes <= 0:
+        raise RuntimeError(f"cuMemGetAddressRange returned invalid range base={base_ptr}, nbytes={nbytes}")
+    return base_ptr, nbytes
 
 
 def _cuda_set_device(device: int) -> None:
@@ -521,6 +575,9 @@ def export_cuda_ipc_view(
         "direct_ipc_enabled": bool(direct_ipc_enabled),
         "direct_ipc_role": role,
         "direct_ipc_error": "",
+        "direct_ipc_allocation_nbytes": 0,
+        "direct_ipc_allocation_offset": 0,
+        "direct_ipc_storage_base_delta": 0,
         "staging_kind": "none",
         "staging_alloc_us": 0.0,
         "staging_copy_enqueue_us": 0.0,
@@ -528,12 +585,23 @@ def export_cuda_ipc_view(
 
     if direct_ipc_enabled:
         try:
-            mem_handle = _ipc_handle_bytes_from_ptr(storage_ptr)
+            allocation_base, allocation_nbytes = _cuda_allocation_range(data_ptr)
+            allocation_offset = data_ptr - allocation_base
+            if allocation_offset < 0 or allocation_offset + nbytes > allocation_nbytes:
+                raise RuntimeError(
+                    "CUDA IPC tensor view is outside allocation range: "
+                    f"data_ptr={data_ptr}, nbytes={nbytes}, allocation_base={allocation_base}, "
+                    f"allocation_nbytes={allocation_nbytes}"
+                )
+            profile["direct_ipc_allocation_nbytes"] = int(allocation_nbytes)
+            profile["direct_ipc_allocation_offset"] = int(allocation_offset)
+            profile["direct_ipc_storage_base_delta"] = int(storage_ptr - allocation_base)
+            mem_handle = _ipc_handle_bytes_from_ptr(allocation_base)
             event_handle, event_ptr = _record_interprocess_event(device, stream_ptr)
             return CudaIpcView(
                 device=device,
                 nbytes=nbytes,
-                base_offset=base_offset,
+                base_offset=int(allocation_offset),
                 dtype=str(tensor.dtype),
                 shape=list(tensor.shape),
                 mem_handle=mem_handle,
@@ -748,6 +816,9 @@ class StorageBackend:
     def metadata(self, tag: str, chunk_id: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    def update_metadata(self, tag: str, chunk_id: str, metadata: dict[str, Any]) -> None:
+        return
+
     def list_chunks(self, tag: str) -> list[str]:
         raise NotImplementedError
 
@@ -849,8 +920,18 @@ class NativePinnedMemoryBackend(StorageBackend):
         self._lock = threading.RLock()
         self._op_condition = threading.Condition(self._lock)
         self._ipc_lock = threading.RLock()
+        self._read_ipc_lock = threading.RLock()
         self._stream_lock = threading.RLock()
         self._ipc_mem_cache_max_entries = int(os.environ.get("RACER_CSD_IPC_MEM_CACHE_MAX_ENTRIES", "128"))
+        self._serialize_read_ipc = str(os.environ.get("RACER_CSD_SERIALIZE_READ_IPC", "0")).lower() not in {
+            "",
+            "0",
+            "false",
+            "no",
+            "off",
+            "none",
+            "disabled",
+        }
         self._copy_stream_pool_size = max(1, int(os.environ.get("RACER_CSD_COPY_STREAMS_PER_DEVICE", "4")))
         self._copy_streams: dict[int, list[int]] = {}
         self._copy_stream_next: dict[int, int] = {}
@@ -1294,7 +1375,7 @@ class NativePinnedMemoryBackend(StorageBackend):
                 ctypes.c_void_p(int(chunk.host_ptr)),
                 ctypes.c_void_p(src_ptr),
                 ctypes.c_size_t(nbytes),
-                ctypes.c_int(_CUDA_MEMCPY_DEFAULT),
+                ctypes.c_int(_CUDA_MEMCPY_DEVICE_TO_HOST),
                 ctypes.c_void_p(stream),
             ),
             "cudaMemcpyAsync D2H to native pinned failed",
@@ -1334,8 +1415,50 @@ class NativePinnedMemoryBackend(StorageBackend):
         return op_id, dict(record_metadata)
 
     def read_to_cuda_ipc(self, tag: str, chunk_id: str, view: dict[str, Any]) -> str:
+        if bool(getattr(self, "_serialize_read_ipc", False)):
+            with self._read_ipc_lock:
+                op_id = self._read_to_cuda_ipc_unserialized(tag, chunk_id, view)
+                self.wait(op_id)
+                return op_id
+        return self._read_to_cuda_ipc_unserialized(tag, chunk_id, view)
+
+    def _read_to_cuda_ipc_unserialized(self, tag: str, chunk_id: str, view: dict[str, Any]) -> str:
         with self._lock:
             chunk = self._chunks[str(tag)][str(chunk_id)]
+        debug_read_checksum = any(
+            str(os.environ.get(name, "")).lower() not in {"", "0", "false", "no", "off", "none", "disabled"}
+            for name in ("RACER_DEBUG_STORAGE_READ_CHECKSUM", "RACER_DEBUG_PAYLOAD_CHECKSUM")
+        )
+        if debug_read_checksum:
+            metadata = dict(chunk.metadata or {})
+            expected = str(metadata.get("checksum", "") or "")
+            checksum_type = str(metadata.get("checksum_type", "") or "")
+            if expected:
+                checksum_kind = checksum_type or "sample64"
+                if expected.startswith(("sample64-v1:", "sum64-v1:")):
+                    checksum_kind = "sample64"
+                elif expected.startswith("sha256-v1:"):
+                    checksum_kind = "sha256"
+                try:
+                    actual = self.checksum(str(tag), str(chunk_id), checksum_type=checksum_kind)
+                    if actual == expected:
+                        print(
+                            f"RACER CSD resident checksum before read verified: tag={tag}, "
+                            f"chunk_id={chunk_id}, checksum={actual}, nbytes={int(chunk.nbytes)}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"RACER CSD resident checksum before read mismatch: tag={tag}, chunk_id={chunk_id}, "
+                            f"expected={expected}, got={actual}, nbytes={int(chunk.nbytes)}",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(
+                        f"RACER CSD resident checksum before read error: tag={tag}, chunk_id={chunk_id}, "
+                        f"checksum_type={checksum_kind!r}, error={type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
         dst_nbytes = int(view.get("nbytes", 0) or 0)
         if dst_nbytes < int(chunk.nbytes):
             raise ValueError(
@@ -1365,7 +1488,7 @@ class NativePinnedMemoryBackend(StorageBackend):
                 ctypes.c_void_p(dst_ptr),
                 ctypes.c_void_p(int(chunk.host_ptr)),
                 ctypes.c_size_t(int(chunk.nbytes)),
-                ctypes.c_int(_CUDA_MEMCPY_DEFAULT),
+                ctypes.c_int(_CUDA_MEMCPY_HOST_TO_DEVICE),
                 ctypes.c_void_p(stream),
             ),
             "cudaMemcpyAsync H2D from native pinned failed",
@@ -1559,6 +1682,10 @@ class NativePinnedMemoryBackend(StorageBackend):
                 return dict(self._chunks[str(tag)][str(chunk_id)].metadata)
         except KeyError as exc:
             raise KeyError(f"CSD native_pinned chunk metadata {chunk_id!r} for tag {tag!r} is not resident") from exc
+
+    def update_metadata(self, tag: str, chunk_id: str, metadata: dict[str, Any]) -> None:
+        with self._lock:
+            self._chunks[str(tag)][str(chunk_id)].metadata = dict(metadata)
 
     def list_chunks(self, tag: str) -> list[str]:
         with self._lock:
@@ -1861,6 +1988,12 @@ class EgmBackend(StorageBackend):
             except KeyError:
                 pass
         return self._normalize_metadata(str(tag), str(chunk_id), int(local.get("nbytes", 0) or 0), local)
+
+    def update_metadata(self, tag: str, chunk_id: str, metadata: dict[str, Any]) -> None:
+        normalized = self._normalize_metadata(str(tag), str(chunk_id), int(dict(metadata).get("nbytes", 0) or 0), dict(metadata))
+        runtime_update_metadata = getattr(self.runtime, "update_metadata", None)
+        if callable(runtime_update_metadata):
+            runtime_update_metadata(str(tag), str(chunk_id), normalized)
 
     def list_chunks(self, tag: str) -> list[str]:
         runtime_list_fn = getattr(self.runtime, "list_chunks", None)
@@ -2287,6 +2420,7 @@ class CheckpointStorageDaemon:
                         else:
                             checksum = ""
                             metadata.update({"checksum_type": "none", "checksum": ""})
+                self.backend.update_metadata(op["tag"], op["chunk_id"], metadata)
                 profile["checksum_ms"] = checksum_ms
                 with self._lock:
                     self._entries[op["tag"]].setdefault("chunks", {})[op["chunk_id"]] = metadata

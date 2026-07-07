@@ -185,6 +185,88 @@ def _zero_data_chunk_ids(manifest: dict[str, Any] | None) -> set[str]:
     return zero_chunks
 
 
+def _storage_read_checksum_debug_enabled() -> bool:
+    return any(
+        str(os.environ.get(name, "")).lower() not in {"", "0", "false", "no", "off", "none", "disabled"}
+        for name in ("RACER_DEBUG_STORAGE_READ_CHECKSUM", "RACER_DEBUG_PAYLOAD_CHECKSUM")
+    )
+
+
+def _storage_read_checksum_mode(expected: str, checksum_type: str) -> str | None:
+    normalized_type = str(checksum_type or "").lower().replace("-", "_")
+    if expected.startswith(("sample64-v1:", "sum64-v1:")):
+        return "fast"
+    if expected.startswith("sha256-v1:"):
+        return "sha256"
+    if normalized_type in {"sample64", "sample64_v1", "fast", "sampled"}:
+        return "fast"
+    if normalized_type in {"sha256", "sha256_v1", "strict", "strict_sha256"}:
+        return "sha256"
+    return None
+
+
+def _debug_storage_read_checksum(
+    *,
+    tag: str,
+    rank: int,
+    chunk_id: str,
+    chunk: Mapping[str, Any],
+    tensor: torch.Tensor,
+) -> tuple[int, int, float]:
+    if not _storage_read_checksum_debug_enabled():
+        return 0, 0, 0.0
+    expected = str(chunk.get("checksum", "") or "")
+    checksum_type = str(chunk.get("checksum_type", "") or "")
+    mode = _storage_read_checksum_mode(expected, checksum_type)
+    if not expected or mode is None:
+        print(
+            f"RACER storage read checksum skipped: rank={rank}, tag={tag}, "
+            f"chunk_id={chunk_id}, checksum_type={checksum_type!r}, expected_present={bool(expected)}",
+            flush=True,
+        )
+        return 0, 0, 0.0
+    nbytes = int(chunk.get("nbytes", chunk.get("num_bytes", int(tensor.numel()))) or 0)
+    nbytes = min(nbytes, int(tensor.numel()))
+    view = tensor.narrow(0, 0, nbytes)
+
+    def sync_device(device: torch.device) -> None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    from .checksum import tensor_checksum
+
+    start = time.perf_counter()
+    try:
+        actual = tensor_checksum(
+            view,
+            buffer_size=16 * 1024 * 1024,
+            sync_device=sync_device,
+            mode=mode,
+        )
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        print(
+            f"RACER storage read checksum error: rank={rank}, tag={tag}, chunk_id={chunk_id}, "
+            f"checksum_type={checksum_type!r}, error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return 0, 1, elapsed_ms
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    if actual != expected:
+        print(
+            f"RACER storage read checksum mismatch: rank={rank}, tag={tag}, chunk_id={chunk_id}, "
+            f"expected={expected}, got={actual}, nbytes={nbytes}",
+            flush=True,
+        )
+        return 0, 1, elapsed_ms
+    print(
+        f"RACER storage read checksum verified: rank={rank}, tag={tag}, chunk_id={chunk_id}, "
+        f"checksum={actual}, nbytes={nbytes}",
+        flush=True,
+    )
+    return 1, 0, elapsed_ms
+
+
 def _expected_storage_chunk_count(manifest: dict[str, Any] | None) -> int:
     if not manifest:
         return 0
@@ -209,6 +291,19 @@ def _csv_ints(value: str | None) -> list[int]:
         else:
             out.append(int(item))
     return out
+
+
+def _align_nbytes(value: int, alignment: int) -> int:
+    value = int(value)
+    alignment = max(1, int(alignment))
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _distributed_group_alignment_bytes() -> int:
+    value = os.environ.get("RACER_DISTRIBUTED_GROUP_ALIGNMENT_BYTES", "2097152")
+    if value in (None, ""):
+        return 4096
+    return max(1, int(value))
 
 
 def _per_node_csd_enabled() -> bool:
@@ -490,21 +585,12 @@ def _payload_store_slot(
         return flat
     if int(flat.numel()) > nbytes:
         return flat.narrow(0, 0, nbytes)
-    if int(flat.numel()) == 0 and nbytes > 0:
-        if zero_slot is None:
-            raise RuntimeError(
-                "strict RACER store requires a fixed zero-send slot for empty payload chunks; "
-                f"required_nbytes={nbytes}"
-            )
-        if zero_slot.device != device or zero_slot.device.type != "cuda":
-            raise ValueError("strict RACER zero-send slot must be on the current CUDA device")
-        if int(zero_slot.numel()) < nbytes:
-            raise RuntimeError(
-                "strict RACER zero-send slot is too small; "
-                f"slot_nbytes={int(zero_slot.numel())}, required_nbytes={nbytes}"
-            )
-        out = zero_slot.narrow(0, 0, nbytes)
-        out.zero_()
+    if int(flat.numel()) < nbytes:
+        out = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        valid = int(flat.numel())
+        if valid > 0:
+            out.narrow(0, 0, valid).copy_(flat)
+        out.narrow(0, valid, nbytes - valid).zero_()
         return out
 
     storage_nbytes = int(flat.untyped_storage().nbytes())
@@ -573,11 +659,14 @@ def _recv_tensor_into(
 
 def _group_nbytes(layout: ElasticLayout, packet_sizes: dict[int, int]) -> dict[int, int]:
     out: dict[int, int] = {}
+    alignment = _distributed_group_alignment_bytes()
     for group in layout.reduction_groups:
         size = 0
         for slot in group:
             if slot.train_rank is not None:
                 size = max(size, packet_sizes[int(slot.train_rank)])
+        if size > 0 and alignment > 1:
+            size = _align_nbytes(size, alignment)
         out[group[0].relative_index] = size
     return out
 
@@ -878,25 +967,11 @@ def distributed_store(
         local_source_group = None
     source_group_completed = rank not in config.train_ranks
 
-    def slot3_view(nbytes: int) -> torch.Tensor:
-        if local_payload is None:
-            raise RuntimeError("strict RACER store cannot reuse slot3 without a local payload slot")
-        return _payload_store_slot(
-            local_payload,
-            int(nbytes),
-            device=_current_cuda_device(),
-            zero_slot=recv_slot4,
-        )
-
     def receive_slot_for(group: Sequence[Any], *, after_source_send: bool) -> torch.Tensor | None:
-        nonlocal source_group_completed
-        nbytes = int(group_sizes[group[0].relative_index])
-        if (
-            local_payload is not None
-            and int(local_payload.numel()) > 0
-            and (source_group_completed or after_source_send)
-        ):
-            return slot3_view(nbytes)
+        # Keep local_payload immutable until all daemon writes for this store call are complete.
+        # Reusing slot3 for receives can overwrite a source buffer whose direct-IPC EGM copy
+        # is still visible to the daemon/runtime on GB200. recv_slot4 is already preallocated
+        # for the largest group and is flushed before reuse across groups.
         return recv_slot4
 
     def flush_ready(chunks: Mapping[str, torch.Tensor]) -> None:
@@ -917,13 +992,21 @@ def distributed_store(
 
     for group in layout.reduction_groups:
         group_chunks: dict[str, torch.Tensor] = {}
+        group_index = int(group[0].relative_index)
+        group_local_slot_payload: dict[int, torch.Tensor] = {}
+        if rank in config.train_ranks and local_payload is not None:
+            group_local_slot_payload[rank] = _payload_store_slot(
+                local_payload,
+                int(group_sizes[group_index]),
+                device=_current_cuda_device(),
+            )
         data_rows_start = time.perf_counter()
         data_bytes_sent += _store_data_rows_for_group(
             rank=rank,
             config=config,
             group=group,
             group_nbytes=group_sizes,
-            local_slot_payload=local_slot_payload,
+            local_slot_payload=group_local_slot_payload,
             local_chunks=group_chunks,
             receive_slot=receive_slot_for(group, after_source_send=False),
             zero_send_slot=recv_slot4,
@@ -939,7 +1022,7 @@ def distributed_store(
             group=group,
             E=E,
             group_nbytes=group_sizes,
-            local_slot_payload=local_slot_payload,
+            local_slot_payload=group_local_slot_payload,
             local_chunks=group_chunks,
             receive_slot=receive_slot_for(
                 group,
@@ -1030,10 +1113,14 @@ def distributed_state_from_storage(
     plan = routing.make_planner(config).plan(layout, matrix, max(group_sizes.values(), default=0))
     setup_ms = (time.perf_counter() - setup_start) * 1000.0
     local_chunks: dict[str, torch.Tensor] = {}
+    chunk_by_id = {str(chunk["chunk_id"]): dict(chunk) for chunk in manifest.get("chunks", [])}
     zero_chunks = _zero_data_chunk_ids(manifest)
     zero_cache: dict[tuple[int | None, int], torch.Tensor] = {}
     read_futures: list[tuple[str, str, torch.Tensor]] = []
     storage_profile: dict[str, float] = {}
+    read_checksum_verified = 0
+    read_checksum_mismatch = 0
+    read_checksum_ms = 0.0
     read_nbytes = 0
     read_count = 0
     use_cuda_ipc_read = (
@@ -1043,7 +1130,8 @@ def distributed_state_from_storage(
         if hasattr(chunk_storage, "capabilities")
         else False
     )
-    read_enqueue_start = time.perf_counter()
+    read_enqueue_ms = 0.0
+    read_wait_ms = 0.0
     for chunk in manifest.get("chunks", []):
         if int(chunk.get("owner_rank", -1)) != rank:
             continue
@@ -1053,27 +1141,36 @@ def distributed_state_from_storage(
         elif use_cuda_ipc_read and device.type == "cuda":
             nbytes = int(chunk.get("nbytes", chunk.get("num_bytes", 0)) or 0)
             dst = torch.empty(nbytes, dtype=torch.uint8, device=device)
+            enqueue_start = time.perf_counter()
             op_id = chunk_storage.read_into_cuda_tensor(tag, chunk_id, dst)
-            read_futures.append((op_id, chunk_id, dst))
+            read_enqueue_ms += (time.perf_counter() - enqueue_start) * 1000.0
             read_nbytes += nbytes
             read_count += 1
+            wait_start = time.perf_counter()
+            result = chunk_storage.wait(op_id)
+            read_wait_ms += (time.perf_counter() - wait_start) * 1000.0
+            if isinstance(result, dict):
+                profile = result.get("profile")
+                if isinstance(profile, dict):
+                    for key, value in profile.items():
+                        if isinstance(value, (int, float)):
+                            storage_profile[f"csd_get_{key}"] = storage_profile.get(f"csd_get_{key}", 0.0) + float(value)
+            verified, mismatch, checksum_ms = _debug_storage_read_checksum(
+                tag=tag,
+                rank=rank,
+                chunk_id=chunk_id,
+                chunk=chunk,
+                tensor=dst,
+            )
+            read_checksum_verified += verified
+            read_checksum_mismatch += mismatch
+            read_checksum_ms += checksum_ms
+            local_chunks[chunk_id] = dst
         else:
             raise RuntimeError(
                 "RACER distributed load requires daemon storage with CUDA IPC async read support; "
                 "CPU/socket fallback get is disabled"
             )
-    read_enqueue_ms = (time.perf_counter() - read_enqueue_start) * 1000.0
-    read_wait_start = time.perf_counter()
-    for op_id, chunk_id, dst in read_futures:
-        result = chunk_storage.wait(op_id)
-        if isinstance(result, dict):
-            profile = result.get("profile")
-            if isinstance(profile, dict):
-                for key, value in profile.items():
-                    if isinstance(value, (int, float)):
-                        storage_profile[f"csd_get_{key}"] = storage_profile.get(f"csd_get_{key}", 0.0) + float(value)
-        local_chunks[chunk_id] = dst
-    read_wait_ms = (time.perf_counter() - read_wait_start) * 1000.0
     barrier_start = time.perf_counter()
     _barrier(process_group)
     final_barrier_ms = (time.perf_counter() - barrier_start) * 1000.0
@@ -1087,6 +1184,9 @@ def distributed_state_from_storage(
         "load_read_nbytes": int(read_nbytes),
         "load_read_chunk_count": int(read_count),
         "load_cuda_ipc_read": bool(use_cuda_ipc_read),
+        "storage_read_checksum_verified_count": int(read_checksum_verified),
+        "storage_read_checksum_mismatch_count": int(read_checksum_mismatch),
+        "storage_read_checksum_ms": float(read_checksum_ms),
     }
     profile.update(storage_profile)
     return DistributedStoreResult(
@@ -1173,6 +1273,9 @@ def distributed_load_local_payload_from_storage(
     setup_ms = (time.perf_counter() - setup_start) * 1000.0
     zero_chunks = _zero_data_chunk_ids(manifest)
     storage_profile: dict[str, float] = {}
+    read_checksum_verified = 0
+    read_checksum_mismatch = 0
+    read_checksum_ms = 0.0
     read_enqueue_ms = 0.0
     read_wait_ms = 0.0
     if chunk_id in zero_chunks or valid_nbytes <= 0:
@@ -1199,6 +1302,16 @@ def distributed_load_local_payload_from_storage(
                     for key, value in profile.items():
                         if isinstance(value, (int, float)):
                             storage_profile[f"csd_get_{key}"] = storage_profile.get(f"csd_get_{key}", 0.0) + float(value)
+            verified, mismatch, checksum_ms = _debug_storage_read_checksum(
+                tag=tag,
+                rank=requested,
+                chunk_id=chunk_id,
+                chunk=chunk,
+                tensor=dst,
+            )
+            read_checksum_verified += verified
+            read_checksum_mismatch += mismatch
+            read_checksum_ms += checksum_ms
         else:
             raise RuntimeError(
                 "RACER distributed fetch requires daemon storage with CUDA IPC async read support; "
@@ -1217,6 +1330,9 @@ def distributed_load_local_payload_from_storage(
         "load_read_nbytes": int(storage_nbytes if valid_nbytes > 0 else 0),
         "load_read_chunk_count": int(0 if chunk_id in zero_chunks or valid_nbytes <= 0 else 1),
         "load_cuda_ipc_read": bool(storage_profile or read_wait_ms > 0.0),
+        "storage_read_checksum_verified_count": int(read_checksum_verified),
+        "storage_read_checksum_mismatch_count": int(read_checksum_mismatch),
+        "storage_read_checksum_ms": float(read_checksum_ms),
         "load_direct_storage": True,
         "load_route_pre_barrier_ms": 0.0,
         "load_route_requested_ms": 0.0,

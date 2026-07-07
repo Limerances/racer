@@ -46,16 +46,23 @@ node0:
 
 ```bash
 cd /mnt/data/luohaonan/workspace/racer
-MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
-  RESTART_OVERWRITE=1 NODE_RANK=0 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=<MASTER_IP> \
-  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
+MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_006 \
+  RESTART_OVERWRITE=1 MASTER_PORT_BASE=29500 RACER_RUNTIME_PORT_BASE=29610 CSD_PORT=7007 NODE_RANK=0 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=<MASTER_IP> \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_006 \
   bash examples/pai_run_megatron_restart_driver.sh
 ```
 ```bash
 cd /mnt/data/luohaonan/workspace/racer
-MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
-  RESTART_OVERWRITE=1 NODE_RANK=0 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.155 \
-  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
+MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_006 \
+  RESTART_OVERWRITE=1 MASTER_PORT_BASE=29500 RACER_RUNTIME_PORT_BASE=29610 CSD_PORT=7007 NODE_RANK=0 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.153 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_006 \
+  bash examples/pai_run_megatron_restart_driver.sh
+```
+```bash
+cd /mnt/data/luohaonan/workspace/racer
+MODE=racer_egm_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_006 \
+  RESTART_OVERWRITE=1 MASTER_PORT_BASE=29500 RACER_RUNTIME_PORT_BASE=29610 CSD_PORT=7007 NODE_RANK=0 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.153 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_006 \
   bash examples/pai_run_megatron_restart_driver.sh
 ```
 
@@ -63,16 +70,23 @@ node1:
 
 ```bash
 cd /mnt/data/luohaonan/workspace/racer
-MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
-  RESTART_OVERWRITE=1 NODE_RANK=1 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=<MASTER_IP> \
-  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
+MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_006 \
+  RESTART_OVERWRITE=1 MASTER_PORT_BASE=29500 RACER_RUNTIME_PORT_BASE=29610 CSD_PORT=7007 NODE_RANK=1 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=<MASTER_IP> \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_006 \
   bash examples/pai_run_megatron_restart_driver.sh
 ```
 ```bash
 cd /mnt/data/luohaonan/workspace/racer
-MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
-  RESTART_OVERWRITE=1 NODE_RANK=1 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.155 \
-  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
+MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_006 \
+  RESTART_OVERWRITE=1 MASTER_PORT_BASE=29500 RACER_RUNTIME_PORT_BASE=29610 CSD_PORT=7007 NODE_RANK=1 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.153 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_006 \
+  bash examples/pai_run_megatron_restart_driver.sh
+```
+```bash
+cd /mnt/data/luohaonan/workspace/racer
+MODE=racer_egm_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_006 \
+  RESTART_OVERWRITE=1 MASTER_PORT_BASE=29500 RACER_RUNTIME_PORT_BASE=29610 CSD_PORT=7007 NODE_RANK=1 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.153 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_006 \
   bash examples/pai_run_megatron_restart_driver.sh
 ```
 
@@ -80,23 +94,30 @@ node2:
 
 ```bash
 cd /mnt/data/luohaonan/workspace/racer
-MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
-  RESTART_OVERWRITE=1 NODE_RANK=2 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=<MASTER_IP> \
-  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
+MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_006 \
+  RESTART_OVERWRITE=1 MASTER_PORT_BASE=29500 RACER_RUNTIME_PORT_BASE=29610 CSD_PORT=7007 NODE_RANK=2 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=<MASTER_IP> \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_006 \
   bash examples/pai_run_megatron_restart_driver.sh
 ```
 ```bash
 cd /mnt/data/luohaonan/workspace/racer
-MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_001 \
-  RESTART_OVERWRITE=1 NODE_RANK=2 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.155 \
-  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001 \
+MODE=racer_pinned_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_006 \
+  RESTART_OVERWRITE=1 MASTER_PORT_BASE=29500 RACER_RUNTIME_PORT_BASE=29610 CSD_PORT=7007 NODE_RANK=2 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.153 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_006 \
+  bash examples/pai_run_megatron_restart_driver.sh
+```
+```bash
+cd /mnt/data/luohaonan/workspace/racer
+MODE=racer_egm_remote_spare MODEL_SIZE=1.5b BASE_RUN_ID=gb200_pinned_1_5b_006 \
+  RESTART_OVERWRITE=1 MASTER_PORT_BASE=29500 RACER_RUNTIME_PORT_BASE=29610 CSD_PORT=7007 NODE_RANK=2 NNODES=2 NPROC_PER_NODE=4 MASTER_ADDR=10.101.226.153 \
+  OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_006 \
   bash examples/pai_run_megatron_restart_driver.sh
 ```
 
 5.3B 只改 `MODEL_SIZE`、`BASE_RUN_ID`、`OUTPUT_ROOT`：
 
 ```bash
-MODEL_SIZE=5.3b BASE_RUN_ID=gb200_pinned_5_3b_001 OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_5_3b_001
+MODEL_SIZE=5.3b BASE_RUN_ID=gb200_pinned_5_3b_006 OUTPUT_ROOT=/mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_5_3b_006
 ```
 
 ## 3. 正式测 EGM
@@ -187,7 +208,7 @@ capabilities()
 node0 完成后看：
 
 ```bash
-cat /mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_001/restart_state/gb200_pinned_1_5b_001/summary.md
+cat /mnt/data/luohaonan/workspace/pai_runs/gb200_pinned_1_5b_006/restart_state/gb200_pinned_1_5b_006/summary.md
 ```
 
 关键文件：
