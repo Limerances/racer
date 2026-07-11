@@ -7,6 +7,7 @@ CUDA GF kernels, and parity rows are returned to train-rank chunk owners.
 
 from __future__ import annotations
 
+from collections import deque
 import os
 import re
 import time
@@ -50,6 +51,14 @@ class DistributedStorePendingPut:
 
 
 @dataclass
+class _DistributedStoreInflightGroup:
+    state_index: int
+    pending: list[DistributedStorePendingPut]
+    retained: list[torch.Tensor]
+    nbytes: int
+
+
+@dataclass
 class DistributedStoreBatchHandle:
     states: list[DistributedStoreResult]
     chunk_storage: Any
@@ -62,6 +71,7 @@ class DistributedStoreBatchHandle:
     prepare_total_ms: float
     finalize_started: bool = False
     finalized: bool = False
+    prepare_error: BaseException | None = None
 
     @property
     def tags(self) -> list[str]:
@@ -495,6 +505,25 @@ def _wait_storage_puts(
                     storage_profile[count_key] = storage_profile.get(count_key, 0.0) + 1.0
     storage_profile["storage_wait_ms"] = (time.perf_counter() - wait_start) * 1000.0
     return storage_profile
+
+
+def _wait_storage_puts_deferred_error(
+    *,
+    chunk_storage: Any,
+    pending: Sequence[DistributedStorePendingPut],
+) -> tuple[dict[str, float], BaseException | None]:
+    """Wait every put so all CUDA IPC sources are releasable before reporting an error."""
+
+    storage_profile: dict[str, float] = {"storage_wait_ms": 0.0}
+    first_error: BaseException | None = None
+    for put in pending:
+        try:
+            put_profile = _wait_storage_puts(chunk_storage=chunk_storage, pending=[put])
+            _accumulate_profile(storage_profile, put_profile)
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    return storage_profile, first_error
 
 
 def _put_storage_chunks(
@@ -1305,11 +1334,55 @@ def prepare_distributed_store_many(
             }
         )
 
+    max_inflight_ec_groups = max(0, int(config.max_inflight_ec_groups))
     pending_puts_by_tag: list[list[DistributedStorePendingPut]] = [[] for _ in prepared]
     retained_tensors_by_tag: list[list[torch.Tensor]] = [
-        ([local_payload] if local_payload is not None else [])
+        (
+            [local_payload]
+            if max_inflight_ec_groups <= 0 and local_payload is not None
+            else []
+        )
         for _state, local_payload, _group_sizes in prepared
     ]
+    inflight_groups: deque[_DistributedStoreInflightGroup] = deque()
+    inflight_nbytes = 0
+    inflight_peak_groups = 0
+    inflight_peak_nbytes = 0
+    prepare_window_wait_ms_by_tag = [0.0 for _ in prepared]
+    deferred_window_error: BaseException | None = None
+
+    def drain_inflight_groups() -> float:
+        nonlocal inflight_nbytes, deferred_window_error
+        if not inflight_groups:
+            return 0.0
+
+        drained = list(inflight_groups)
+        inflight_groups.clear()
+        first_error: BaseException | None = None
+        total_wait_ms = 0.0
+        for entry in drained:
+            wait_profile, wait_error = _wait_storage_puts_deferred_error(
+                chunk_storage=chunk_storage,
+                pending=entry.pending,
+            )
+            _accumulate_profile(storage_profiles[entry.state_index], wait_profile)
+            wait_ms = float(wait_profile.get("storage_wait_ms", 0.0))
+            prepare_window_wait_ms_by_tag[entry.state_index] += wait_ms
+            total_wait_ms += wait_ms
+            if first_error is None and wait_error is not None:
+                first_error = wait_error
+
+        # Some receive slots are send/zero scratch and may not back a storage put.
+        # Complete their EC stream use before dropping the final strong references.
+        torch.cuda.current_stream(_current_cuda_device()).synchronize()
+        for entry in drained:
+            entry.pending.clear()
+            entry.retained.clear()
+        drained.clear()
+        inflight_nbytes = 0
+        if deferred_window_error is None and first_error is not None:
+            deferred_window_error = first_error
+        return total_wait_ms
 
     # Begin every child tag first. A single barrier then makes all manifests
     # visible before any rank starts sending data for the batch.
@@ -1339,6 +1412,7 @@ def prepare_distributed_store_many(
     execute_ms_by_tag: list[float] = []
     for state, local_payload, group_sizes in prepared:
         execute_start = time.perf_counter()
+        execute_window_wait_ms = 0.0
         data_rows_ms = 0.0
         parity_ms = 0.0
         data_bytes_sent = 0
@@ -1358,8 +1432,6 @@ def prepare_distributed_store_many(
                 if rank in config.train_ranks and group_nbytes > 0
                 else None
             )
-            if recv_slot4 is not None:
-                retained_tensors_by_tag[state_index].append(recv_slot4)
             # Delay tail padding until a send/placement actually consumes the
             # local packet so it can reuse this group's retained recv slot.
             group_local_slot_payload = (
@@ -1413,8 +1485,23 @@ def prepare_distributed_store_many(
                     rank=rank,
                 )
             )
-            pending_puts_by_tag[state_index].extend(group_pending)
-            retained_tensors_by_tag[state_index].extend(put.tensor for put in group_pending)
+            group_retained = [recv_slot4] if recv_slot4 is not None else []
+            group_retained.extend(put.tensor for put in group_pending)
+            if max_inflight_ec_groups > 0:
+                inflight_groups.append(
+                    _DistributedStoreInflightGroup(
+                        state_index=state_index,
+                        pending=group_pending,
+                        retained=group_retained,
+                        nbytes=group_nbytes,
+                    )
+                )
+                inflight_nbytes += int(group_nbytes)
+                inflight_peak_groups = max(inflight_peak_groups, len(inflight_groups))
+                inflight_peak_nbytes = max(inflight_peak_nbytes, inflight_nbytes)
+            else:
+                pending_puts_by_tag[state_index].extend(group_pending)
+                retained_tensors_by_tag[state_index].extend(group_retained)
             stored_nbytes += int(group_stored_nbytes)
             stored_count += int(group_stored_count)
             _accumulate_profile(storage_profile, group_storage_profile)
@@ -1422,7 +1509,16 @@ def prepare_distributed_store_many(
             # reachable from the handle until finalize waits the matching op.
             group_chunks.clear()
 
-        execute_ms_by_tag.append((time.perf_counter() - execute_start) * 1000.0)
+            if max_inflight_ec_groups > 0 and len(inflight_groups) >= max_inflight_ec_groups:
+                execute_window_wait_ms += drain_inflight_groups()
+                # Avoid keeping the just-drained group alive while the next allocation is evaluated.
+                recv_slot4 = None
+                group_pending = []
+                group_retained = []
+
+        execute_ms_by_tag.append(
+            max(0.0, (time.perf_counter() - execute_start) * 1000.0 - execute_window_wait_ms)
+        )
         assert state.profile is not None
         state.profile["data_rows_ms"] = data_rows_ms
         state.profile["parity_ms"] = parity_ms
@@ -1434,7 +1530,27 @@ def prepare_distributed_store_many(
         state.profile["local_storage_chunk_count"] = int(stored_count)
         state.profile["local_chunks_retained_nbytes"] = int(stored_nbytes)
         state.profile["local_chunks_retained_count"] = int(stored_count)
+        state.profile["storage_prepare_window_wait_ms"] = float(
+            prepare_window_wait_ms_by_tag[state_index]
+        )
         state.local_chunks.clear()
+
+    # Keep the incomplete tail asynchronous; the existing finalize path waits it and commits tags.
+    while inflight_groups:
+        entry = inflight_groups.popleft()
+        pending_puts_by_tag[entry.state_index].extend(entry.pending)
+        retained_tensors_by_tag[entry.state_index].extend(entry.retained)
+
+    for index, (state, _local_payload, _group_sizes) in enumerate(prepared):
+        assert state.profile is not None
+        state.profile["storage_prepare_window_wait_ms"] = float(
+            prepare_window_wait_ms_by_tag[index]
+        )
+        state.profile["ec_inflight_group_window"] = (
+            int(max_inflight_ec_groups) if index == 0 else 0
+        )
+        state.profile["ec_inflight_group_peak"] = int(inflight_peak_groups) if index == 0 else 0
+        state.profile["ec_inflight_bytes_peak"] = int(inflight_peak_nbytes) if index == 0 else 0
 
     return DistributedStoreBatchHandle(
         states=[state for state, _local_payload, _group_sizes in prepared],
@@ -1446,6 +1562,7 @@ def prepare_distributed_store_many(
         execute_ms_by_tag=execute_ms_by_tag,
         batch_start=batch_start,
         prepare_total_ms=(time.perf_counter() - batch_start) * 1000.0,
+        prepare_error=deferred_window_error,
     )
 
 
@@ -1539,6 +1656,24 @@ def finalize_distributed_store_many(
     if not handle.states:
         handle.finalized = True
         return []
+
+    if handle.prepare_error is not None:
+        deferred_error = handle.prepare_error
+        for index, _state in enumerate(handle.states):
+            wait_profile, wait_error = _wait_storage_puts_deferred_error(
+                chunk_storage=handle.chunk_storage,
+                pending=handle.pending_puts_by_tag[index],
+            )
+            _accumulate_profile(handle.storage_profiles[index], wait_profile)
+            if deferred_error is None and wait_error is not None:
+                deferred_error = wait_error
+            handle.pending_puts_by_tag[index].clear()
+            handle.retained_tensors_by_tag[index].clear()
+        handle.finalized = True
+        raise RuntimeError(
+            "RACER bounded EC window storage wait failed during prepare: "
+            f"{type(deferred_error).__name__}: {deferred_error}"
+        ) from deferred_error
 
     for index, state in enumerate(handle.states):
         storage_profile = handle.storage_profiles[index]

@@ -60,6 +60,7 @@ fi
 HOSTFILE="${HOSTFILE:-/mnt/workspace/pai_nodes.txt}"
 
 DATA_PATH="${DATA_PATH:-${WORKSPACE_ROOT}/data/my_shakespeare_text_document}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-${WORKSPACE_ROOT}/tokenizer/llama3_70b}"
 GPT2_VOCAB_FILE="${GPT2_VOCAB_FILE:-${VOCAB_FILE:-${WORKSPACE_ROOT}/gpt2_vocab/vocab.json}}"
 GPT2_MERGE_FILE="${GPT2_MERGE_FILE:-${MERGE_FILE:-${WORKSPACE_ROOT}/gpt2_vocab/merges.txt}}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${WORKSPACE_ROOT}/pai_runs}"
@@ -73,8 +74,10 @@ MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-}"
 MEGATRON_DATALOADER_PIN_MEMORY="${MEGATRON_DATALOADER_PIN_MEMORY:-}"
 
-TP_SIZE="${TP_SIZE:-1}"
-PP_SIZE="${PP_SIZE:-4}"
+TP_SIZE="${TP_SIZE:-}"
+PP_SIZE="${PP_SIZE:-}"
+SEQ_LENGTH="${SEQ_LENGTH:-1024}"
+MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-${SEQ_LENGTH}}"
 
 CSD_PORT="${CSD_PORT:-7007}"
 CSD_START_TIMEOUT_SECONDS="${CSD_START_TIMEOUT_SECONDS:-300}"
@@ -342,12 +345,17 @@ default_local_rank_range() {
   fi
 }
 
+MODEL_FAMILY=gpt
+MODEL_EXTRA_ARGS=()
+DATA_ARGS=()
 case "${MODEL_SIZE}" in
   1.5b)
     NUM_LAYERS="${NUM_LAYERS:-48}"
     HIDDEN_SIZE="${HIDDEN_SIZE:-1600}"
     FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-6400}"
     NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-25}"
+    TP_SIZE="${TP_SIZE:-1}"
+    PP_SIZE="${PP_SIZE:-4}"
     DEFAULT_GLOBAL_BATCH_SIZE=16
     DEFAULT_CSD_NATIVE_PINNED_TOTAL_BYTES=103079215104
     ;;
@@ -356,14 +364,72 @@ case "${MODEL_SIZE}" in
     HIDDEN_SIZE="${HIDDEN_SIZE:-2560}"
     FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-10240}"
     NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-40}"
+    TP_SIZE="${TP_SIZE:-1}"
+    PP_SIZE="${PP_SIZE:-4}"
     DEFAULT_GLOBAL_BATCH_SIZE=8
     DEFAULT_CSD_NATIVE_PINNED_TOTAL_BYTES=274877906944
     ;;
+  llama70b|70b)
+    # Llama 3 70B shape. TOKENIZER_MODEL points at the local Hugging Face
+    # tokenizer directory; the indexed performance corpus contains valid ids
+    # within its 128256-token vocabulary.
+    MODEL_FAMILY=llama
+    NUM_LAYERS="${NUM_LAYERS:-80}"
+    HIDDEN_SIZE="${HIDDEN_SIZE:-8192}"
+    FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-28672}"
+    NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-64}"
+    NUM_QUERY_GROUPS="${NUM_QUERY_GROUPS:-8}"
+    VOCAB_SIZE="${VOCAB_SIZE:-128256}"
+    ROTARY_BASE="${ROTARY_BASE:-500000}"
+    TP_SIZE="${TP_SIZE:-8}"
+    PP_SIZE="${PP_SIZE:-1}"
+    DEFAULT_GLOBAL_BATCH_SIZE=16
+    # These GB200 jobs have an 800 GiB cgroup limit. Keep about 100 GiB for
+    # trainer processes, NCCL, Python, and CSD metadata.
+    DEFAULT_CSD_NATIVE_PINNED_TOTAL_BYTES=751619276800
+    MODEL_EXTRA_ARGS=(
+      --group-query-attention
+      --num-query-groups "${NUM_QUERY_GROUPS}"
+      --kv-channels 128
+      --position-embedding-type rope
+      --rotary-base "${ROTARY_BASE}"
+      --rotary-percent 1.0
+      --swiglu
+      --normalization RMSNorm
+      --apply-layernorm-1p
+      --untie-embeddings-and-output-weights
+      --disable-bias-linear
+      --attention-dropout 0.0
+      --hidden-dropout 0.0
+      --grad-reduce-in-bf16
+      --sequence-parallel
+      --recompute-granularity full
+      --recompute-method uniform
+      --recompute-num-layers 1
+      --no-create-attention-mask-in-dataloader
+    )
+    ;;
   *)
-    echo "ERROR: MODEL_SIZE 只能是 1.5b 或 5.3b，当前是 ${MODEL_SIZE}" >&2
+    echo "ERROR: MODEL_SIZE 只能是 1.5b、5.3b 或 llama70b，当前是 ${MODEL_SIZE}" >&2
     exit 3
     ;;
 esac
+
+if [[ "${MODEL_FAMILY}" == "llama" ]]; then
+  DATA_ARGS=(
+    --data-path "${DATA_PATH}"
+    --tokenizer-type HuggingFaceTokenizer
+    --tokenizer-model "${TOKENIZER_MODEL}"
+    --split 949,50,1
+  )
+else
+  DATA_ARGS=(
+    --data-path "${DATA_PATH}"
+    --vocab-file "${GPT2_VOCAB_FILE}"
+    --merge-file "${GPT2_MERGE_FILE}"
+    --split 949,50,1
+  )
+fi
 
 NODE_RANK="$(detect_node_rank)"
 MASTER_ADDR="$(resolve_master_addr)"
@@ -426,8 +492,13 @@ require_path "${RACER_ROOT}" "RACER_ROOT"
 require_path "${MEGATRON_ROOT}/pretrain_gpt.py" "Megatron pretrain_gpt.py"
 if [[ "${DRY_RUN}" != "1" ]]; then
   require_indexed_dataset_prefix "${DATA_PATH}" "DATA_PATH"
-  require_path "${GPT2_VOCAB_FILE}" "GPT2_VOCAB_FILE"
-  require_path "${GPT2_MERGE_FILE}" "GPT2_MERGE_FILE"
+  if [[ "${MODEL_FAMILY}" == "gpt" ]]; then
+    require_path "${GPT2_VOCAB_FILE}" "GPT2_VOCAB_FILE"
+    require_path "${GPT2_MERGE_FILE}" "GPT2_MERGE_FILE"
+  else
+    require_path "${TOKENIZER_MODEL}/tokenizer.json" "Llama tokenizer.json"
+    require_path "${TOKENIZER_MODEL}/tokenizer_config.json" "Llama tokenizer_config.json"
+  fi
 fi
 
 mkdir -p "${CHECKPOINT_ROOT}" "${LOG_ROOT}"
@@ -947,6 +1018,12 @@ echo "MODE=${MODE}"
 echo "NODE_ROLE=${NODE_ROLE}"
 echo "DRY_RUN=${DRY_RUN}"
 echo "MODEL_SIZE=${MODEL_SIZE}"
+echo "MODEL_FAMILY=${MODEL_FAMILY}"
+echo "TP_SIZE=${TP_SIZE}"
+echo "PP_SIZE=${PP_SIZE}"
+echo "SEQ_LENGTH=${SEQ_LENGTH}"
+echo "MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS}"
+echo "TOKENIZER_MODEL=${TOKENIZER_MODEL}"
 echo "MEGATRON_EXTRA_ARGS=${MEGATRON_EXTRA_ARGS:-}"
 echo "MEGATRON_DATALOADER_PIN_MEMORY=${MEGATRON_DATALOADER_PIN_MEMORY}"
 echo "MASTER_ADDR=${MASTER_ADDR}"
@@ -1025,8 +1102,9 @@ torchrun \
   --hidden-size "${HIDDEN_SIZE}" \
   --ffn-hidden-size "${FFN_HIDDEN_SIZE}" \
   --num-attention-heads "${NUM_ATTENTION_HEADS}" \
-  --seq-length 1024 \
-  --max-position-embeddings 1024 \
+  "${MODEL_EXTRA_ARGS[@]}" \
+  --seq-length "${SEQ_LENGTH}" \
+  --max-position-embeddings "${MAX_POSITION_EMBEDDINGS}" \
   --attention-backend auto \
   --micro-batch-size "${MICRO_BATCH_SIZE}" \
   --global-batch-size "${GLOBAL_BATCH_SIZE}" \
@@ -1041,10 +1119,7 @@ torchrun \
   --no-bias-dropout-fusion \
   --use-distributed-optimizer \
   --ckpt-format torch \
-  --data-path "${DATA_PATH}" \
-  --vocab-file "${GPT2_VOCAB_FILE}" \
-  --merge-file "${GPT2_MERGE_FILE}" \
-  --split 949,50,1 \
+  "${DATA_ARGS[@]}" \
   --save "${CHECKPOINT_PATH}" \
   --load "${CHECKPOINT_PATH}" \
   --tensorboard-dir "${TENSORBOARD_DIR}" \

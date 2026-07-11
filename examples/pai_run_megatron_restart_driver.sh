@@ -22,6 +22,7 @@ MODE="${MODE:-racer_pinned_remote_spare}"
 MODEL_SIZE="${MODEL_SIZE:-1.5b}"
 BASE_RUN_ID="${BASE_RUN_ID:-}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${WORKSPACE_ROOT}/pai_runs/${MODEL_SIZE}_${MODE}_restart}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-${WORKSPACE_ROOT}/tokenizer/llama3_70b}"
 RESTART_OVERWRITE="${RESTART_OVERWRITE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 MEGATRON_EXTRA_ARGS="${MEGATRON_EXTRA_ARGS:-}"
@@ -41,10 +42,16 @@ CSD_PORT="${CSD_PORT:-7007}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
 RACER_RETAIN_CHECKPOINTS="${RACER_RETAIN_CHECKPOINTS:-1}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-}"
+TP_SIZE="${TP_SIZE:-}"
+PP_SIZE="${PP_SIZE:-}"
+SEQ_LENGTH="${SEQ_LENGTH:-1024}"
+MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-${SEQ_LENGTH}}"
 KILL_INTERVAL_ITERS="${KILL_INTERVAL_ITERS:-20}"
 KILL_COUNT="${KILL_COUNT:-3}"
 POST_KILL_TRAIN_ITERS="${POST_KILL_TRAIN_ITERS:-20}"
 FINAL_TRAIN_ITERS=$((KILL_INTERVAL_ITERS * KILL_COUNT + POST_KILL_TRAIN_ITERS))
+PRE_KILL_TRAIN_ITERS="${PRE_KILL_TRAIN_ITERS:-${FINAL_TRAIN_ITERS}}"
+FINAL_PHASE_STOP_AT_TARGET="${FINAL_PHASE_STOP_AT_TARGET:-0}"
 PHASE_COUNT=$((KILL_COUNT + 1))
 
 RACER_K="${RACER_K:-6}"
@@ -83,6 +90,8 @@ if [[ -z "${RACER_CSD_STRICT_DIRECT_IPC:-}" ]]; then
 fi
 RACER_CSD_SERIALIZE_READ_IPC="${RACER_CSD_SERIALIZE_READ_IPC:-0}"
 RACER_ASYNC_OFFLOAD="${RACER_ASYNC_OFFLOAD:-1}"
+RACER_AGGRESSIVE_CUDA_CLEANUP="${RACER_AGGRESSIVE_CUDA_CLEANUP:-0}"
+RACER_MAX_INFLIGHT_EC_GROUPS="${RACER_MAX_INFLIGHT_EC_GROUPS:-0}"
 RACER_BUFFER_SIZE="${RACER_BUFFER_SIZE:-1073741824}"
 if [[ -z "${RACER_PAYLOAD_POOL_PREWARM_CHUNKS:-}" ]]; then
   case "${MODE}" in
@@ -90,6 +99,7 @@ if [[ -z "${RACER_PAYLOAD_POOL_PREWARM_CHUNKS:-}" ]]; then
     *) RACER_PAYLOAD_POOL_PREWARM_CHUNKS=0 ;;
   esac
 fi
+RACER_PAYLOAD_POOL_PREWARM_AFTER_LOAD="${RACER_PAYLOAD_POOL_PREWARM_AFTER_LOAD:-1}"
 CSD_NATIVE_PINNED_TOTAL_BYTES="${CSD_NATIVE_PINNED_TOTAL_BYTES:-}"
 CSD_NATIVE_PINNED_SEGMENT_BYTES="${CSD_NATIVE_PINNED_SEGMENT_BYTES:-1073741824}"
 CSD_NATIVE_PINNED_DEVICE="${CSD_NATIVE_PINNED_DEVICE:-0}"
@@ -232,6 +242,37 @@ wait_for_save_then_kill() {
       echo "ERROR: phase ${phase} 等待 iteration ${target_iter} 保存完成超时，日志: ${log_path}" >&2
       terminate_group "${pid}"
       exit 8
+    fi
+    sleep "${MARKER_POLL_SECONDS}"
+  done
+}
+
+wait_for_iteration_then_stop() {
+  local phase="$1"
+  local target_iter="$2"
+  local pid="$3"
+  local log_path="$4"
+  local marker="$5"
+  local start now iteration_pattern
+  iteration_pattern="iteration[[:space:]]+${target_iter}[[:space:]]*/[[:space:]]*[0-9]+.*elapsed time per iteration"
+  start="$(date +%s)"
+  while true; do
+    if grep -Eq "${iteration_pattern}" \
+      "${log_path}" "${LOG_ROOT}/${BASE_RUN_ID}_${phase}.node"*.log 2>/dev/null; then
+      echo "final phase observed iteration ${target_iter}; terminating process group ${pid}"
+      date -u +"%Y-%m-%dT%H:%M:%SZ" > "${marker}"
+      terminate_group "${pid}"
+      return
+    fi
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      echo "ERROR: final phase ${phase} 在 iteration ${target_iter} 前退出，日志: ${log_path}" >&2
+      exit 9
+    fi
+    now="$(date +%s)"
+    if (( now - start > PHASE_TIMEOUT_SECONDS )); then
+      echo "ERROR: final phase ${phase} 等待 iteration ${target_iter} 超时，日志: ${log_path}" >&2
+      terminate_group "${pid}"
+      exit 10
     fi
     sleep "${MARKER_POLL_SECONDS}"
   done
@@ -403,6 +444,9 @@ if [[ -z "${CSD_EGM_TOTAL_BYTES}" ]]; then
           5.3b)
             CSD_EGM_TOTAL_BYTES=274877906944
             ;;
+          llama70b|70b)
+            CSD_EGM_TOTAL_BYTES=751619276800
+            ;;
           *)
             echo "ERROR: EGM 预分配无法识别 MODEL_SIZE=${MODEL_SIZE}" >&2
             exit 2
@@ -462,6 +506,11 @@ BASE_RUN_ID=${BASE_RUN_ID}
 MODE=${MODE}
 MODEL_SIZE=${MODEL_SIZE}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}
+TP_SIZE=${TP_SIZE}
+PP_SIZE=${PP_SIZE}
+SEQ_LENGTH=${SEQ_LENGTH}
+MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS}
+TOKENIZER_MODEL=${TOKENIZER_MODEL}
 MEGATRON_EXTRA_ARGS=${MEGATRON_EXTRA_ARGS}
 RACER_DEBUG_PAYLOAD_CHECKSUM=${RACER_DEBUG_PAYLOAD_CHECKSUM}
 RACER_DEBUG_STORAGE_READ_CHECKSUM=${RACER_DEBUG_STORAGE_READ_CHECKSUM}
@@ -478,6 +527,8 @@ KILL_INTERVAL_ITERS=${KILL_INTERVAL_ITERS}
 KILL_COUNT=${KILL_COUNT}
 POST_KILL_TRAIN_ITERS=${POST_KILL_TRAIN_ITERS}
 FINAL_TRAIN_ITERS=${FINAL_TRAIN_ITERS}
+PRE_KILL_TRAIN_ITERS=${PRE_KILL_TRAIN_ITERS}
+FINAL_PHASE_STOP_AT_TARGET=${FINAL_PHASE_STOP_AT_TARGET}
 RACER_K=${RACER_K}
 RACER_M=${RACER_M}
 RACER_TRAIN_RANKS=${RACER_TRAIN_RANKS}
@@ -494,8 +545,11 @@ RACER_CSD_STRICT_DIRECT_IPC=${RACER_CSD_STRICT_DIRECT_IPC}
 RACER_CSD_SERIALIZE_READ_IPC=${RACER_CSD_SERIALIZE_READ_IPC}
 RACER_EGM_DIRECT_IPC=${RACER_EGM_DIRECT_IPC}
 RACER_ASYNC_OFFLOAD=${RACER_ASYNC_OFFLOAD}
+RACER_AGGRESSIVE_CUDA_CLEANUP=${RACER_AGGRESSIVE_CUDA_CLEANUP}
+RACER_MAX_INFLIGHT_EC_GROUPS=${RACER_MAX_INFLIGHT_EC_GROUPS}
 RACER_BUFFER_SIZE=${RACER_BUFFER_SIZE}
 RACER_PAYLOAD_POOL_PREWARM_CHUNKS=${RACER_PAYLOAD_POOL_PREWARM_CHUNKS}
+RACER_PAYLOAD_POOL_PREWARM_AFTER_LOAD=${RACER_PAYLOAD_POOL_PREWARM_AFTER_LOAD}
 CSD_NATIVE_PINNED_TOTAL_BYTES=${CSD_NATIVE_PINNED_TOTAL_BYTES}
 CSD_NATIVE_PINNED_SEGMENT_BYTES=${CSD_NATIVE_PINNED_SEGMENT_BYTES}
 CSD_NATIVE_PINNED_DEVICE=${CSD_NATIVE_PINNED_DEVICE}
@@ -523,12 +577,19 @@ echo "NODE_ROLE=${NODE_ROLE}"
 echo "MODE=${MODE}"
 echo "MODEL_SIZE=${MODEL_SIZE}"
 echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
+echo "TP_SIZE=${TP_SIZE}"
+echo "PP_SIZE=${PP_SIZE}"
+echo "SEQ_LENGTH=${SEQ_LENGTH}"
+echo "MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS}"
+echo "TOKENIZER_MODEL=${TOKENIZER_MODEL}"
 echo "DRY_RUN=${DRY_RUN}"
 echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT_BASE=${MASTER_PORT_BASE}"
 echo "RACER_RUNTIME_PORT_BASE=${RACER_RUNTIME_PORT_BASE}"
 echo "CSD_PORT=${CSD_PORT}"
 echo "FINAL_TRAIN_ITERS=${FINAL_TRAIN_ITERS}"
+echo "PRE_KILL_TRAIN_ITERS=${PRE_KILL_TRAIN_ITERS}"
+echo "FINAL_PHASE_STOP_AT_TARGET=${FINAL_PHASE_STOP_AT_TARGET}"
 echo "STATE_DIR=${STATE_DIR}"
 
 for phase in $(seq 0 $((PHASE_COUNT - 1))); do
@@ -537,6 +598,7 @@ for phase in $(seq 0 $((PHASE_COUNT - 1))); do
   phase_log="${LOG_ROOT}/${phase_run_id}.driver.node${NODE_RANK}.log"
   phase_done="${STATE_DIR}/${phase_name}.node${NODE_RANK}.done"
   kill_marker="${STATE_DIR}/${phase_name}.kill"
+  final_stop_marker="${STATE_DIR}/${phase_name}.final_stop"
   master_port=$((MASTER_PORT_BASE + phase))
   runtime_port=$((RACER_RUNTIME_PORT_BASE + phase))
   if (( phase == 0 )); then
@@ -544,12 +606,24 @@ for phase in $(seq 0 $((PHASE_COUNT - 1))); do
   else
     csd_mode=existing
   fi
+  if (( phase < KILL_COUNT )); then
+    phase_train_iters="${PRE_KILL_TRAIN_ITERS}"
+  elif [[ "${FINAL_PHASE_STOP_AT_TARGET}" == "1" ]]; then
+    phase_train_iters="${PRE_KILL_TRAIN_ITERS}"
+  else
+    phase_train_iters="${FINAL_TRAIN_ITERS}"
+  fi
 
   echo "启动 ${phase_name}，日志 ${phase_log}"
   setsid env \
     MODE="${MODE}" \
     MODEL_SIZE="${MODEL_SIZE}" \
     GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE}" \
+    TP_SIZE="${TP_SIZE}" \
+    PP_SIZE="${PP_SIZE}" \
+    SEQ_LENGTH="${SEQ_LENGTH}" \
+    MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS}" \
+    TOKENIZER_MODEL="${TOKENIZER_MODEL}" \
     MEGATRON_EXTRA_ARGS="${MEGATRON_EXTRA_ARGS}" \
     RACER_DEBUG_PAYLOAD_CHECKSUM="${RACER_DEBUG_PAYLOAD_CHECKSUM}" \
     RACER_DEBUG_STORAGE_READ_CHECKSUM="${RACER_DEBUG_STORAGE_READ_CHECKSUM}" \
@@ -559,7 +633,7 @@ for phase in $(seq 0 $((PHASE_COUNT - 1))); do
     MASTER_ADDR="${MASTER_ADDR}" \
     MASTER_PORT="${master_port}" \
     RACER_RUNTIME_PORT="${runtime_port}" \
-    TRAIN_ITERS="${FINAL_TRAIN_ITERS}" \
+    TRAIN_ITERS="${phase_train_iters}" \
     SAVE_INTERVAL="${SAVE_INTERVAL}" \
     RUN_ID="${phase_run_id}" \
     OUTPUT_ROOT="${OUTPUT_ROOT}" \
@@ -584,8 +658,11 @@ for phase in $(seq 0 $((PHASE_COUNT - 1))); do
     RACER_CSD_SERIALIZE_READ_IPC="${RACER_CSD_SERIALIZE_READ_IPC}" \
     RACER_EGM_DIRECT_IPC="${RACER_EGM_DIRECT_IPC}" \
     RACER_ASYNC_OFFLOAD="${RACER_ASYNC_OFFLOAD}" \
+    RACER_AGGRESSIVE_CUDA_CLEANUP="${RACER_AGGRESSIVE_CUDA_CLEANUP}" \
+    RACER_MAX_INFLIGHT_EC_GROUPS="${RACER_MAX_INFLIGHT_EC_GROUPS}" \
     RACER_BUFFER_SIZE="${RACER_BUFFER_SIZE}" \
     RACER_PAYLOAD_POOL_PREWARM_CHUNKS="${RACER_PAYLOAD_POOL_PREWARM_CHUNKS}" \
+    RACER_PAYLOAD_POOL_PREWARM_AFTER_LOAD="${RACER_PAYLOAD_POOL_PREWARM_AFTER_LOAD}" \
     RACER_RETAIN_CHECKPOINTS="${RACER_RETAIN_CHECKPOINTS}" \
     CSD_NATIVE_PINNED_TOTAL_BYTES="${CSD_NATIVE_PINNED_TOTAL_BYTES}" \
     CSD_NATIVE_PINNED_SEGMENT_BYTES="${CSD_NATIVE_PINNED_SEGMENT_BYTES}" \
@@ -624,6 +701,28 @@ for phase in $(seq 0 $((PHASE_COUNT - 1))); do
         fi
         sleep "${MARKER_POLL_SECONDS}"
       done
+    fi
+    wait "${child_pid}" >/dev/null 2>&1 || true
+  elif [[ "${FINAL_PHASE_STOP_AT_TARGET}" == "1" ]]; then
+    if [[ "${DRY_RUN}" == "1" ]]; then
+      if (( NODE_RANK == 0 )) || [[ "${RESTART_STANDALONE}" == "1" ]]; then
+        date -u +"%Y-%m-%dT%H:%M:%SZ" > "${final_stop_marker}"
+      fi
+      wait "${child_pid}" >/dev/null 2>&1 || true
+    elif (( NODE_RANK == 0 )); then
+      wait_for_iteration_then_stop "${phase_name}" "${FINAL_TRAIN_ITERS}" "${child_pid}" "${phase_log}" "${final_stop_marker}"
+    else
+      while kill -0 "${child_pid}" >/dev/null 2>&1; do
+        if [[ -e "${final_stop_marker}" ]]; then
+          terminate_group "${child_pid}"
+          break
+        fi
+        sleep "${MARKER_POLL_SECONDS}"
+      done
+      if [[ ! -e "${final_stop_marker}" ]]; then
+        echo "ERROR: final phase ${phase_name} 在 stop marker 前退出，日志: ${phase_log}" >&2
+        exit 9
+      fi
     fi
     wait "${child_pid}" >/dev/null 2>&1 || true
   else

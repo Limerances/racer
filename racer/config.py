@@ -17,6 +17,7 @@ class RacerConfig:
     spare_ranks: tuple[int, ...]
     buffer_size: int = 64 * 1024 * 1024
     optimize_cauchy: bool = False
+    max_inflight_ec_groups: int = 0
 
     @property
     def w(self) -> int:
@@ -25,6 +26,7 @@ class RacerConfig:
     def __post_init__(self) -> None:
         object.__setattr__(self, "train_ranks", tuple(int(r) for r in self.train_ranks))
         object.__setattr__(self, "spare_ranks", tuple(int(r) for r in self.spare_ranks))
+        object.__setattr__(self, "max_inflight_ec_groups", int(self.max_inflight_ec_groups))
 
         if self.k + self.m != len(self.train_ranks):
             raise ValueError(
@@ -44,3 +46,5 @@ class RacerConfig:
             raise ValueError("spare_ranks must contain at least one spare GPU")
         if self.buffer_size <= 0:
             raise ValueError("buffer_size must be positive")
+        if self.max_inflight_ec_groups < 0:
+            raise ValueError("max_inflight_ec_groups must be non-negative")
