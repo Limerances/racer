@@ -65,6 +65,21 @@ _CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 1
 _CUDA_HOST_ALLOC_DEFAULT = 0
 _CUDA_ERROR_NOT_READY = 34
 _CUDA_ERROR_NOT_PERMITTED = 600
+_CUDA_IPC_PRODUCER_TOKEN_LOCK = threading.Lock()
+_CUDA_IPC_PRODUCER_TOKEN_PID = -1
+_CUDA_IPC_PRODUCER_TOKEN = ""
+
+
+def _cuda_ipc_producer_token() -> str:
+    """Return a process-lifetime identity that is safe across PID reuse/fork."""
+
+    global _CUDA_IPC_PRODUCER_TOKEN_PID, _CUDA_IPC_PRODUCER_TOKEN
+    pid = os.getpid()
+    with _CUDA_IPC_PRODUCER_TOKEN_LOCK:
+        if _CUDA_IPC_PRODUCER_TOKEN_PID != pid:
+            _CUDA_IPC_PRODUCER_TOKEN_PID = pid
+            _CUDA_IPC_PRODUCER_TOKEN = f"{pid}:{uuid.uuid4().hex}"
+        return _CUDA_IPC_PRODUCER_TOKEN
 
 
 def _visible_cuda_device_count() -> int:
@@ -451,6 +466,7 @@ class CudaIpcView:
             "requires_staging": bool(self.requires_staging),
             "staging_id": self.staging_id,
             "producer_pid": os.getpid(),
+            "producer_token": _cuda_ipc_producer_token(),
             "allocation_id": hashlib.sha1(bytes(self.mem_handle)).hexdigest(),
             "staging_kind": "persistent_slab" if self._staging_region is not None else ("none" if not self.requires_staging else "ephemeral"),
             "profile": dict(self.profile or {}),
@@ -571,6 +587,7 @@ def export_cuda_ipc_view(
         direct_ipc_enabled = global_direct or os.environ.get("RACER_CSD_DIRECT_READ_IPC", "0") == "1"
     else:
         direct_ipc_enabled = global_direct or os.environ.get("RACER_CSD_DIRECT_WRITE_IPC", "0") == "1"
+    strict_direct_ipc = os.environ.get("RACER_CSD_STRICT_DIRECT_IPC", "0") == "1"
     profile: dict[str, Any] = {
         "direct_ipc_enabled": bool(direct_ipc_enabled),
         "direct_ipc_role": role,
@@ -613,8 +630,16 @@ def export_cuda_ipc_view(
             )
         except Exception as exc:
             profile["direct_ipc_error"] = str(exc)
+            if strict_direct_ipc:
+                raise RuntimeError(
+                    f"strict direct CUDA IPC export failed for {role}: {exc}"
+                ) from exc
     else:
         profile["direct_ipc_error"] = "disabled"
+        if strict_direct_ipc:
+            raise RuntimeError(
+                f"strict direct CUDA IPC requires direct IPC to be enabled for {role}"
+            )
 
     pool = _get_staging_pool(device)
     alloc_start = time.perf_counter()
@@ -849,6 +874,8 @@ class _NativeSegment:
     ptr: int
     nbytes: int
     offset: int = 0
+    allocation_device: int | None = None
+    numa_id: int | None = None
 
 
 @dataclass
@@ -975,7 +1002,7 @@ class NativePinnedMemoryBackend(StorageBackend):
             self._new_segment(min(segment_size, remaining))
             remaining -= min(segment_size, remaining)
 
-    def _new_segment(self, nbytes: int) -> _NativeSegment:
+    def _new_segment(self, nbytes: int, *, allocation_device: int | None = None) -> _NativeSegment:
         cudart = _load_cudart()
         if cudart is None:
             raise RuntimeError("CUDA runtime is required for cudaHostAlloc")
@@ -988,6 +1015,21 @@ class NativePinnedMemoryBackend(StorageBackend):
         self._segments.append(segment)
         self._segment_by_id[segment.segment_id] = segment
         return segment
+
+    def _segment_matches_allocation(
+        self,
+        segment: _NativeSegment,
+        allocation_device: int | None,
+    ) -> bool:
+        """Return whether a segment may serve an allocation request.
+
+        Native pinned memory is accessible from every CUDA device, so its
+        default allocator remains device agnostic. Topology-aware backends can
+        override this hook to keep free-list and bump allocations local to the
+        CUDA device that owns a segment.
+        """
+
+        return True
 
     def pool_stats(self) -> dict[str, int]:
         with self._lock:
@@ -1008,11 +1050,20 @@ class NativePinnedMemoryBackend(StorageBackend):
         alignment = max(1, int(alignment))
         return (value + alignment - 1) // alignment * alignment
 
-    def _allocate_location(self, nbytes: int, *, alignment: int = 256) -> _NativeAllocation:
+    def _allocate_location(
+        self,
+        nbytes: int,
+        *,
+        alignment: int = 256,
+        allocation_device: int | None = None,
+    ) -> _NativeAllocation:
         nbytes = int(nbytes)
         allocate_start = time.perf_counter()
         with self._lock:
             for index, block in enumerate(list(self._free_blocks)):
+                segment = self._segment_by_id[block.segment_id]
+                if not self._segment_matches_allocation(segment, allocation_device):
+                    continue
                 aligned_offset = self._align(block.offset, alignment)
                 block_end = int(block.offset) + int(block.nbytes)
                 if aligned_offset + nbytes > block_end:
@@ -1026,7 +1077,6 @@ class NativePinnedMemoryBackend(StorageBackend):
                 if after_nbytes > 0:
                     self._free_blocks.append(_NativeFreeBlock(block.segment_id, int(after_offset), int(after_nbytes)))
                 self._coalesce_free_blocks_locked()
-                segment = self._segment_by_id[block.segment_id]
                 return _NativeAllocation(
                     segment=segment,
                     offset=int(aligned_offset),
@@ -1035,6 +1085,8 @@ class NativePinnedMemoryBackend(StorageBackend):
                     allocate_ms=(time.perf_counter() - allocate_start) * 1000.0,
                 )
             for segment in self._segments:
+                if not self._segment_matches_allocation(segment, allocation_device):
+                    continue
                 offset = self._align(segment.offset, alignment)
                 if offset + nbytes <= segment.nbytes:
                     segment.offset = offset + nbytes
@@ -1046,7 +1098,7 @@ class NativePinnedMemoryBackend(StorageBackend):
                         allocate_ms=(time.perf_counter() - allocate_start) * 1000.0,
                     )
             size = max(self.segment_bytes, self._align(nbytes, alignment))
-            segment = self._new_segment(size)
+            segment = self._new_segment(size, allocation_device=allocation_device)
             segment.offset = nbytes
             return _NativeAllocation(
                 segment=segment,
@@ -1102,6 +1154,10 @@ class NativePinnedMemoryBackend(StorageBackend):
             "offset": int(offset),
             "nbytes": int(nbytes),
         }
+        if segment.allocation_device is not None:
+            location["allocation_device"] = int(segment.allocation_device)
+        if segment.numa_id is not None:
+            location["numa_id"] = int(segment.numa_id)
         record_metadata = dict(metadata or {})
         record_metadata.update(
             {
@@ -1118,6 +1174,8 @@ class NativePinnedMemoryBackend(StorageBackend):
                 "offset": int(offset),
                 "allocation_source": allocation.source,
                 "allocation_ms": allocation.allocate_ms,
+                "allocation_device": segment.allocation_device,
+                "allocation_numa_id": segment.numa_id,
             }
         )
         chunk = BackendChunk(
@@ -1145,7 +1203,56 @@ class NativePinnedMemoryBackend(StorageBackend):
     @staticmethod
     def _ipc_cache_key(view: dict[str, Any]) -> str:
         digest = hashlib.sha1(bytes(view["mem_handle"])).hexdigest()
-        return f"{int(view.get('producer_pid', -1))}:{int(view['device'])}:{digest}"
+        producer = str(view.get("producer_token") or int(view.get("producer_pid", -1)))
+        # The opaque handle carries the CUDA allocation generation. A virtual
+        # base address is not sufficient because the caching allocator may
+        # reuse it for a different receive/parity allocation on the next save.
+        return f"{producer}:{int(view['device'])}:{digest}"
+
+    @staticmethod
+    def _producer_pid_is_alive(pid: int) -> bool:
+        if int(pid) <= 0:
+            return False
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except PermissionError:
+            return True
+        except ProcessLookupError:
+            return False
+
+    def _reap_retired_ipc_producers(
+        self,
+        *,
+        current_pid: int,
+        current_token: str,
+        cudart: Any,
+    ) -> None:
+        """Close idle imports only after their producer process has exited."""
+
+        retired_ptrs: list[int] = []
+        with self._ipc_lock:
+            for key, cached in list(self._ipc_mem_cache.items()):
+                if int(cached.get("refcount", 0)) > 0:
+                    continue
+                producer_token = str(cached.get("producer_token", ""))
+                if producer_token == str(current_token):
+                    continue
+                producer_pid = int(cached.get("producer_pid", -1))
+                if producer_pid != int(current_pid) and self._producer_pid_is_alive(producer_pid):
+                    continue
+                retired_ptrs.append(int(cached["ptr"]))
+                self._ipc_mem_cache.pop(str(key), None)
+        for ptr in retired_ptrs:
+            try:
+                _cuda_check(
+                    cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr)),
+                    "cudaIpcCloseMemHandle failed for retired producer",
+                )
+            except Exception:
+                # The exporting context is already gone. Its mapping must not
+                # be reused even if the runtime reports it as already invalid.
+                pass
 
     def _open_ipc_mem(self, view: dict[str, Any]) -> tuple[int, int | None, str, float, float, bool, float]:
         cudart = _load_cudart()
@@ -1154,58 +1261,62 @@ class NativePinnedMemoryBackend(StorageBackend):
         set_device_start = time.perf_counter()
         _cuda_set_device(int(view["device"]))
         set_device_ms = (time.perf_counter() - set_device_start) * 1000.0
-        cacheable = bool(view.get("requires_staging")) and bool(view.get("staging_id"))
-        cache_key = self._ipc_cache_key(view) if cacheable else ""
+        # A producer allocation may back multiple concurrent PUTs. CUDA returns
+        # the same imported pointer for repeated opens in one context, and
+        # closing one import while another copy still uses that allocation can
+        # block indefinitely inside cudaIpcCloseMemHandle. Share every imported
+        # allocation while it has active operations. Source mappings remain
+        # cached while their producer process is alive because GB200's runtime
+        # may block in a hot-path close even after copy events complete. They
+        # are reaped after producer exit; one-shot target mappings close after
+        # their final active reference.
+        producer_pid = int(view.get("producer_pid", -1))
+        producer_token = str(view.get("producer_token") or producer_pid)
+        self._reap_retired_ipc_producers(
+            current_pid=producer_pid,
+            current_token=producer_token,
+            cudart=cudart,
+        )
+        direct_role = str(dict(view.get("profile") or {}).get("direct_ipc_role", ""))
+        keep_idle = (
+            bool(view.get("requires_staging")) and bool(view.get("staging_id"))
+        ) or direct_role == "source"
+        cache_key = self._ipc_cache_key(view)
         open_start = time.perf_counter()
         opened_new = False
         remote_ptr_value: int
-        if cacheable:
-            with self._ipc_lock:
-                cached = self._ipc_mem_cache.get(cache_key)
-                if cached is not None:
-                    cached["refcount"] = int(cached.get("refcount", 0)) + 1
-                    cached["last_used_ns"] = time.monotonic_ns()
-                    remote_ptr_value = int(cached["ptr"])
-                else:
-                    remote_ptr = ctypes.c_void_p()
-                    mem_handle = _CudaIpcMemHandle()
-                    raw_mem_handle = bytes(view["mem_handle"])
-                    if len(raw_mem_handle) != 64:
-                        raise RuntimeError(f"CUDA IPC mem handle must be 64 bytes, got {len(raw_mem_handle)}")
-                    ctypes.memmove(ctypes.byref(mem_handle), raw_mem_handle, 64)
-                    _cuda_check(
-                        cudart.cudaIpcOpenMemHandle(
-                            ctypes.byref(remote_ptr),
-                            mem_handle,
-                            ctypes.c_uint(_CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS),
-                        ),
-                        "cudaIpcOpenMemHandle failed",
-                    )
-                    remote_ptr_value = int(remote_ptr.value)
-                    self._ipc_mem_cache[cache_key] = {
-                        "ptr": remote_ptr_value,
-                        "refcount": 1,
-                        "device": int(view["device"]),
-                        "last_used_ns": time.monotonic_ns(),
-                    }
-                    opened_new = True
-        else:
-            remote_ptr = ctypes.c_void_p()
-            mem_handle = _CudaIpcMemHandle()
-            raw_mem_handle = bytes(view["mem_handle"])
-            if len(raw_mem_handle) != 64:
-                raise RuntimeError(f"CUDA IPC mem handle must be 64 bytes, got {len(raw_mem_handle)}")
-            ctypes.memmove(ctypes.byref(mem_handle), raw_mem_handle, 64)
-            _cuda_check(
-                cudart.cudaIpcOpenMemHandle(
-                    ctypes.byref(remote_ptr),
-                    mem_handle,
-                    ctypes.c_uint(_CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS),
-                ),
-                "cudaIpcOpenMemHandle failed",
-            )
-            remote_ptr_value = int(remote_ptr.value)
-            opened_new = True
+        with self._ipc_lock:
+            cached = self._ipc_mem_cache.get(cache_key)
+            if cached is not None:
+                cached["refcount"] = int(cached.get("refcount", 0)) + 1
+                cached["last_used_ns"] = time.monotonic_ns()
+                remote_ptr_value = int(cached["ptr"])
+            else:
+                remote_ptr = ctypes.c_void_p()
+                mem_handle = _CudaIpcMemHandle()
+                raw_mem_handle = bytes(view["mem_handle"])
+                if len(raw_mem_handle) != 64:
+                    raise RuntimeError(f"CUDA IPC mem handle must be 64 bytes, got {len(raw_mem_handle)}")
+                ctypes.memmove(ctypes.byref(mem_handle), raw_mem_handle, 64)
+                _cuda_check(
+                    cudart.cudaIpcOpenMemHandle(
+                        ctypes.byref(remote_ptr),
+                        mem_handle,
+                        ctypes.c_uint(_CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS),
+                    ),
+                    "cudaIpcOpenMemHandle failed",
+                )
+                remote_ptr_value = int(remote_ptr.value)
+                self._ipc_mem_cache[cache_key] = {
+                    "ptr": remote_ptr_value,
+                    "refcount": 1,
+                    "device": int(view["device"]),
+                    "keep_idle": bool(keep_idle),
+                    "producer_pid": producer_pid,
+                    "producer_token": producer_token,
+                    "last_used_ns": time.monotonic_ns(),
+                }
+                opened_new = True
         ipc_open_us = (time.perf_counter() - open_start) * 1_000_000.0
         event = ctypes.c_void_p()
         event_handle = _CudaIpcEventHandle()
@@ -1214,12 +1325,16 @@ class NativePinnedMemoryBackend(StorageBackend):
             raise RuntimeError(f"CUDA IPC event handle must be 64 bytes, got {len(raw_event_handle)}")
         ctypes.memmove(ctypes.byref(event_handle), raw_event_handle, 64)
         event_open_start = time.perf_counter()
-        _cuda_check(
-            cudart.cudaIpcOpenEventHandle(ctypes.byref(event), event_handle),
-            "cudaIpcOpenEventHandle failed",
-        )
+        try:
+            _cuda_check(
+                cudart.cudaIpcOpenEventHandle(ctypes.byref(event), event_handle),
+                "cudaIpcOpenEventHandle failed",
+            )
+        except BaseException:
+            self._release_ipc_cache_ref(cache_key)
+            raise
         event_open_us = (time.perf_counter() - event_open_start) * 1_000_000.0
-        return remote_ptr_value, int(event.value), (cache_key if cacheable else ""), ipc_open_us, event_open_us, opened_new, set_device_ms
+        return remote_ptr_value, int(event.value), cache_key, ipc_open_us, event_open_us, opened_new, set_device_ms
 
     def _get_copy_stream(self, device: int) -> int:
         cudart = _load_cudart()
@@ -1275,13 +1390,23 @@ class NativePinnedMemoryBackend(StorageBackend):
         cudart = _load_cudart()
         if cudart is None:
             return
+        close_ptr: int | None = None
         with self._ipc_lock:
             cached = self._ipc_mem_cache.get(str(cache_key))
             if cached is None:
                 return
             cached["refcount"] = max(0, int(cached.get("refcount", 0)) - 1)
             cached["last_used_ns"] = time.monotonic_ns()
-            self._evict_idle_ipc_cache_locked(cudart)
+            if int(cached["refcount"]) == 0 and not bool(cached.get("keep_idle", False)):
+                close_ptr = int(cached["ptr"])
+                self._ipc_mem_cache.pop(str(cache_key), None)
+            else:
+                self._evict_idle_ipc_cache_locked(cudart)
+        if close_ptr is not None:
+            _cuda_check(
+                cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(close_ptr)),
+                "cudaIpcCloseMemHandle failed",
+            )
 
     def _evict_idle_ipc_cache_locked(self, cudart: Any) -> None:
         max_entries = int(self._ipc_mem_cache_max_entries)
@@ -1291,6 +1416,10 @@ class NativePinnedMemoryBackend(StorageBackend):
             (str(key), int(value.get("last_used_ns", 0)), int(value.get("ptr", 0)))
             for key, value in self._ipc_mem_cache.items()
             if int(value.get("refcount", 0)) <= 0
+            and not (
+                bool(value.get("keep_idle", False))
+                and self._producer_pid_is_alive(int(value.get("producer_pid", -1)))
+            )
         ]
         if max_entries == 0:
             victims = idle
@@ -1316,10 +1445,14 @@ class NativePinnedMemoryBackend(StorageBackend):
         metadata: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         nbytes = int(view["nbytes"])
-        allocation = self._allocate_location(nbytes)
+        allocation = self._allocate_location(nbytes, allocation_device=int(view["device"]))
         segment = allocation.segment
         offset = allocation.offset
         location = {"backend": self.name, "segment_id": segment.segment_id, "offset": int(offset), "nbytes": nbytes}
+        if segment.allocation_device is not None:
+            location["allocation_device"] = int(segment.allocation_device)
+        if segment.numa_id is not None:
+            location["numa_id"] = int(segment.numa_id)
         record_metadata = dict(metadata or {})
         record_metadata.update(
             {
@@ -1338,6 +1471,8 @@ class NativePinnedMemoryBackend(StorageBackend):
                 "offset": int(offset),
                 "allocation_source": allocation.source,
                 "allocation_ms": allocation.allocate_ms,
+                "allocation_device": segment.allocation_device,
+                "allocation_numa_id": segment.numa_id,
             }
         )
         chunk = BackendChunk(
@@ -1400,6 +1535,8 @@ class NativePinnedMemoryBackend(StorageBackend):
                 profile={
                     "daemon_allocate_ms": allocation.allocate_ms,
                     "daemon_allocate_source": allocation.source,
+                    "daemon_allocation_device": segment.allocation_device,
+                    "daemon_allocation_numa_id": segment.numa_id,
                     "daemon_ipc_open_us": ipc_open_us,
                     "daemon_ipc_event_open_us": event_open_us,
                     "daemon_ipc_opened_new": opened_new,
@@ -1529,11 +1666,12 @@ class NativePinnedMemoryBackend(StorageBackend):
         assert cudart is not None
         try:
             profile = dict(op.profile or {})
-            try:
-                profile["daemon_event_wait_ms"] = _cuda_event_elapsed_ms(op.wait_start_event, op.copy_start_event)
-                profile["daemon_memcpy_ms_cuda_event"] = _cuda_event_elapsed_ms(op.copy_start_event, op.complete_event)
-            except Exception as exc:
-                profile["daemon_event_timing_error"] = str(exc)
+            if os.environ.get("RACER_CSD_CUDA_EVENT_TIMING", "0") == "1":
+                try:
+                    profile["daemon_event_wait_ms"] = _cuda_event_elapsed_ms(op.wait_start_event, op.copy_start_event)
+                    profile["daemon_memcpy_ms_cuda_event"] = _cuda_event_elapsed_ms(op.copy_start_event, op.complete_event)
+                except Exception as exc:
+                    profile["daemon_event_timing_error"] = str(exc)
             op.profile = profile
             op.done = True
         except BaseException as exc:
@@ -1842,34 +1980,73 @@ class EgmBackend(StorageBackend):
             allocation_id = f"{_safe_tag(tag)}:{_safe_tag(chunk_id)}"
         offset = int(record_metadata.get("offset", location.get("offset", 0)) or 0)
         access_handle = record_metadata.get("access_handle", location.get("access_handle"))
+        pool_id = record_metadata.get("pool_id", location.get("pool_id", self.pool_id))
+        source_device_raw = record_metadata.get(
+            "source_device",
+            record_metadata.get(
+                "allocation_device",
+                location.get(
+                    "source_device",
+                    location.get(
+                        "allocation_device",
+                        record_metadata.get("egm_home_device", location.get("home_device", self.home_device)),
+                    ),
+                ),
+            ),
+        )
+        source_device = int(self.home_device if source_device_raw is None else source_device_raw)
+        pool_home_device = int(
+            record_metadata.get("egm_home_device", location.get("home_device", source_device))
+        )
+        numa_id_raw = record_metadata.get("egm_numa_id", location.get("numa_id", self.numa_id))
+        pool_numa_id = None if numa_id_raw is None else int(numa_id_raw)
+        accessing_devices = record_metadata.get("egm_accessing_devices")
+        if accessing_devices is None:
+            accessing_devices = list(self.accessing_devices)
+        stored_device = str(record_metadata.get("stored_device", "") or "")
+        if not stored_device.startswith("cuda:"):
+            stored_device = f"cuda:{source_device}"
+        daemon_storage_device = str(record_metadata.get("daemon_storage_device", "") or "")
+        if not daemon_storage_device:
+            daemon_storage_device = (
+                f"host_numa:{pool_numa_id}" if pool_numa_id is not None else "host_numa"
+            )
         location.update(
             {
                 "backend": self.name,
-                "pool_id": record_metadata.get("pool_id", self.pool_id),
+                "pool_id": pool_id,
                 "allocation_id": allocation_id,
                 "offset": offset,
                 "nbytes": int(nbytes),
                 "owner_node": record_metadata.get("owner_node", self.owner_node),
                 "owner_tray": record_metadata.get("owner_tray", self.owner_tray),
                 "access_handle": access_handle,
+                "source_device": source_device,
+                "allocation_device": source_device,
+                "home_device": pool_home_device,
+                "numa_id": pool_numa_id,
             }
         )
         record_metadata.update(
             {
                 "storage_backend": self.name,
                 "storage_transport": "egm_native",
-                "stored_device": f"cuda:{self.home_device}",
+                "stored_device": stored_device,
+                "daemon_storage_device": daemon_storage_device,
                 "daemon_owned": True,
                 "egm_native": True,
-                "egm_pool_id": location.get("pool_id"),
+                "pool_id": pool_id,
+                "egm_pool_id": pool_id,
                 "egm_allocation_id": allocation_id,
                 "egm_offset": offset,
                 "egm_owner_node": location.get("owner_node"),
                 "egm_owner_tray": location.get("owner_tray"),
                 "egm_access_handle": access_handle,
-                "egm_home_device": int(self.home_device),
-                "egm_numa_id": self.numa_id,
-                "egm_accessing_devices": list(self.accessing_devices),
+                "source_device": source_device,
+                "allocation_device": source_device,
+                "egm_home_device": pool_home_device,
+                "egm_numa_id": pool_numa_id,
+                "egm_accessing_devices": list(accessing_devices),
                 "egm_page_size": int(self.page_size),
                 "nbytes": int(nbytes),
                 "offset": offset,

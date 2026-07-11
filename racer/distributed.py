@@ -8,6 +8,7 @@ CUDA GF kernels, and parity rows are returned to train-rank chunk owners.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
@@ -38,6 +39,33 @@ class DistributedStoreResult:
     @property
     def routing_cost(self):
         return self.plan.cost
+
+
+@dataclass
+class DistributedStorePendingPut:
+    tag: str
+    chunk_id: str
+    op_id: str
+    tensor: torch.Tensor
+
+
+@dataclass
+class DistributedStoreBatchHandle:
+    states: list[DistributedStoreResult]
+    chunk_storage: Any
+    rank: int
+    pending_puts_by_tag: list[list[DistributedStorePendingPut]]
+    retained_tensors_by_tag: list[list[torch.Tensor]]
+    storage_profiles: list[dict[str, float]]
+    execute_ms_by_tag: list[float]
+    batch_start: float
+    prepare_total_ms: float
+    finalize_started: bool = False
+    finalized: bool = False
+
+    @property
+    def tags(self) -> list[str]:
+        return [state.tag for state in self.states]
 
 
 @dataclass
@@ -98,6 +126,20 @@ def _barrier(process_group: Any | None = None) -> None:
         dist.barrier()
     else:
         process_group.barrier().wait()
+
+
+def _stream_barrier(process_group: Any) -> None:
+    """Order runtime-PG work on the current CUDA stream without CPU waiting.
+
+    ProcessGroupNCCL treats barrier().wait() specially and synchronizes the
+    CPU thread. synchronize() only installs the CUDA stream dependency,
+    retaining the P2P ordering boundary without defeating asynchronous launch.
+    """
+
+    if process_group is None:
+        raise RuntimeError("RACER stream barrier requires an explicit process group")
+    work = process_group.barrier()
+    work.synchronize()
 
 
 def _chunk_id(reduction_group_index: int, row: int) -> str:
@@ -385,21 +427,20 @@ def _begin_storage_checkpoint(
     return storage_profile
 
 
-def _put_storage_chunks(
+def _enqueue_storage_chunks(
     *,
     chunk_storage: Any,
     state: DistributedStoreResult,
     chunks: Mapping[str, torch.Tensor],
     rank: int,
-) -> tuple[int, int, dict[str, float]]:
+) -> tuple[int, int, dict[str, float], list[DistributedStorePendingPut]]:
     zero_chunks = _zero_data_chunk_ids(state.manifest)
     storage_profile: dict[str, float] = {
         "storage_enqueue_ms": 0.0,
-        "storage_wait_ms": 0.0,
     }
     stored_nbytes = 0
     stored_count = 0
-    futures: list[tuple[str, torch.Tensor]] = []
+    pending: list[DistributedStorePendingPut] = []
     use_cuda_ipc = _storage_supports_cuda_ipc(chunk_storage)
     enqueue_start = time.perf_counter()
     for chunk_id, chunk in chunks.items():
@@ -414,7 +455,14 @@ def _put_storage_chunks(
             metadata["manifest_update_mode"] = str(manifest_update_mode)
         if use_cuda_ipc and chunk.device.type == "cuda":
             op_id = chunk_storage.put_cuda_tensor(state.tag, chunk_id, chunk, metadata)
-            futures.append((op_id, chunk))
+            pending.append(
+                DistributedStorePendingPut(
+                    tag=state.tag,
+                    chunk_id=str(chunk_id),
+                    op_id=str(op_id),
+                    tensor=chunk,
+                )
+            )
         else:
             raise RuntimeError(
                 "RACER distributed store requires daemon storage with CUDA IPC async write support; "
@@ -423,9 +471,18 @@ def _put_storage_chunks(
         stored_nbytes += int(chunk.numel())
         stored_count += 1
     storage_profile["storage_enqueue_ms"] = (time.perf_counter() - enqueue_start) * 1000.0
+    return stored_nbytes, stored_count, storage_profile, pending
+
+
+def _wait_storage_puts(
+    *,
+    chunk_storage: Any,
+    pending: Sequence[DistributedStorePendingPut],
+) -> dict[str, float]:
+    storage_profile: dict[str, float] = {"storage_wait_ms": 0.0}
     wait_start = time.perf_counter()
-    for op_id, _chunk in futures:
-        result = chunk_storage.wait(op_id)
+    for put in pending:
+        result = chunk_storage.wait(put.op_id)
         if isinstance(result, dict):
             profile = result.get("profile")
             if isinstance(profile, dict):
@@ -437,6 +494,27 @@ def _put_storage_chunks(
                     count_key = f"csd_daemon_allocate_source_{source}_count"
                     storage_profile[count_key] = storage_profile.get(count_key, 0.0) + 1.0
     storage_profile["storage_wait_ms"] = (time.perf_counter() - wait_start) * 1000.0
+    return storage_profile
+
+
+def _put_storage_chunks(
+    *,
+    chunk_storage: Any,
+    state: DistributedStoreResult,
+    chunks: Mapping[str, torch.Tensor],
+    rank: int,
+) -> tuple[int, int, dict[str, float]]:
+    stored_nbytes, stored_count, storage_profile, pending = _enqueue_storage_chunks(
+        chunk_storage=chunk_storage,
+        state=state,
+        chunks=chunks,
+        rank=rank,
+    )
+    wait_profile = _wait_storage_puts(
+        chunk_storage=chunk_storage,
+        pending=pending,
+    )
+    _accumulate_profile(storage_profile, wait_profile)
     return stored_nbytes, stored_count, storage_profile
 
 
@@ -1071,6 +1149,463 @@ def distributed_store(
         state.profile["local_chunks_released_nbytes"] = int(released_nbytes)
         state.profile["local_chunks_released_count"] = int(released_count)
     return state
+
+
+def prepare_distributed_store_many(
+    *,
+    config: RacerConfig,
+    tags: Sequence[str],
+    local_packets: Sequence[torch.Tensor | None],
+    process_group: Any | None = None,
+    chunk_storage: Any | None = None,
+    packet_sizes_by_tag: Mapping[str, Mapping[int, int]] | None = None,
+) -> DistributedStoreBatchHandle:
+    """Prepare a batch on the caller thread and enqueue strict CUDA-IPC writes.
+
+    Each tag keeps its own manifest, erasure-code layout, and daemon-owned chunks.
+    This phase owns every RACER NCCL/EC launch and every runtime-process-group
+    barrier. It enqueues daemon CUDA-IPC PUTs but deliberately does not wait or
+    commit them, so callers may move the returned handle to a background thread.
+
+    ``packet_sizes_by_tag`` follows the same semantics as
+    :func:`distributed_store`'s ``packet_sizes_by_rank`` argument, keyed by tag.
+    Train-rank packet tensors must have disjoint storage because every packet
+    remains live in the handle until :func:`finalize_distributed_store_many`
+    completes its local CSD waits.
+    """
+
+    batch_start = time.perf_counter()
+    normalized_tags = [str(tag) for tag in tags]
+    packets = list(local_packets)
+    if len(normalized_tags) != len(packets):
+        raise ValueError(
+            "prepare_distributed_store_many requires one local packet per tag; "
+            f"tags={len(normalized_tags)}, local_packets={len(packets)}"
+        )
+    if len(set(normalized_tags)) != len(normalized_tags):
+        raise ValueError("prepare_distributed_store_many requires unique tags")
+    if not normalized_tags:
+        return DistributedStoreBatchHandle(
+            states=[],
+            chunk_storage=chunk_storage,
+            rank=0,
+            pending_puts_by_tag=[],
+            retained_tensors_by_tag=[],
+            storage_profiles=[],
+            execute_ms_by_tag=[],
+            batch_start=batch_start,
+            prepare_total_ms=(time.perf_counter() - batch_start) * 1000.0,
+        )
+    if chunk_storage is None:
+        raise RuntimeError(
+            "prepare_distributed_store_many requires daemon-owned checkpoint storage; "
+            "in-process/local-chunk fallback is disabled"
+        )
+
+    _require_nccl(process_group)
+    rank = _rank(process_group)
+    layout = ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m)
+    E = cauchy.generate_systematic_matrix(config.k, config.m, config.w, optimize=config.optimize_cauchy)
+    supplied_sizes = {
+        str(tag): {int(owner): int(nbytes) for owner, nbytes in dict(sizes).items()}
+        for tag, sizes in dict(packet_sizes_by_tag or {}).items()
+    }
+
+    prepared: list[tuple[DistributedStoreResult, torch.Tensor | None, dict[int, int]]] = []
+    storage_profiles: list[dict[str, float]] = []
+    payload_ranges: list[tuple[torch.device, int, int, str]] = []
+    for tag, local_packet in zip(normalized_tags, packets):
+        store_start = time.perf_counter()
+        if rank in config.spare_ranks and local_packet is not None:
+            raise ValueError("spare ranks must pass local_packet=None")
+        if rank in config.train_ranks and local_packet is None:
+            raise ValueError(f"train rank {rank} must pass its local checkpoint packet")
+
+        local_payload = _cuda_payload(local_packet)
+        if local_payload is not None and int(local_payload.numel()) > 0:
+            payload_start = int(local_payload.data_ptr())
+            payload_end = payload_start + int(local_payload.numel()) * int(local_payload.element_size())
+            for prior_device, prior_start, prior_end, prior_tag in payload_ranges:
+                if local_payload.device == prior_device and payload_start < prior_end and prior_start < payload_end:
+                    raise ValueError(
+                        "prepare_distributed_store_many train-rank packets must not alias; "
+                        f"tags {prior_tag!r} and {tag!r} overlap the same staging storage. "
+                        "Use a distinct CUDA staging slot for every batched tag."
+                    )
+            payload_ranges.append(
+                (local_payload.device, payload_start, payload_end, tag)
+            )
+        setup_ms = (time.perf_counter() - store_start) * 1000.0
+        sizing_start = time.perf_counter()
+        if tag not in supplied_sizes:
+            packet_sizes = _packet_sizes_by_rank(config, local_payload, process_group)
+        else:
+            packet_sizes = dict(supplied_sizes[tag])
+            missing = [int(owner) for owner in config.train_ranks if int(owner) not in packet_sizes]
+            if missing:
+                raise ValueError(f"packet_sizes_by_tag[{tag!r}] is missing train ranks {missing}")
+        group_sizes = _group_nbytes(layout, packet_sizes)
+        plan = routing.make_planner(config).plan(layout, E, max(group_sizes.values(), default=0))
+        sizing_ms = (time.perf_counter() - sizing_start) * 1000.0
+
+        manifest_start = time.perf_counter()
+        manifest = _build_storage_manifest(
+            tag=tag,
+            config=config,
+            layout=layout,
+            matrix=E,
+            plan=plan,
+            group_nbytes=group_sizes,
+            packet_sizes=packet_sizes,
+        )
+        manifest_ms = (time.perf_counter() - manifest_start) * 1000.0
+        state = DistributedStoreResult(
+            tag=tag,
+            config=config,
+            layout=layout,
+            matrix=E,
+            plan=plan,
+            local_chunks={},
+            packet_nbytes_by_rank=packet_sizes,
+            manifest=manifest,
+            profile={
+                "setup_ms": setup_ms,
+                "sizing_ms": sizing_ms,
+                "data_rows_ms": 0.0,
+                "parity_ms": 0.0,
+                "final_barrier_ms": 0.0,
+                "manifest_ms": manifest_ms,
+                "storage_ms": 0.0,
+                "group_transfer_barrier_ms": 0.0,
+                "group_storage_barrier_ms": 0.0,
+                "data_rows_bytes_sent": 0,
+                "parity_bytes_sent": 0,
+                "local_storage_nbytes": 0,
+                "local_storage_chunk_count": 0,
+            },
+        )
+        prepared.append((state, local_payload, group_sizes))
+        storage_profiles.append(
+            {
+                "storage_begin_ms": 0.0,
+                "storage_begin_barrier_ms": 0.0,
+                "storage_enqueue_barrier_ms": 0.0,
+                "storage_wait_ms": 0.0,
+                "storage_commit_pre_barrier_ms": 0.0,
+                "storage_commit_ms": 0.0,
+                "storage_commit_post_barrier_ms": 0.0,
+                "storage_commit_retry_count": 0.0,
+            }
+        )
+
+    pending_puts_by_tag: list[list[DistributedStorePendingPut]] = [[] for _ in prepared]
+    retained_tensors_by_tag: list[list[torch.Tensor]] = [
+        ([local_payload] if local_payload is not None else [])
+        for _state, local_payload, _group_sizes in prepared
+    ]
+
+    # Begin every child tag first. A single barrier then makes all manifests
+    # visible before any rank starts sending data for the batch.
+    for index, (state, _local_payload, _group_sizes) in enumerate(prepared):
+        coordinator = int(state.config.train_ranks[0])
+        if _per_node_csd_enabled():
+            local_owner_ranks = _local_csd_owner_ranks(rank)
+            should_begin = rank == _local_csd_coordinator_rank(rank)
+            expected_chunks = _expected_storage_chunk_count_for_ranks(state.manifest, local_owner_ranks)
+        else:
+            should_begin = rank == coordinator
+            expected_chunks = _expected_storage_chunk_count(state.manifest)
+        if should_begin:
+            begin_start = time.perf_counter()
+            chunk_storage.begin(
+                state.tag,
+                manifest_base=state.manifest or {},
+                expected_chunks=expected_chunks,
+            )
+            storage_profiles[index]["storage_begin_ms"] = (time.perf_counter() - begin_start) * 1000.0
+    begin_barrier_start = time.perf_counter()
+    _barrier(process_group)
+    storage_profiles[-1]["storage_begin_barrier_ms"] = (
+        time.perf_counter() - begin_barrier_start
+    ) * 1000.0
+
+    execute_ms_by_tag: list[float] = []
+    for state, local_payload, group_sizes in prepared:
+        execute_start = time.perf_counter()
+        data_rows_ms = 0.0
+        parity_ms = 0.0
+        data_bytes_sent = 0
+        parity_bytes_sent = 0
+        group_transfer_barrier_ms = 0.0
+        stored_nbytes = 0
+        stored_count = 0
+        state_index = len(execute_ms_by_tag)
+        storage_profile = storage_profiles[state_index]
+
+        for group in layout.reduction_groups:
+            group_chunks: dict[str, torch.Tensor] = {}
+            group_index = int(group[0].relative_index)
+            group_nbytes = int(group_sizes[group_index])
+            recv_slot4 = (
+                torch.empty(group_nbytes, dtype=torch.uint8, device=_current_cuda_device())
+                if rank in config.train_ranks and group_nbytes > 0
+                else None
+            )
+            if recv_slot4 is not None:
+                retained_tensors_by_tag[state_index].append(recv_slot4)
+            group_local_slot_payload: dict[int, torch.Tensor] = {}
+            if rank in config.train_ranks and local_payload is not None:
+                group_local_slot_payload[rank] = _payload_store_slot(
+                    local_payload,
+                    int(group_sizes[group_index]),
+                    device=_current_cuda_device(),
+                )
+
+            data_rows_start = time.perf_counter()
+            data_bytes_sent += _store_data_rows_for_group(
+                rank=rank,
+                config=config,
+                group=group,
+                group_nbytes=group_sizes,
+                local_slot_payload=group_local_slot_payload,
+                local_chunks=group_chunks,
+                receive_slot=recv_slot4,
+                zero_send_slot=recv_slot4,
+                row_sink=None,
+                process_group=process_group,
+            )
+            data_rows_ms += (time.perf_counter() - data_rows_start) * 1000.0
+
+            parity_start = time.perf_counter()
+            parity_bytes_sent += _store_spare_compute_parity_cuda_for_group(
+                rank=rank,
+                config=config,
+                group=group,
+                E=E,
+                group_nbytes=group_sizes,
+                local_slot_payload=group_local_slot_payload,
+                local_chunks=group_chunks,
+                receive_slot=recv_slot4,
+                zero_send_slot=recv_slot4,
+                row_sink=None,
+                process_group=process_group,
+            )
+            parity_ms += (time.perf_counter() - parity_start) * 1000.0
+
+            transfer_barrier_start = time.perf_counter()
+            _stream_barrier(process_group)
+            group_transfer_barrier_ms += (
+                time.perf_counter() - transfer_barrier_start
+            ) * 1000.0
+
+            group_stored_nbytes, group_stored_count, group_storage_profile, group_pending = (
+                _enqueue_storage_chunks(
+                    chunk_storage=chunk_storage,
+                    state=state,
+                    chunks=group_chunks,
+                    rank=rank,
+                )
+            )
+            pending_puts_by_tag[state_index].extend(group_pending)
+            retained_tensors_by_tag[state_index].extend(put.tensor for put in group_pending)
+            stored_nbytes += int(group_stored_nbytes)
+            stored_count += int(group_stored_count)
+            _accumulate_profile(storage_profile, group_storage_profile)
+            # Every receive slot and every tensor exported through CUDA IPC stays
+            # reachable from the handle until finalize waits the matching op.
+            group_chunks.clear()
+
+        execute_ms_by_tag.append((time.perf_counter() - execute_start) * 1000.0)
+        assert state.profile is not None
+        state.profile["data_rows_ms"] = data_rows_ms
+        state.profile["parity_ms"] = parity_ms
+        state.profile["group_transfer_barrier_ms"] = group_transfer_barrier_ms
+        state.profile["group_storage_barrier_ms"] = 0.0
+        state.profile["data_rows_bytes_sent"] = int(data_bytes_sent)
+        state.profile["parity_bytes_sent"] = int(parity_bytes_sent)
+        state.profile["local_storage_nbytes"] = int(stored_nbytes)
+        state.profile["local_storage_chunk_count"] = int(stored_count)
+        state.profile["local_chunks_retained_nbytes"] = int(stored_nbytes)
+        state.profile["local_chunks_retained_count"] = int(stored_count)
+        state.local_chunks.clear()
+
+    return DistributedStoreBatchHandle(
+        states=[state for state, _local_payload, _group_sizes in prepared],
+        chunk_storage=chunk_storage,
+        rank=rank,
+        pending_puts_by_tag=pending_puts_by_tag,
+        retained_tensors_by_tag=retained_tensors_by_tag,
+        storage_profiles=storage_profiles,
+        execute_ms_by_tag=execute_ms_by_tag,
+        batch_start=batch_start,
+        prepare_total_ms=(time.perf_counter() - batch_start) * 1000.0,
+    )
+
+
+_INCOMPLETE_CSD_COMMIT = re.compile(
+    r"cannot commit: sealed_chunks=(?P<sealed>[0-9]+), expected_chunks=(?P<expected>[0-9]+)"
+)
+
+
+def _commit_storage_checkpoint_after_local_waits(
+    *,
+    chunk_storage: Any,
+    state: DistributedStoreResult,
+    rank: int,
+) -> dict[str, float]:
+    """Commit without any process-group operation, retrying only incomplete seals."""
+
+    profile: dict[str, float] = {
+        "storage_manifest_put_ms": 0.0,
+        "storage_commit_pre_barrier_ms": 0.0,
+        "storage_commit_ms": 0.0,
+        "storage_commit_post_barrier_ms": 0.0,
+        "storage_commit_retry_count": 0.0,
+        "storage_commit_wait_ms": 0.0,
+    }
+    if _per_node_csd_enabled():
+        should_commit = rank == _local_csd_coordinator_rank(rank)
+    else:
+        should_commit = rank == int(state.config.train_ranks[0])
+    if not should_commit:
+        return profile
+
+    manifest_start = time.perf_counter()
+    chunk_storage.put_manifest(state.tag, state.manifest or {})
+    profile["storage_manifest_put_ms"] = (time.perf_counter() - manifest_start) * 1000.0
+
+    timeout_s = max(
+        0.001,
+        float(os.environ.get("RACER_CSD_COMMIT_WAIT_TIMEOUT_SECONDS", "300")),
+    )
+    retry_interval_s = max(
+        0.001,
+        min(
+            1.0,
+            float(os.environ.get("RACER_CSD_COMMIT_RETRY_INTERVAL_MS", "10")) / 1000.0,
+        ),
+    )
+    deadline = time.monotonic() + timeout_s
+    commit_start = time.perf_counter()
+    retries = 0
+    retry_wait_ms = 0.0
+    while True:
+        try:
+            chunk_storage.commit(state.tag)
+            break
+        except RuntimeError as exc:
+            match = _INCOMPLETE_CSD_COMMIT.search(str(exc))
+            if match is None:
+                raise
+            sealed = int(match.group("sealed"))
+            expected = int(match.group("expected"))
+            if sealed >= expected:
+                raise
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                raise TimeoutError(
+                    "timed out waiting for local CSD chunks to seal before commit; "
+                    f"tag={state.tag!r}, sealed_chunks={sealed}, "
+                    f"expected_chunks={expected}, timeout_s={timeout_s}"
+                ) from exc
+            retries += 1
+            sleep_start = time.perf_counter()
+            time.sleep(min(retry_interval_s, remaining_s))
+            retry_wait_ms += (time.perf_counter() - sleep_start) * 1000.0
+    profile["storage_commit_ms"] = (time.perf_counter() - commit_start) * 1000.0
+    profile["storage_commit_retry_count"] = float(retries)
+    profile["storage_commit_wait_ms"] = retry_wait_ms
+    return profile
+
+
+def finalize_distributed_store_many(
+    handle: DistributedStoreBatchHandle,
+) -> list[DistributedStoreResult]:
+    """Wait and commit a prepared batch without touching torch.distributed/NCCL."""
+
+    if handle.finalized:
+        return handle.states
+    if handle.finalize_started:
+        raise RuntimeError("RACER distributed store batch finalization is already in progress")
+    handle.finalize_started = True
+    finalize_start = time.perf_counter()
+    if not handle.states:
+        handle.finalized = True
+        return []
+
+    for index, state in enumerate(handle.states):
+        storage_profile = handle.storage_profiles[index]
+        wait_profile = _wait_storage_puts(
+            chunk_storage=handle.chunk_storage,
+            pending=handle.pending_puts_by_tag[index],
+        )
+        _accumulate_profile(storage_profile, wait_profile)
+        commit_profile = _commit_storage_checkpoint_after_local_waits(
+            chunk_storage=handle.chunk_storage,
+            state=state,
+            rank=handle.rank,
+        )
+        _accumulate_profile(storage_profile, commit_profile)
+
+        assert state.profile is not None
+        state.profile.update(storage_profile)
+        state.profile["storage_ms"] = (
+            float(handle.execute_ms_by_tag[index])
+            + float(storage_profile["storage_begin_ms"])
+            + float(storage_profile["storage_begin_barrier_ms"])
+            + float(storage_profile["storage_enqueue_barrier_ms"])
+            + float(storage_profile["storage_wait_ms"])
+            + float(storage_profile["storage_commit_ms"])
+        )
+        state.profile["total_ms"] = (
+            float(state.profile["setup_ms"])
+            + float(state.profile["sizing_ms"])
+            + float(state.profile["manifest_ms"])
+            + float(state.profile["storage_ms"])
+        )
+        state.profile["local_chunks_released_nbytes"] = int(
+            state.profile["local_storage_nbytes"]
+        )
+        state.profile["local_chunks_released_count"] = int(
+            state.profile["local_storage_chunk_count"]
+        )
+        state.storage_backed = True
+        handle.pending_puts_by_tag[index].clear()
+        handle.retained_tensors_by_tag[index].clear()
+
+    finalize_total_ms = (time.perf_counter() - finalize_start) * 1000.0
+    batch_total_ms = (time.perf_counter() - handle.batch_start) * 1000.0
+    for index, state in enumerate(handle.states):
+        assert state.profile is not None
+        # Shared values live on one result so numeric per-tag aggregation remains exact.
+        state.profile["store_batch_prepare_ms"] = handle.prepare_total_ms if index == 0 else 0.0
+        state.profile["store_batch_finalize_ms"] = finalize_total_ms if index == 0 else 0.0
+        state.profile["store_batch_total_ms"] = batch_total_ms if index == 0 else 0.0
+        state.profile["store_batch_tag_count"] = len(handle.states) if index == 0 else 0
+    handle.finalized = True
+    return handle.states
+
+
+def distributed_store_many(
+    *,
+    config: RacerConfig,
+    tags: Sequence[str],
+    local_packets: Sequence[torch.Tensor | None],
+    process_group: Any | None = None,
+    chunk_storage: Any | None = None,
+    packet_sizes_by_tag: Mapping[str, Mapping[int, int]] | None = None,
+) -> list[DistributedStoreResult]:
+    """Synchronous compatibility wrapper for prepare/finalize batch storage."""
+
+    handle = prepare_distributed_store_many(
+        config=config,
+        tags=tags,
+        local_packets=local_packets,
+        process_group=process_group,
+        chunk_storage=chunk_storage,
+        packet_sizes_by_tag=packet_sizes_by_tag,
+    )
+    return finalize_distributed_store_many(handle)
 
 
 def distributed_state_from_storage(

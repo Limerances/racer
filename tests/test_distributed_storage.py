@@ -253,12 +253,17 @@ def test_distributed_store_writes_each_reduction_group_before_next_group(monkeyp
     monkeypatch.setattr(distributed, "_require_nccl", lambda process_group=None: None)
     monkeypatch.setattr(distributed, "_rank", lambda process_group=None: 0)
     monkeypatch.setattr(distributed, "_barrier", lambda process_group=None: events.append("barrier"))
+    monkeypatch.setattr(
+        distributed,
+        "_stream_barrier",
+        lambda process_group=None: events.append("stream_barrier"),
+    )
     monkeypatch.setattr(distributed, "_current_cuda_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(distributed, "_cuda_payload", lambda local_packet: local_packet)
     monkeypatch.setattr(
         distributed,
         "_payload_store_slot",
-        lambda payload, nbytes, *, device, zero_slot=None: payload.narrow(0, 0, int(nbytes)),
+        lambda payload, nbytes, *, device, zero_slot=None: payload,
     )
     monkeypatch.setattr(distributed, "_begin_storage_checkpoint", lambda **kwargs: events.append("begin") or {})
     monkeypatch.setattr(distributed, "_commit_storage_checkpoint", lambda **kwargs: events.append("commit") or {})
@@ -297,6 +302,286 @@ def test_distributed_store_writes_each_reduction_group_before_next_group(monkeyp
     assert result.profile["local_storage_chunk_count"] == 4
     assert "group_transfer_barrier_ms" in result.profile
     assert "group_storage_barrier_ms" in result.profile
+
+
+def test_distributed_store_many_batches_control_barriers_and_preserves_tags(monkeypatch):
+    config = RacerConfig(k=3, m=1, train_ranks=(0, 1, 2, 3), spare_ranks=(4,))
+    tags = ["checkpoint:chunk:000000", "checkpoint:chunk:000001"]
+    events: list[str] = []
+
+    class FakeStorage:
+        def begin(self, tag, *, manifest_base, expected_chunks):
+            assert manifest_base["tag"] == tag
+            assert int(expected_chunks) > 0
+            events.append(f"begin:{tag}")
+
+        def put_manifest(self, tag, manifest):
+            assert manifest["tag"] == tag
+            events.append(f"manifest:{tag}")
+
+        def commit(self, tag):
+            events.append(f"commit:{tag}")
+
+        def wait(self, op_id):
+            events.append(f"wait:{op_id}")
+            return {"profile": {}}
+
+    def fake_store_data_rows_for_group(**kwargs):
+        group = kwargs["group"]
+        chunks = kwargs["local_chunks"]
+        group_id = int(group[0].relative_index)
+        events.append(f"group{group_id}:data_rows")
+        chunks[f"rg_{group_id:06d}_row_000"] = torch.ones(4, dtype=torch.uint8)
+        return 0
+
+    def fake_store_parity_for_group(**kwargs):
+        group = kwargs["group"]
+        chunks = kwargs["local_chunks"]
+        group_id = int(group[0].relative_index)
+        events.append(f"group{group_id}:parity")
+        chunks[f"rg_{group_id:06d}_row_003"] = torch.ones(4, dtype=torch.uint8)
+        return 0
+
+    def fake_enqueue_storage_chunks(**kwargs):
+        state = kwargs["state"]
+        chunks = kwargs["chunks"]
+        chunk_ids = tuple(sorted(chunks))
+        group_ids = {chunk_id.split("_row_", 1)[0] for chunk_id in chunk_ids}
+        assert len(group_ids) == 1
+        group_id = next(iter(group_ids))
+        events.append(f"{state.tag}:{group_id}:enqueue")
+        pending = [
+            distributed.DistributedStorePendingPut(
+                tag=state.tag,
+                chunk_id=chunk_id,
+                op_id=f"{state.tag}:{chunk_id}",
+                tensor=chunks[chunk_id],
+            )
+            for chunk_id in chunk_ids
+        ]
+        return (
+            sum(int(chunk.numel()) for chunk in chunks.values()),
+            len(chunks),
+            {"storage_enqueue_ms": 1.0},
+            pending,
+        )
+
+    monkeypatch.setattr(distributed, "_require_nccl", lambda process_group=None: None)
+    monkeypatch.setattr(distributed, "_rank", lambda process_group=None: 0)
+    monkeypatch.setattr(distributed, "_barrier", lambda process_group=None: events.append("barrier"))
+    monkeypatch.setattr(
+        distributed,
+        "_stream_barrier",
+        lambda process_group=None: events.append("stream_barrier"),
+    )
+    monkeypatch.setattr(distributed, "_current_cuda_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(distributed, "_cuda_payload", lambda local_packet: local_packet)
+    monkeypatch.setattr(
+        distributed,
+        "_payload_store_slot",
+        lambda payload, nbytes, *, device, zero_slot=None: payload,
+    )
+    monkeypatch.setattr(distributed, "_store_data_rows_for_group", fake_store_data_rows_for_group)
+    monkeypatch.setattr(distributed, "_store_spare_compute_parity_cuda_for_group", fake_store_parity_for_group)
+    monkeypatch.setattr(distributed, "_enqueue_storage_chunks", fake_enqueue_storage_chunks)
+
+    packet_sizes = {0: 4, 1: 4, 2: 4, 3: 4}
+    storage = FakeStorage()
+    handle = distributed.prepare_distributed_store_many(
+        config=config,
+        tags=tags,
+        local_packets=[
+            torch.ones(4, dtype=torch.uint8),
+            torch.zeros(4, dtype=torch.uint8),
+        ],
+        chunk_storage=storage,
+        packet_sizes_by_tag={tag: packet_sizes for tag in tags},
+    )
+
+    expected_prepare_events = [
+        f"begin:{tags[0]}",
+        f"begin:{tags[1]}",
+        "barrier",
+        "group0:data_rows",
+        "group0:parity",
+        "stream_barrier",
+        f"{tags[0]}:rg_000000:enqueue",
+        "group1:data_rows",
+        "group1:parity",
+        "stream_barrier",
+        f"{tags[0]}:rg_000001:enqueue",
+        "group0:data_rows",
+        "group0:parity",
+        "stream_barrier",
+        f"{tags[1]}:rg_000000:enqueue",
+        "group1:data_rows",
+        "group1:parity",
+        "stream_barrier",
+        f"{tags[1]}:rg_000001:enqueue",
+    ]
+    assert events == expected_prepare_events
+    assert events.count("barrier") == 1
+    assert not any(event.startswith(("wait:", "manifest:", "commit:")) for event in events)
+    assert [state.tag for state in handle.states] == tags
+    assert all(not state.storage_backed for state in handle.states)
+    assert all(len(pending) == 4 for pending in handle.pending_puts_by_tag)
+    receive_slots = [
+        tensor
+        for tensors in handle.retained_tensors_by_tag
+        for tensor in tensors
+        if int(tensor.numel()) > 4
+    ]
+    assert len(receive_slots) == 4
+    assert len({int(tensor.data_ptr()) for tensor in receive_slots}) == 4
+
+    barrier_count_before_finalize = events.count("barrier")
+    states = distributed.finalize_distributed_store_many(handle)
+
+    assert events.count("barrier") == barrier_count_before_finalize
+    assert [event for event in events if event.startswith("manifest:")] == [
+        f"manifest:{tags[0]}",
+        f"manifest:{tags[1]}",
+    ]
+    assert [event for event in events if event.startswith("commit:")] == [
+        f"commit:{tags[0]}",
+        f"commit:{tags[1]}",
+    ]
+    assert len([event for event in events if event.startswith("wait:")]) == 8
+    assert [state.tag for state in states] == tags
+    assert all(state.storage_backed for state in states)
+    assert all(state.local_chunks == {} for state in states)
+    assert all(not pending for pending in handle.pending_puts_by_tag)
+    assert all(not tensors for tensors in handle.retained_tensors_by_tag)
+    assert sum(int(state.profile["store_batch_tag_count"]) for state in states) == 2
+    assert all(float(state.profile["group_storage_barrier_ms"]) == 0.0 for state in states)
+    assert all(float(state.profile["storage_commit_pre_barrier_ms"]) == 0.0 for state in states)
+    assert all(float(state.profile["storage_commit_post_barrier_ms"]) == 0.0 for state in states)
+    assert all(int(state.profile["local_storage_chunk_count"]) == 4 for state in states)
+
+
+def test_stream_barrier_installs_stream_dependency_without_waiting():
+    events = []
+
+    class FakeWork:
+        def synchronize(self):
+            events.append("synchronize")
+
+        def wait(self):
+            pytest.fail("stream barrier must not call blocking Work.wait()")
+
+    class FakeProcessGroup:
+        def barrier(self):
+            events.append("barrier")
+            return FakeWork()
+
+    distributed._stream_barrier(FakeProcessGroup())
+
+    assert events == ["barrier", "synchronize"]
+
+
+def test_csd_only_commit_retries_incomplete_seals_and_rejects_other_errors(monkeypatch):
+    config = RacerConfig(k=1, m=1, train_ranks=(0, 1), spare_ranks=(2,))
+    layout = ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m)
+    matrix = cauchy.generate_systematic_matrix(config.k, config.m, config.w)
+    packet_sizes = {0: 4, 1: 4}
+    group_sizes = {group[0].relative_index: 4 for group in layout.reduction_groups}
+    plan = routing.make_planner(config).plan(layout, matrix, 4)
+    manifest = distributed._build_storage_manifest(
+        tag="dist",
+        config=config,
+        layout=layout,
+        matrix=matrix,
+        plan=plan,
+        group_nbytes=group_sizes,
+        packet_sizes=packet_sizes,
+    )
+    state = distributed.DistributedStoreResult(
+        tag="dist",
+        config=config,
+        layout=layout,
+        matrix=matrix,
+        plan=plan,
+        local_chunks={},
+        packet_nbytes_by_rank=packet_sizes,
+        manifest=manifest,
+    )
+
+    class EventuallySealedStorage:
+        def __init__(self):
+            self.commit_calls = 0
+
+        def put_manifest(self, tag, value):
+            assert tag == "dist"
+            assert value is manifest
+
+        def commit(self, tag):
+            self.commit_calls += 1
+            if self.commit_calls == 1:
+                raise RuntimeError("CSD checkpoint 'dist' cannot commit: sealed_chunks=0, expected_chunks=2")
+            if self.commit_calls == 2:
+                raise RuntimeError("CSD checkpoint 'dist' cannot commit: sealed_chunks=1, expected_chunks=2")
+
+    monkeypatch.delenv("RACER_CSD_PER_NODE", raising=False)
+    monkeypatch.setenv("RACER_CSD_COMMIT_WAIT_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("RACER_CSD_COMMIT_RETRY_INTERVAL_MS", "1")
+    monkeypatch.setattr(distributed.time, "sleep", lambda _seconds: None)
+    storage = EventuallySealedStorage()
+    profile = distributed._commit_storage_checkpoint_after_local_waits(
+        chunk_storage=storage,
+        state=state,
+        rank=0,
+    )
+    assert storage.commit_calls == 3
+    assert profile["storage_commit_retry_count"] == 2.0
+    assert profile["storage_commit_pre_barrier_ms"] == 0.0
+    assert profile["storage_commit_post_barrier_ms"] == 0.0
+
+    storage.commit_calls = 10
+    storage.commit = lambda _tag: (_ for _ in ()).throw(RuntimeError("unrelated storage failure"))
+    with pytest.raises(RuntimeError, match="unrelated storage failure"):
+        distributed._commit_storage_checkpoint_after_local_waits(
+            chunk_storage=storage,
+            state=state,
+            rank=0,
+        )
+
+
+def test_distributed_store_many_validates_batch_shape_before_distributed_setup(monkeypatch):
+    config = RacerConfig(k=1, m=1, train_ranks=(0, 1), spare_ranks=(2,))
+
+    assert distributed.distributed_store_many(
+        config=config,
+        tags=[],
+        local_packets=[],
+    ) == []
+    with pytest.raises(ValueError, match="one local packet per tag"):
+        distributed.distributed_store_many(
+            config=config,
+            tags=["a"],
+            local_packets=[],
+        )
+    with pytest.raises(ValueError, match="unique tags"):
+        distributed.distributed_store_many(
+            config=config,
+            tags=["a", "a"],
+            local_packets=[None, None],
+        )
+
+    monkeypatch.setattr(distributed, "_require_nccl", lambda process_group=None: None)
+    monkeypatch.setattr(distributed, "_rank", lambda process_group=None: 0)
+    monkeypatch.setattr(distributed, "_cuda_payload", lambda local_packet: local_packet)
+    aliased = torch.ones(4, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="must not alias"):
+        distributed.distributed_store_many(
+            config=config,
+            tags=["a", "b"],
+            local_packets=[aliased, aliased],
+            chunk_storage=object(),
+            packet_sizes_by_tag={
+                "a": {0: 4, 1: 4},
+                "b": {0: 4, 1: 4},
+            },
+        )
 
 
 def test_store_data_rows_receives_into_preallocated_slot_and_flushes(monkeypatch):

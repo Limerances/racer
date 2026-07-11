@@ -466,8 +466,8 @@ def test_native_ipc_cache_refcount_decrements_and_evicts_idle(monkeypatch):
     backend._ipc_lock = threading.RLock()
     backend._ipc_mem_cache_max_entries = 1
     backend._ipc_mem_cache = {
-        "old": {"ptr": 11, "refcount": 0, "device": 0, "last_used_ns": 1},
-        "active": {"ptr": 22, "refcount": 1, "device": 0, "last_used_ns": 2},
+        "old": {"ptr": 11, "refcount": 0, "device": 0, "keep_idle": True, "last_used_ns": 1},
+        "active": {"ptr": 22, "refcount": 1, "device": 0, "keep_idle": True, "last_used_ns": 2},
     }
     monkeypatch.setattr(csd_mod, "_load_cudart", lambda: FakeCudaRuntime())
 
@@ -476,6 +476,169 @@ def test_native_ipc_cache_refcount_decrements_and_evicts_idle(monkeypatch):
     assert backend._ipc_mem_cache["active"]["refcount"] == 0
     assert "old" not in backend._ipc_mem_cache
     assert closed_ptrs == [11]
+
+
+def test_native_direct_ipc_mapping_is_shared_until_last_active_op(monkeypatch):
+    opened_ptrs = []
+    closed_ptrs = []
+    opened_events = []
+
+    class FakeCudaRuntime:
+        def cudaIpcOpenMemHandle(self, out_ptr, _handle, _flags):
+            out_ptr._obj.value = 1234
+            opened_ptrs.append(1234)
+            return 0
+
+        def cudaIpcCloseMemHandle(self, ptr):
+            closed_ptrs.append(int(ptr.value))
+            return 0
+
+        def cudaIpcOpenEventHandle(self, out_event, _handle):
+            event = 2000 + len(opened_events)
+            out_event._obj.value = event
+            opened_events.append(event)
+            return 0
+
+    backend = NativePinnedMemoryBackend.__new__(NativePinnedMemoryBackend)
+    backend._ipc_lock = threading.RLock()
+    backend._ipc_mem_cache_max_entries = 128
+    backend._ipc_mem_cache = {}
+    monkeypatch.setattr(csd_mod, "_load_cudart", lambda: FakeCudaRuntime())
+    monkeypatch.setattr(csd_mod, "_cuda_set_device", lambda _device: None)
+    view = {
+        "device": 0,
+        "mem_handle": b"m" * 64,
+        "event_handle": b"e" * 64,
+        "requires_staging": False,
+        "staging_id": None,
+        "producer_pid": 99,
+        "producer_token": "99:test-session",
+    }
+
+    first = backend._open_ipc_mem(view)
+    second = backend._open_ipc_mem(view)
+    cache_key = first[2]
+
+    assert first[0] == second[0] == 1234
+    assert first[5] is True
+    assert second[5] is False
+    assert opened_ptrs == [1234]
+    assert opened_events == [2000, 2001]
+    assert backend._ipc_mem_cache[cache_key]["refcount"] == 2
+
+    backend._release_ipc_cache_ref(cache_key)
+    assert backend._ipc_mem_cache[cache_key]["refcount"] == 1
+    assert closed_ptrs == []
+
+    backend._release_ipc_cache_ref(cache_key)
+    assert cache_key not in backend._ipc_mem_cache
+    assert closed_ptrs == [1234]
+
+
+def test_native_direct_source_mapping_reaps_only_after_producer_exit(monkeypatch):
+    next_ptr = 3000
+    closed_ptrs = []
+
+    class FakeCudaRuntime:
+        def cudaIpcOpenMemHandle(self, out_ptr, _handle, _flags):
+            nonlocal next_ptr
+            out_ptr._obj.value = next_ptr
+            next_ptr += 1
+            return 0
+
+        def cudaIpcCloseMemHandle(self, ptr):
+            closed_ptrs.append(int(ptr.value))
+            return 0
+
+        def cudaIpcOpenEventHandle(self, out_event, _handle):
+            out_event._obj.value = 4000
+            return 0
+
+    backend = NativePinnedMemoryBackend.__new__(NativePinnedMemoryBackend)
+    backend._ipc_lock = threading.RLock()
+    backend._ipc_mem_cache_max_entries = 128
+    backend._ipc_mem_cache = {}
+    monkeypatch.setattr(csd_mod, "_load_cudart", lambda: FakeCudaRuntime())
+    monkeypatch.setattr(csd_mod, "_cuda_set_device", lambda _device: None)
+    monkeypatch.setattr(backend, "_producer_pid_is_alive", lambda pid: int(pid) == 101)
+
+    first_view = {
+        "device": 0,
+        "mem_handle": b"a" * 64,
+        "event_handle": b"e" * 64,
+        "requires_staging": False,
+        "staging_id": None,
+        "producer_pid": 100,
+        "producer_token": "100:first-session",
+        "profile": {"direct_ipc_role": "source"},
+    }
+    first = backend._open_ipc_mem(first_view)
+    backend._release_ipc_cache_ref(first[2])
+
+    assert backend._ipc_mem_cache[first[2]]["refcount"] == 0
+    assert closed_ptrs == []
+
+    second_view = dict(first_view)
+    second_view.update(
+        {
+            "mem_handle": b"b" * 64,
+            "producer_pid": 101,
+            "producer_token": "101:second-session",
+        }
+    )
+    second = backend._open_ipc_mem(second_view)
+
+    assert first[2] not in backend._ipc_mem_cache
+    assert backend._ipc_mem_cache[second[2]]["refcount"] == 1
+    assert closed_ptrs == [3000]
+
+    backend._release_ipc_cache_ref(second[2])
+    assert backend._ipc_mem_cache[second[2]]["refcount"] == 0
+    assert closed_ptrs == [3000]
+
+
+def test_native_source_cache_does_not_alias_distinct_opaque_handles(monkeypatch):
+    next_ptr = 5000
+
+    class FakeCudaRuntime:
+        def cudaIpcOpenMemHandle(self, out_ptr, _handle, _flags):
+            nonlocal next_ptr
+            out_ptr._obj.value = next_ptr
+            next_ptr += 1
+            return 0
+
+        def cudaIpcCloseMemHandle(self, _ptr):
+            return 0
+
+        def cudaIpcOpenEventHandle(self, out_event, _handle):
+            out_event._obj.value = 6000
+            return 0
+
+    backend = NativePinnedMemoryBackend.__new__(NativePinnedMemoryBackend)
+    backend._ipc_lock = threading.RLock()
+    backend._ipc_mem_cache_max_entries = 128
+    backend._ipc_mem_cache = {}
+    monkeypatch.setattr(csd_mod, "_load_cudart", lambda: FakeCudaRuntime())
+    monkeypatch.setattr(csd_mod, "_cuda_set_device", lambda _device: None)
+    monkeypatch.setattr(backend, "_producer_pid_is_alive", lambda _pid: True)
+    base_view = {
+        "device": 0,
+        "event_handle": b"e" * 64,
+        "requires_staging": False,
+        "staging_id": None,
+        "producer_pid": 200,
+        "producer_token": "200:one-session",
+        "profile": {"direct_ipc_role": "source"},
+    }
+    first_view = dict(base_view, mem_handle=b"x" * 64)
+    second_view = dict(base_view, mem_handle=b"y" * 64)
+
+    first = backend._open_ipc_mem(first_view)
+    second = backend._open_ipc_mem(second_view)
+
+    assert first[2] != second[2]
+    assert first[0] == 5000
+    assert second[0] == 5001
 
 
 def test_csd_allows_explicit_repair_put_after_commit(tmp_path, monkeypatch):
@@ -517,6 +680,9 @@ def test_csd_allows_explicit_repair_put_after_commit(tmp_path, monkeypatch):
 
         def metadata(self, tag, chunk_id):
             return dict(self.metadata_by_tag[tag][chunk_id])
+
+        def update_metadata(self, tag, chunk_id, metadata):
+            self.metadata_by_tag[tag][chunk_id] = dict(metadata)
 
         def checksum(self, tag, chunk_id, checksum_type="sha256"):
             return f"{checksum_type}-sealed-{len(self.waited)}"

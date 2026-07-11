@@ -87,12 +87,15 @@ CSD_EGM_POOL_ID="${CSD_EGM_POOL_ID:-}"
 CSD_EGM_OWNER_NODE="${CSD_EGM_OWNER_NODE:-}"
 CSD_EGM_OWNER_TRAY="${CSD_EGM_OWNER_TRAY:-}"
 CSD_EGM_HOME_DEVICE="${CSD_EGM_HOME_DEVICE:-0}"
+# Optional legacy override for the home device only. Other accessing devices
+# still auto-detect CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID.
 CSD_EGM_NUMA_ID="${CSD_EGM_NUMA_ID:-}"
 CSD_EGM_ACCESSING_DEVICES="${CSD_EGM_ACCESSING_DEVICES:-}"
 CSD_EGM_TOTAL_BYTES="${CSD_EGM_TOTAL_BYTES:-}"
 CSD_EGM_SEGMENT_BYTES="${CSD_EGM_SEGMENT_BYTES:-}"
 CSD_EGM_MAX_POOL_BYTES="${CSD_EGM_MAX_POOL_BYTES:-}"
 RACER_CSD_PROFILE_LOG="${RACER_CSD_PROFILE_LOG:-1}"
+RACER_CSD_CUDA_EVENT_TIMING="${RACER_CSD_CUDA_EVENT_TIMING:-1}"
 RACER_CSD_CHECKSUM_TYPE="${RACER_CSD_CHECKSUM_TYPE:-sample64}"
 RACER_CSD_MANIFEST_UPDATE_MODE="${RACER_CSD_MANIFEST_UPDATE_MODE:-batch}"
 RACER_CSD_DIRECT_TENSOR_IPC="${RACER_CSD_DIRECT_TENSOR_IPC:-0}"
@@ -112,7 +115,22 @@ case "${MODE}" in
     RACER_CSD_DIRECT_READ_IPC="${RACER_CSD_DIRECT_READ_IPC:-0}"
     ;;
 esac
+if [[ -z "${RACER_CSD_STRICT_DIRECT_IPC:-}" ]]; then
+  case "${MODE}" in
+    racer_egm|racer_egm_remote_spare)
+      RACER_CSD_STRICT_DIRECT_IPC="${RACER_EGM_DIRECT_IPC}"
+      ;;
+    *) RACER_CSD_STRICT_DIRECT_IPC=0 ;;
+  esac
+fi
 RACER_CSD_SERIALIZE_READ_IPC="${RACER_CSD_SERIALIZE_READ_IPC:-0}"
+RACER_ASYNC_OFFLOAD="${RACER_ASYNC_OFFLOAD:-1}"
+if [[ -z "${RACER_PAYLOAD_POOL_PREWARM_CHUNKS:-}" ]]; then
+  case "${MODE}" in
+    racer_egm|racer_egm_remote_spare) RACER_PAYLOAD_POOL_PREWARM_CHUNKS=4 ;;
+    *) RACER_PAYLOAD_POOL_PREWARM_CHUNKS=0 ;;
+  esac
+fi
 
 RACER_K="${RACER_K:-6}"
 RACER_M="${RACER_M:-2}"
@@ -375,13 +393,23 @@ if [[ -z "${CSD_NATIVE_PINNED_TOTAL_BYTES}" ]]; then
       ;;
   esac
 fi
+if [[ -z "${CSD_EGM_TOTAL_BYTES}" ]]; then
+  case "${MODE}" in
+    racer_egm|racer_egm_remote_spare)
+      # Preallocate the existing per-node memory budget at daemon startup.
+      # In remote-spare mode CSD_NATIVE_PINNED_TOTAL_BYTES already resolves to
+      # zero on the spare node and to 96/256 GiB on train nodes.
+      CSD_EGM_TOTAL_BYTES="${CSD_NATIVE_PINNED_TOTAL_BYTES}"
+      ;;
+  esac
+fi
 if [[ -z "${CSD_EGM_SEGMENT_BYTES}" ]]; then
   CSD_EGM_SEGMENT_BYTES="${CSD_NATIVE_PINNED_SEGMENT_BYTES}"
 fi
 if [[ -z "${CSD_EGM_MAX_POOL_BYTES}" ]]; then
   case "${MODE}" in
     racer_egm|racer_egm_remote_spare)
-      CSD_EGM_MAX_POOL_BYTES="${CSD_NATIVE_PINNED_TOTAL_BYTES}"
+      CSD_EGM_MAX_POOL_BYTES="${CSD_EGM_TOTAL_BYTES}"
       ;;
   esac
 fi
@@ -444,11 +472,13 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TORCH_COMPILE_DISABLE="${TORCH_COMPILE_DISABLE:-1}"
 export PYTHONPATH="${RACER_ROOT}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
 export RACER_CSD_PROFILE_LOG
+export RACER_CSD_CUDA_EVENT_TIMING
 export RACER_CSD_CHECKSUM_TYPE
 export RACER_CSD_MANIFEST_UPDATE_MODE
 export RACER_CSD_DIRECT_TENSOR_IPC
 export RACER_CSD_DIRECT_WRITE_IPC
 export RACER_CSD_DIRECT_READ_IPC
+export RACER_CSD_STRICT_DIRECT_IPC
 export RACER_CSD_SERIALIZE_READ_IPC
 export RACER_EGM_DIRECT_IPC
 export CSD_EGM_TOTAL_BYTES
@@ -601,6 +631,11 @@ print(json.dumps({
     "supports_cuda_ipc": bool(caps.get("supports_cuda_ipc")),
     "supports_async_copy": bool(caps.get("supports_async_copy")),
     "supports_egm_native_transport": bool(caps.get("supports_egm_native_transport")),
+    "topology_aware": bool(caps.get("topology_aware")),
+    "egm_topology": caps.get("egm_topology"),
+    "device_numa_map": caps.get("device_numa_map"),
+    "pool_count": caps.get("pool_count"),
+    "preallocated_total_bytes": caps.get("preallocated_total_bytes"),
 }, sort_keys=True))
 PY
     )"
@@ -757,7 +792,7 @@ MSG
     --racer-spare-ranks "${RACER_SPARE_RANKS_EXPANDED}"
     --racer-spare-launch-mode "${launch_mode}"
     --racer-buffer-size "${RACER_BUFFER_SIZE:-1073741824}"
-    --racer-payload-pool-prewarm-chunks "${RACER_PAYLOAD_POOL_PREWARM_CHUNKS:-0}"
+    --racer-payload-pool-prewarm-chunks "${RACER_PAYLOAD_POOL_PREWARM_CHUNKS}"
     --racer-retain-checkpoints 1
     --racer-distributed-store
     --racer-storage-backend "${storage_backend}"
@@ -769,6 +804,9 @@ MSG
   )
   if [[ "${launch_mode}" == "remote" ]]; then
     RACER_ARGS+=(--racer-runtime-port "${RACER_RUNTIME_PORT}")
+  fi
+  if [[ "${RACER_ASYNC_OFFLOAD}" == "1" ]]; then
+    RACER_ARGS+=(--racer-async-offload)
   fi
 }
 
@@ -802,6 +840,7 @@ run_remote_spare_worker() {
   echo "CSD_NATIVE_PINNED_TOTAL_BYTES=${CSD_NATIVE_PINNED_TOTAL_BYTES}"
   echo "CSD_NATIVE_PINNED_SEGMENT_BYTES=${CSD_NATIVE_PINNED_SEGMENT_BYTES}"
   echo "CSD_NATIVE_PINNED_DEVICE=${CSD_NATIVE_PINNED_DEVICE}"
+  echo "RACER_CSD_CUDA_EVENT_TIMING=${RACER_CSD_CUDA_EVENT_TIMING}"
   echo "RACER_CSD_CHECKSUM_TYPE=${RACER_CSD_CHECKSUM_TYPE}"
   echo "RACER_CSD_MANIFEST_UPDATE_MODE=${RACER_CSD_MANIFEST_UPDATE_MODE}"
   echo "RACER_DISTRIBUTED_DIRECT_STORAGE_LOAD=${RACER_DISTRIBUTED_DIRECT_STORAGE_LOAD:-}"
@@ -810,8 +849,10 @@ run_remote_spare_worker() {
   echo "RACER_CSD_DIRECT_TENSOR_IPC=${RACER_CSD_DIRECT_TENSOR_IPC}"
   echo "RACER_CSD_DIRECT_WRITE_IPC=${RACER_CSD_DIRECT_WRITE_IPC}"
   echo "RACER_CSD_DIRECT_READ_IPC=${RACER_CSD_DIRECT_READ_IPC}"
+  echo "RACER_CSD_STRICT_DIRECT_IPC=${RACER_CSD_STRICT_DIRECT_IPC}"
   echo "RACER_CSD_SERIALIZE_READ_IPC=${RACER_CSD_SERIALIZE_READ_IPC}"
   echo "RACER_EGM_DIRECT_IPC=${RACER_EGM_DIRECT_IPC}"
+  echo "RACER_ASYNC_OFFLOAD=${RACER_ASYNC_OFFLOAD}"
   echo "RACER_JIT_COMPILE=${RACER_JIT_COMPILE}"
   echo "RACER_EXTENSION_CACHE_KEY=${RACER_EXTENSION_CACHE_KEY}"
   echo "TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-}"
@@ -925,6 +966,7 @@ echo "RACER_CSD_MODE=${RACER_CSD_MODE}"
 echo "CSD_NATIVE_PINNED_TOTAL_BYTES=${CSD_NATIVE_PINNED_TOTAL_BYTES}"
 echo "CSD_NATIVE_PINNED_SEGMENT_BYTES=${CSD_NATIVE_PINNED_SEGMENT_BYTES}"
 echo "CSD_NATIVE_PINNED_DEVICE=${CSD_NATIVE_PINNED_DEVICE}"
+echo "RACER_CSD_CUDA_EVENT_TIMING=${RACER_CSD_CUDA_EVENT_TIMING}"
 echo "RACER_CSD_CHECKSUM_TYPE=${RACER_CSD_CHECKSUM_TYPE}"
 echo "RACER_CSD_MANIFEST_UPDATE_MODE=${RACER_CSD_MANIFEST_UPDATE_MODE}"
 echo "RACER_DISTRIBUTED_DIRECT_STORAGE_LOAD=${RACER_DISTRIBUTED_DIRECT_STORAGE_LOAD:-}"
@@ -933,8 +975,10 @@ echo "RACER_DEBUG_STORAGE_READ_CHECKSUM=${RACER_DEBUG_STORAGE_READ_CHECKSUM:-}"
 echo "RACER_CSD_DIRECT_TENSOR_IPC=${RACER_CSD_DIRECT_TENSOR_IPC}"
 echo "RACER_CSD_DIRECT_WRITE_IPC=${RACER_CSD_DIRECT_WRITE_IPC}"
 echo "RACER_CSD_DIRECT_READ_IPC=${RACER_CSD_DIRECT_READ_IPC}"
+echo "RACER_CSD_STRICT_DIRECT_IPC=${RACER_CSD_STRICT_DIRECT_IPC}"
 echo "RACER_CSD_SERIALIZE_READ_IPC=${RACER_CSD_SERIALIZE_READ_IPC}"
 echo "RACER_EGM_DIRECT_IPC=${RACER_EGM_DIRECT_IPC}"
+echo "RACER_ASYNC_OFFLOAD=${RACER_ASYNC_OFFLOAD}"
 echo "RACER_JIT_COMPILE=${RACER_JIT_COMPILE}"
 echo "RACER_EXTENSION_CACHE_KEY=${RACER_EXTENSION_CACHE_KEY}"
 echo "TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-}"

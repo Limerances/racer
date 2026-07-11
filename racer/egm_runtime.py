@@ -161,7 +161,7 @@ def _detect_host_numa_id(device: int) -> int:
 
 
 class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
-    """EGM runtime backed by CUDA Host NUMA stream-ordered memory pools."""
+    """EGM runtime backed by topology-aware CUDA Host NUMA memory pools."""
 
     name = "cuda_mempool_egm_runtime"
     dynamic_allocation_source = "dynamic_cuda_mempool"
@@ -176,36 +176,91 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
         segment_bytes: int = 1024 * 1024 * 1024,
         max_pool_bytes: int = 0,
     ) -> None:
-        self.numa_id = None if numa_id is None else int(numa_id)
         self.home_device = int(home_device)
-        self.accessing_devices = tuple(int(item) for item in (accessing_devices or ()))
+        requested_devices = tuple(dict.fromkeys(int(item) for item in (accessing_devices or ())))
+        if not requested_devices:
+            count = _visible_cuda_device_count()
+            requested_devices = tuple(range(count)) if count > 0 else (int(self.home_device),)
+        self.accessing_devices = requested_devices
+        self._home_numa_override = None if numa_id is None else int(numa_id)
+        self._device_numa_ids: dict[int, int] = {}
+        for device in self.accessing_devices:
+            if self._home_numa_override is not None and int(device) == int(self.home_device):
+                detected_numa = int(self._home_numa_override)
+            else:
+                detected_numa = _detect_host_numa_id(int(device))
+            self._device_numa_ids[int(device)] = int(detected_numa)
+        self.numa_id = (
+            int(self._home_numa_override)
+            if self._home_numa_override is not None
+            else int(
+                self._device_numa_ids.get(
+                    int(self.home_device),
+                    self._device_numa_ids[int(self.accessing_devices[0])],
+                )
+            )
+        )
         self.max_pool_bytes = int(max_pool_bytes or total_bytes or 0)
-        self._egm_pool: int | None = None
-        self._egm_alloc_stream: int | None = None
+        self._device_max_pool_bytes = self._split_bytes_evenly(
+            self.max_pool_bytes,
+            self.accessing_devices,
+        )
+        self._egm_pools: dict[int, int] = {}
         self._egm_destroyed = False
-        self._create_egm_pool()
-        super().__init__(total_bytes=0, segment_bytes=int(segment_bytes), device=int(home_device))
+        self._create_egm_pools()
+        primary_device = (
+            int(self.home_device)
+            if int(self.home_device) in self._egm_pools
+            else int(self.accessing_devices[0])
+        )
+        self._egm_pool: int | None = int(self._egm_pools[primary_device])
+        super().__init__(total_bytes=0, segment_bytes=int(segment_bytes), device=int(primary_device))
         self.total_bytes = int(total_bytes)
         self.segment_bytes = int(segment_bytes)
+        self._device_preallocated_bytes = {int(device): 0 for device in self.accessing_devices}
         if self.total_bytes > 0:
             self.create_pool(self.total_bytes, self.segment_bytes)
 
-    def _create_egm_pool(self) -> None:
-        cudart = _configure_cudart_mempool_api()
-        props = _CudaMemPoolProps()
-        props.allocType = _CUDA_MEM_ALLOCATION_TYPE_PINNED
-        props.handleTypes = _CUDA_MEM_HANDLE_TYPE_NONE
-        if self.numa_id is None:
-            self.numa_id = _detect_host_numa_id(int(self.home_device))
-        props.location = _CudaMemLocation(_CUDA_MEM_LOCATION_TYPE_HOST_NUMA, int(self.numa_id))
-        props.win32SecurityAttributes = None
-        props.maxSize = ctypes.c_size_t(max(0, int(self.max_pool_bytes))).value
-        props.usage = 0
-        pool = ctypes.c_void_p()
-        _cuda_check(cudart.cudaMemPoolCreate(ctypes.byref(pool), ctypes.byref(props)), "cudaMemPoolCreate failed")
-        self._egm_pool = int(pool.value)
+    @staticmethod
+    def _split_bytes_evenly(total_bytes: int, devices: tuple[int, ...]) -> dict[int, int]:
+        total = max(0, int(total_bytes))
+        if not devices:
+            return {}
+        base, remainder = divmod(total, len(devices))
+        return {
+            int(device): int(base + (1 if index < remainder else 0))
+            for index, device in enumerate(devices)
+        }
 
-    def _set_access_if_needed(self) -> None:
+    def _pool_label(self, device: int) -> str:
+        device = int(device)
+        return f"egm_device_{device}_numa_{self._device_numa_ids[device]}"
+
+    def _create_egm_pools(self) -> None:
+        cudart = _configure_cudart_mempool_api()
+        for device in self.accessing_devices:
+            device = int(device)
+            props = _CudaMemPoolProps()
+            props.allocType = _CUDA_MEM_ALLOCATION_TYPE_PINNED
+            props.handleTypes = _CUDA_MEM_HANDLE_TYPE_NONE
+            props.location = _CudaMemLocation(
+                _CUDA_MEM_LOCATION_TYPE_HOST_NUMA,
+                int(self._device_numa_ids[device]),
+            )
+            props.win32SecurityAttributes = None
+            props.maxSize = ctypes.c_size_t(
+                max(0, int(self._device_max_pool_bytes.get(device, 0)))
+            ).value
+            props.usage = 0
+            pool = ctypes.c_void_p()
+            _cuda_check(
+                cudart.cudaMemPoolCreate(ctypes.byref(pool), ctypes.byref(props)),
+                f"cudaMemPoolCreate failed for EGM device {device}",
+            )
+            self._egm_pools[device] = int(pool.value)
+            self._set_pool_access(int(pool.value))
+
+    def _set_pool_access(self, pool: int) -> None:
         if not self.accessing_devices:
             return
         cudart = _configure_cudart_mempool_api()
@@ -215,37 +270,160 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
             descs[index].flags = _CUDA_MEM_ACCESS_FLAGS_PROT_READ_WRITE
         _cuda_check(
             cudart.cudaMemPoolSetAccess(
-                ctypes.c_void_p(int(self._egm_pool or 0)),
+                ctypes.c_void_p(int(pool)),
                 descs,
                 ctypes.c_size_t(len(self.accessing_devices)),
             ),
-            "cudaMemPoolSetAccess failed for EGM pool",
+            "cudaMemPoolSetAccess failed for topology-aware EGM pool",
         )
 
-    def _new_segment(self, nbytes: int) -> _NativeSegment:
+    def _resolve_allocation_device(self, allocation_device: int | None) -> int:
+        if allocation_device is None:
+            candidate = (
+                int(self.home_device)
+                if int(self.home_device) in self._egm_pools
+                else int(self.accessing_devices[0])
+            )
+        else:
+            candidate = int(allocation_device)
+        if candidate not in self._egm_pools:
+            raise RuntimeError(
+                f"CUDA device {candidate} is not configured for topology-aware EGM; "
+                f"configured devices={list(self.accessing_devices)}"
+            )
+        return candidate
+
+    def create_pool(self, total_bytes: int, segment_bytes: int) -> None:
+        segment_size = max(1, int(segment_bytes))
+        shares = self._split_bytes_evenly(int(total_bytes), self.accessing_devices)
+        for device in self.accessing_devices:
+            device = int(device)
+            remaining = int(shares.get(device, 0))
+            while remaining > 0:
+                allocation_bytes = min(segment_size, remaining)
+                self._new_segment(allocation_bytes, allocation_device=device)
+                self._device_preallocated_bytes[device] = (
+                    int(self._device_preallocated_bytes.get(device, 0)) + int(allocation_bytes)
+                )
+                remaining -= allocation_bytes
+
+    def _segment_matches_allocation(
+        self,
+        segment: _NativeSegment,
+        allocation_device: int | None,
+    ) -> bool:
+        requested_device = self._resolve_allocation_device(allocation_device)
+        return segment.allocation_device is not None and int(segment.allocation_device) == requested_device
+
+    def _allocate_location(
+        self,
+        nbytes: int,
+        *,
+        alignment: int = 256,
+        allocation_device: int | None = None,
+    ):
+        return super()._allocate_location(
+            int(nbytes),
+            alignment=int(alignment),
+            allocation_device=self._resolve_allocation_device(allocation_device),
+        )
+
+    def _new_segment(
+        self,
+        nbytes: int,
+        *,
+        allocation_device: int | None = None,
+    ) -> _NativeSegment:
+        device = self._resolve_allocation_device(allocation_device)
         cudart = _configure_cudart_mempool_api()
-        self._set_access_if_needed()
-        stream = self._get_copy_stream(int(self.home_device))
+        stream = self._get_copy_stream(device)
         ptr = ctypes.c_void_p()
         _cuda_check(
             cudart.cudaMallocFromPoolAsync(
                 ctypes.byref(ptr),
                 ctypes.c_size_t(int(nbytes)),
-                ctypes.c_void_p(int(self._egm_pool or 0)),
+                ctypes.c_void_p(int(self._egm_pools[device])),
                 ctypes.c_void_p(int(stream)),
             ),
-            "cudaMallocFromPoolAsync failed for EGM segment",
+            f"cudaMallocFromPoolAsync failed for EGM device {device}",
         )
-        _cuda_check(cudart.cudaStreamSynchronize(ctypes.c_void_p(int(stream))), "EGM segment allocation sync failed")
-        segment = _NativeSegment(segment_id=f"egm_seg_{len(self._segments):08d}", ptr=int(ptr.value), nbytes=int(nbytes))
+        _cuda_check(
+            cudart.cudaStreamSynchronize(ctypes.c_void_p(int(stream))),
+            f"EGM segment allocation sync failed for device {device}",
+        )
+        numa_id = int(self._device_numa_ids[device])
+        segment = _NativeSegment(
+            segment_id=f"egm_dev{device}_numa{numa_id}_seg_{len(self._segments):08d}",
+            ptr=int(ptr.value),
+            nbytes=int(nbytes),
+            allocation_device=device,
+            numa_id=numa_id,
+        )
         self._segments.append(segment)
         self._segment_by_id[segment.segment_id] = segment
         return segment
 
+    def _device_pool_stats(self) -> dict[int, dict[str, int | str]]:
+        with self._lock:
+            free_list_by_segment: dict[str, int] = {}
+            for block in self._free_blocks:
+                free_list_by_segment[block.segment_id] = (
+                    int(free_list_by_segment.get(block.segment_id, 0)) + int(block.nbytes)
+                )
+            result: dict[int, dict[str, int | str]] = {}
+            for device in self.accessing_devices:
+                device = int(device)
+                segments = [
+                    segment
+                    for segment in self._segments
+                    if segment.allocation_device is not None
+                    and int(segment.allocation_device) == device
+                ]
+                result[device] = {
+                    "pool_id": self._pool_label(device),
+                    "numa_id": int(self._device_numa_ids[device]),
+                    "max_pool_bytes": int(self._device_max_pool_bytes.get(device, 0)),
+                    "preallocated_bytes": int(self._device_preallocated_bytes.get(device, 0)),
+                    "pool_total_bytes": sum(int(segment.nbytes) for segment in segments),
+                    "pool_free_bytes": sum(
+                        max(0, int(segment.nbytes) - int(segment.offset))
+                        + int(free_list_by_segment.get(segment.segment_id, 0))
+                        for segment in segments
+                    ),
+                    "pool_segment_count": len(segments),
+                }
+            return result
+
     def capabilities(self) -> dict[str, Any]:
         stats = self.pool_stats()
+        per_device = self._device_pool_stats()
+        per_numa: dict[int, dict[str, Any]] = {}
+        for device, device_stats in per_device.items():
+            numa = int(device_stats["numa_id"])
+            entry = per_numa.setdefault(
+                numa,
+                {
+                    "devices": [],
+                    "max_pool_bytes": 0,
+                    "preallocated_bytes": 0,
+                    "pool_total_bytes": 0,
+                    "pool_free_bytes": 0,
+                    "pool_segment_count": 0,
+                },
+            )
+            entry["devices"].append(int(device))
+            for key in (
+                "max_pool_bytes",
+                "preallocated_bytes",
+                "pool_total_bytes",
+                "pool_free_bytes",
+                "pool_segment_count",
+            ):
+                entry[key] = int(entry[key]) + int(device_stats[key])
         return {
             "egm_runtime": "cuda_mempool_host_numa",
+            "egm_topology": "per_device_host_numa",
+            "topology_aware": True,
             "supports_egm_native_transport": True,
             "supports_cuda_ipc": True,
             "supports_async_copy": True,
@@ -255,35 +433,100 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
             "numa_id": self.numa_id,
             "home_device": int(self.home_device),
             "accessing_devices": list(self.accessing_devices),
+            "device_numa_map": {
+                str(device): int(numa_id)
+                for device, numa_id in sorted(self._device_numa_ids.items())
+            },
+            "pool_count": len(self._egm_pools),
+            "numa_pool_count": len(set(self._device_numa_ids.values())),
+            "device_pool_map": {
+                str(device): {
+                    "pool_id": self._pool_label(device),
+                    "numa_id": int(self._device_numa_ids[device]),
+                }
+                for device in self.accessing_devices
+            },
+            "device_pool_stats": {
+                str(device): dict(device_stats)
+                for device, device_stats in per_device.items()
+            },
+            "numa_pool_stats": {
+                str(numa): dict(numa_stats)
+                for numa, numa_stats in sorted(per_numa.items())
+            },
+            "preallocated_total_bytes": sum(
+                int(value) for value in self._device_preallocated_bytes.values()
+            ),
+            "max_pool_bytes": int(self.max_pool_bytes),
             "pool_total_bytes": stats["pool_total_bytes"],
             "pool_free_bytes": stats["pool_free_bytes"],
             "pool_segment_count": stats["pool_segment_count"],
             "segment_bytes": int(self.segment_bytes),
         }
 
+    def _placement_from_metadata(
+        self,
+        metadata: dict[str, Any],
+    ) -> tuple[int, int, str]:
+        location = dict(metadata.get("location") or {})
+        segment_id = metadata.get("segment_id", location.get("segment_id"))
+        segment = self._segment_by_id.get(str(segment_id)) if segment_id is not None else None
+        if segment is not None and segment.allocation_device is not None:
+            device = int(segment.allocation_device)
+            numa_id = int(
+                segment.numa_id
+                if segment.numa_id is not None
+                else self._device_numa_ids[device]
+            )
+        else:
+            requested_device = metadata.get(
+                "allocation_device",
+                metadata.get(
+                    "source_device",
+                    location.get(
+                        "allocation_device",
+                        location.get("source_device", self.home_device),
+                    ),
+                ),
+            )
+            device = self._resolve_allocation_device(int(requested_device))
+            numa_id = int(self._device_numa_ids[device])
+        return device, numa_id, self._pool_label(device)
+
     def _clean_metadata(self, tag: str, chunk_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
         cleaned = dict(metadata)
         cleaned.pop("cuda_native_pinned", None)
         cleaned.pop("uses_cudaHostAlloc", None)
+        device, numa_id, pool_id = self._placement_from_metadata(cleaned)
         cleaned["storage_transport"] = "egm_cuda_mempool"
-        cleaned["stored_device"] = f"host_numa:{self.numa_id}"
-        cleaned["daemon_storage_device"] = cleaned["stored_device"]
+        cleaned["stored_device"] = f"cuda:{device}"
+        cleaned["daemon_storage_device"] = f"host_numa:{numa_id}"
         cleaned["daemon_owned"] = True
         cleaned["egm_native"] = True
         cleaned["uses_cuda_mempool"] = True
         cleaned["egm_runtime"] = "cuda_mempool_host_numa"
-        cleaned["egm_home_device"] = int(self.home_device)
-        cleaned["egm_numa_id"] = self.numa_id
+        cleaned["egm_topology"] = "per_device_host_numa"
+        cleaned["pool_id"] = pool_id
+        cleaned["egm_pool_id"] = pool_id
+        cleaned["source_device"] = device
+        cleaned["allocation_device"] = device
+        cleaned["allocation_numa_id"] = numa_id
+        cleaned["egm_home_device"] = device
+        cleaned["egm_numa_id"] = numa_id
         cleaned["egm_accessing_devices"] = list(self.accessing_devices)
         location = dict(cleaned.get("location") or {})
         location.update(
             {
                 "backend": "egm",
                 "runtime": "cuda_mempool_host_numa",
+                "topology": "per_device_host_numa",
+                "pool_id": pool_id,
                 "allocation_id": f"{tag}:{chunk_id}",
                 "nbytes": int(cleaned.get("nbytes", 0) or 0),
-                "numa_id": self.numa_id,
-                "home_device": int(self.home_device),
+                "source_device": device,
+                "allocation_device": device,
+                "home_device": device,
+                "numa_id": numa_id,
             }
         )
         cleaned["location"] = location
@@ -328,21 +571,32 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
                 poller.join(timeout=1.0)
         except Exception:
             pass
-        stream = None
-        try:
-            stream = self._get_copy_stream(int(getattr(self, "home_device", 0)))
-        except Exception:
-            stream = None
-        if stream is not None and hasattr(cudart, "cudaFreeAsync"):
-            for segment in getattr(self, "_segments", []):
+        segments_by_device: dict[int, list[_NativeSegment]] = {}
+        for segment in getattr(self, "_segments", []):
+            device = (
+                int(segment.allocation_device)
+                if segment.allocation_device is not None
+                else int(getattr(self, "home_device", 0))
+            )
+            segments_by_device.setdefault(device, []).append(segment)
+        if hasattr(cudart, "cudaFreeAsync"):
+            for device, segments in segments_by_device.items():
                 try:
-                    cudart.cudaFreeAsync(ctypes.c_void_p(int(segment.ptr)), ctypes.c_void_p(int(stream)))
+                    stream = self._get_copy_stream(int(device))
+                except Exception:
+                    continue
+                for segment in segments:
+                    try:
+                        cudart.cudaFreeAsync(
+                            ctypes.c_void_p(int(segment.ptr)),
+                            ctypes.c_void_p(int(stream)),
+                        )
+                    except Exception:
+                        pass
+                try:
+                    cudart.cudaStreamSynchronize(ctypes.c_void_p(int(stream)))
                 except Exception:
                     pass
-            try:
-                cudart.cudaStreamSynchronize(ctypes.c_void_p(int(stream)))
-            except Exception:
-                pass
         for cached in getattr(self, "_ipc_mem_cache", {}).values():
             try:
                 cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(int(cached["ptr"])))
@@ -354,12 +608,13 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
                     cudart.cudaStreamDestroy(ctypes.c_void_p(int(copy_stream)))
                 except Exception:
                     pass
-        pool = getattr(self, "_egm_pool", None)
-        if pool is not None and hasattr(cudart, "cudaMemPoolDestroy"):
-            try:
-                cudart.cudaMemPoolDestroy(ctypes.c_void_p(int(pool)))
-            except Exception:
-                pass
+        if hasattr(cudart, "cudaMemPoolDestroy"):
+            for pool in getattr(self, "_egm_pools", {}).values():
+                try:
+                    cudart.cudaMemPoolDestroy(ctypes.c_void_p(int(pool)))
+                except Exception:
+                    pass
+        self._egm_pools = {}
 
 
 def create_runtime(
