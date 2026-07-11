@@ -234,6 +234,98 @@ class CsdManifestStore:
                         ),
                     )
 
+    def commit_metadata_checkpoint(
+        self,
+        tag: str,
+        manifest: dict[str, Any],
+        *,
+        backend: str,
+    ) -> bool:
+        """Atomically publish a metadata-only checkpoint.
+
+        Returns ``True`` when this call created the committed record and
+        ``False`` for an idempotent retry of the same committed manifest.
+        Metadata checkpoints deliberately use a separate fast path: there are
+        no chunk rows to seal, and the manifest must become visible in one
+        SQLite transaction rather than through the normal begin/update/commit
+        sequence.
+        """
+
+        actual = str(tag)
+        value = dict(manifest or {})
+        if list(value.get("chunks", [])):
+            raise ValueError("metadata-only CSD checkpoints cannot contain chunks")
+        encoded = _json(value)
+        timestamp = now_ns()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT state, manifest_json, expected_chunks, created_at_ns "
+                    "FROM checkpoints WHERE tag=?",
+                    (actual,),
+                ).fetchone()
+                if row is not None:
+                    state = str(row[0])
+                    previous = str(row[1] or "{}")
+                    expected = int(row[2] or 0)
+                    if expected != 0 or previous != encoded:
+                        raise RuntimeError(
+                            f"CSD metadata checkpoint {actual!r} already exists with different content"
+                        )
+                    if state == "COMMITTED":
+                        self._conn.execute("COMMIT")
+                        return False
+                    if state not in {"PREPARING", "WRITING", "COMMITTING"}:
+                        raise RuntimeError(
+                            f"CSD metadata checkpoint {actual!r} cannot commit from state={state}"
+                        )
+                    chunk_count = int(
+                        self._conn.execute(
+                            "SELECT COUNT(*) FROM chunks WHERE tag=?", (actual,)
+                        ).fetchone()[0]
+                    )
+                    if chunk_count:
+                        raise RuntimeError(
+                            f"CSD metadata checkpoint {actual!r} unexpectedly owns {chunk_count} chunk(s)"
+                        )
+                    created_at = int(row[3])
+                else:
+                    created_at = timestamp
+
+                self._conn.execute("DELETE FROM chunks WHERE tag=?", (actual,))
+                self._conn.execute("DELETE FROM operations WHERE tag=?", (actual,))
+                self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO checkpoints(
+                        tag, state, created_at_ns, committed_at_ns, backend, k, m,
+                        train_ranks_json, spare_ranks_json, e_matrix_json_or_bytes,
+                        layout_json, tensor_specs_json, manifest_json, expected_chunks,
+                        total_valid_bytes, error
+                    ) VALUES (?, 'COMMITTED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL)
+                    """,
+                    (
+                        actual,
+                        created_at,
+                        timestamp,
+                        str(backend),
+                        int(value.get("k", 0) or 0),
+                        int(value.get("m", 0) or 0),
+                        _json(value.get("train_ranks", [])),
+                        _json(value.get("spare_ranks", [])),
+                        _json(value.get("E", [])),
+                        _json(value.get("elastic_layout", {})),
+                        _json(value.get("tensor_specs", value.get("tensors", []))),
+                        encoded,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+        return True
+
     def reserve_chunk(self, tag: str, chunk_id: str, metadata: dict[str, Any], *, backend: str) -> None:
         tag = str(tag)
         chunk_id = str(chunk_id)

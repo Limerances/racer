@@ -1,6 +1,9 @@
 # RACER
 
-RACER is a CUDA-only spare-GPU checkpoint coding prototype.
+RACER is a CUDA-only spare-GPU checkpoint coding and daemon-owned in-memory
+checkpoint runtime. The current research path integrates Megatron, per-node
+CSD, native pinned memory or topology-aware EGM, strict CUDA IPC, and remote
+spare GPU encoding/recovery.
 
 - Preserves GF(2^8) Cauchy Reed-Solomon semantics: `k + m == len(train_ranks)`.
 - Treats `spare_ranks` as compute-only CUDA resources outside the E matrix.
@@ -13,17 +16,26 @@ RACER is a CUDA-only spare-GPU checkpoint coding prototype.
 
 ```python
 import racer
+from racer.csd import CheckpointStorageDaemonClient
+
+csd = CheckpointStorageDaemonClient(("127.0.0.1", 7007), authkey="racer-csd")
 
 ctx = racer.init(
     k=3,
     m=1,
     train_ranks=[0, 1, 2, 3],
     spare_ranks=[4],
+    storage_backend="csd_egm",
+    storage_options={"client": csd},
 )
 
 handle = racer.store(rank_state_dicts, tag="iter_100", context=ctx)
 recovered = racer.load(tag="iter_100", failed_train_ranks=[0], context=ctx)
 ```
+
+RACER intentionally has no in-process, CPU-byte, file-mmap, or socket fallback.
+The CSD must already be running and its capabilities must match the requested
+backend.
 
 `rank_state_dicts` may be either:
 
@@ -78,3 +90,11 @@ pytest -q
 ```
 
 CUDA route tests are skipped automatically when CUDA is unavailable. Jerasure comparison tests are skipped when the external Jerasure shared library is unavailable. The project-owned CPU data path is intentionally not supported.
+
+## GB200 multi-node path
+
+The maintained three-node EGM/restart procedure, strict success criteria, and
+explicit erasure-decode test are documented in
+[`docs/gb200_multinode_test_runbook.md`](docs/gb200_multinode_test_runbook.md).
+Formal runs must pass `RACER_K`, `RACER_M`, train/spare ranks, GBS, and unique
+ports explicitly; do not rely on the shell scripts' generic defaults.

@@ -427,6 +427,7 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
             "supports_egm_native_transport": True,
             "supports_cuda_ipc": True,
             "supports_async_copy": True,
+            "supports_zero_copy_region": False,
             "uses_cudaHostAlloc": False,
             "uses_cuda_mempool": True,
             "cuda_mempool_location": "host_numa",
@@ -532,6 +533,14 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
         cleaned["location"] = location
         return cleaned
 
+    def _prepare_record_metadata(
+        self,
+        tag: str,
+        chunk_id: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._clean_metadata(str(tag), str(chunk_id), metadata)
+
     def write_from_cuda_ipc(
         self,
         tag: str,
@@ -539,11 +548,7 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
         view: dict[str, Any],
         metadata: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        op_id, runtime_metadata = super().write_from_cuda_ipc(tag, chunk_id, view, metadata)
-        cleaned = self._clean_metadata(str(tag), str(chunk_id), runtime_metadata)
-        with self._lock:
-            self._chunks[str(tag)][str(chunk_id)].metadata = dict(cleaned)
-        return op_id, cleaned
+        return super().write_from_cuda_ipc(tag, chunk_id, view, metadata)
 
     def read_to_cuda_ipc(self, tag: str, chunk_id: str, view: dict[str, Any]) -> str:
         return super().read_to_cuda_ipc(tag, chunk_id, view)

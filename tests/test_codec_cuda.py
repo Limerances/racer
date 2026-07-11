@@ -1,3 +1,5 @@
+from itertools import combinations
+
 import pytest
 import torch
 
@@ -98,3 +100,36 @@ def test_cuda_virtual_zero_layout_recovery():
         for col, slot in enumerate(group):
             if not slot.is_virtual_zero:
                 assert torch.equal(decoded[col], packets[slot.train_rank])
+
+
+def test_cuda_k5_m3_recovers_every_three_row_erasure_with_virtual_group():
+    """Target GB200 shape: q=2 and every maximum-cardinality erasure set."""
+
+    device = torch.device("cuda:0")
+    layout = ElasticLayout.build(list(range(8)), [8], k=5, m=3)
+    E = cauchy.generate_systematic_matrix(5, 3)
+    packets = {
+        rank: torch.randint(0, 256, (1031,), dtype=torch.uint8, device=device)
+        for rank in layout.train_ranks
+    }
+
+    assert layout.q == 2
+    assert layout.num_virtual_zero == 2
+    for group in layout.reduction_groups:
+        data = [
+            torch.zeros(1031, dtype=torch.uint8, device=device)
+            if slot.is_virtual_zero
+            else packets[int(slot.train_rank)]
+            for slot in group
+        ]
+        code = codec_cuda.apply_matrix_cuda(data, E)
+        for failed_rows in combinations(range(8), 3):
+            survivors = [row for row in range(8) if row not in failed_rows]
+            decoded = codec_cuda.decode_blocks(
+                [code[row] for row in survivors],
+                survivors,
+                E,
+            )
+            for column, slot in enumerate(group):
+                if slot.train_rank is not None:
+                    assert torch.equal(decoded[column], packets[int(slot.train_rank)])

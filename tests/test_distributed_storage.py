@@ -137,6 +137,25 @@ def test_empty_payload_store_slot_uses_fixed_zero_send_slot():
     assert torch.count_nonzero(slot).item() == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_short_payload_store_slot_uses_owned_zero_slot_without_touching_backing():
+    backing = torch.full((128,), 255, dtype=torch.uint8, device="cuda:0")
+    payload = backing.narrow(0, 0, 37)
+    zero_slot = torch.full((128,), 7, dtype=torch.uint8, device="cuda:0")
+
+    slot = distributed._payload_store_slot(
+        payload,
+        128,
+        device=torch.device("cuda:0"),
+        zero_slot=zero_slot,
+    )
+
+    assert slot.data_ptr() == zero_slot.data_ptr()
+    assert torch.equal(slot[:37], torch.full((37,), 255, dtype=torch.uint8, device="cuda:0"))
+    assert torch.count_nonzero(slot[37:]).item() == 0
+    assert torch.equal(backing, torch.full((128,), 255, dtype=torch.uint8, device="cuda:0"))
+
+
 def test_distributed_state_from_storage_rejects_cpu_fake_storage(monkeypatch):
     config = RacerConfig(k=1, m=1, train_ranks=(0, 1), spare_ranks=(2,))
     layout = ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m)
@@ -708,13 +727,19 @@ def test_distributed_load_defaults_failed_rank_output_to_first_spare(monkeypatch
         plan=plan,
         local_chunks={},
         packet_nbytes_by_rank={0: 4, 1: 4},
+        manifest={"group_nbytes": {0: 8, 1: 8}},
     )
+    received_nbytes = []
 
     monkeypatch.setattr(distributed, "_require_nccl", lambda process_group=None: None)
     monkeypatch.setattr(distributed, "_rank", lambda process_group=None: 2)
     monkeypatch.setattr(distributed, "_current_cuda_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(distributed, "_barrier", lambda process_group=None: None)
-    monkeypatch.setattr(distributed, "_recv_tensor", lambda nbytes, src, *, device=None, process_group=None: torch.arange(int(nbytes), dtype=torch.uint8))
+    def fake_recv_tensor(nbytes, src, *, device=None, process_group=None):
+        received_nbytes.append(int(nbytes))
+        return torch.arange(int(nbytes), dtype=torch.uint8)
+
+    monkeypatch.setattr(distributed, "_recv_tensor", fake_recv_tensor)
     monkeypatch.setattr(distributed.codec_cuda, "decode_blocks", lambda chunks, rows, matrix: [chunks[0]])
 
     result = distributed.distributed_load(
@@ -726,6 +751,44 @@ def test_distributed_load_defaults_failed_rank_output_to_first_spare(monkeypatch
 
     assert result.decode_rank == 2
     assert torch.equal(result.recovered[0], torch.arange(4, dtype=torch.uint8))
+    assert received_nbytes == [8]
+
+
+def test_distributed_load_sends_exact_aligned_group_width(monkeypatch):
+    config = RacerConfig(k=1, m=1, train_ranks=(0, 1), spare_ranks=(2,))
+    layout = ElasticLayout.build(config.train_ranks, config.spare_ranks, config.k, config.m)
+    matrix = cauchy.generate_systematic_matrix(config.k, config.m, config.w)
+    plan = routing.make_planner(config).plan(layout, matrix, 8)
+    state = distributed.DistributedStoreResult(
+        tag="dist",
+        config=config,
+        layout=layout,
+        matrix=matrix,
+        plan=plan,
+        local_chunks={"rg_000000_row_001": torch.arange(10, dtype=torch.uint8)},
+        packet_nbytes_by_rank={0: 4, 1: 4},
+        manifest={"group_nbytes": {0: 8, 1: 8}},
+    )
+    sent = []
+
+    monkeypatch.setattr(distributed, "_require_nccl", lambda process_group=None: None)
+    monkeypatch.setattr(distributed, "_rank", lambda process_group=None: 1)
+    monkeypatch.setattr(distributed, "_current_cuda_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(distributed, "_barrier", lambda process_group=None: None)
+    monkeypatch.setattr(
+        distributed,
+        "_send_tensor",
+        lambda tensor, dst, process_group=None: sent.append((int(tensor.numel()), int(dst))),
+    )
+
+    distributed.distributed_load(
+        state=state,
+        failed_train_ranks=[0],
+        requested_train_ranks=[0],
+        replacement_mapping=None,
+    )
+
+    assert sent == [(8, 2)]
 
 
 def test_store_data_rows_skips_virtual_zero_without_allocating_zero_buffer(monkeypatch):

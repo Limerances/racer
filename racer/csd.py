@@ -775,6 +775,9 @@ class BackendChunk:
     host_ptr: int | None = None
     segment_id: str | None = None
     offset: int = 0
+    read_refcount: int = 0
+    retired: bool = False
+    location_released: bool = False
 
 
 class StorageBackend:
@@ -867,6 +870,9 @@ class StorageBackend:
         for chunk_id in self.list_chunks(tag):
             self.free(tag, chunk_id)
 
+    def close(self) -> None:
+        return
+
 
 @dataclass
 class _NativeSegment:
@@ -911,6 +917,10 @@ class _NativeCopyOp:
     error: str | None = None
     resources_released: bool = False
     in_completion: bool = False
+    publish_tag: str | None = None
+    publish_chunk_id: str | None = None
+    pending_chunk: BackendChunk | None = None
+    read_chunk: BackendChunk | None = None
 
 
 class NativePinnedMemoryBackend(StorageBackend):
@@ -933,8 +943,11 @@ class NativePinnedMemoryBackend(StorageBackend):
     ) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("NativePinnedMemoryBackend requires CUDA access in the CSD daemon process")
-        if _load_cudart() is None:
+        cudart = _load_cudart()
+        if cudart is None:
             raise RuntimeError("NativePinnedMemoryBackend requires CUDA runtime")
+        self._cudart = cudart
+        self._closed = False
         self.total_bytes = int(total_bytes)
         self.segment_bytes = int(segment_bytes)
         self.device = int(device)
@@ -1141,6 +1154,49 @@ class NativePinnedMemoryBackend(StorageBackend):
         self._free_blocks.append(_NativeFreeBlock(str(segment_id), int(offset), int(nbytes)))
         self._coalesce_free_blocks_locked()
 
+    def _prepare_record_metadata(
+        self,
+        tag: str,
+        chunk_id: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Allow derived backends to normalize metadata before publication."""
+
+        return dict(metadata)
+
+    def _release_chunk_location_locked(self, chunk: BackendChunk) -> None:
+        if chunk.location_released:
+            return
+        self._free_location_locked(chunk.segment_id, chunk.offset, chunk.capacity_nbytes)
+        chunk.location_released = True
+
+    def _retire_chunk_locked(self, chunk: BackendChunk) -> None:
+        if chunk.retired:
+            return
+        chunk.retired = True
+        if int(chunk.read_refcount) == 0:
+            self._release_chunk_location_locked(chunk)
+
+    @staticmethod
+    def _acquire_chunk_read_lease_locked(chunk: BackendChunk) -> None:
+        if chunk.retired or chunk.location_released:
+            raise RuntimeError("cannot acquire a read lease on a retired native pinned chunk")
+        chunk.read_refcount = int(chunk.read_refcount) + 1
+
+    def _release_chunk_read_lease_locked(self, chunk: BackendChunk) -> None:
+        if int(chunk.read_refcount) <= 0:
+            return
+        chunk.read_refcount = int(chunk.read_refcount) - 1
+        if int(chunk.read_refcount) == 0 and chunk.retired:
+            self._release_chunk_location_locked(chunk)
+
+    def _publish_chunk_locked(self, tag: str, chunk_id: str, chunk: BackendChunk) -> None:
+        chunks = self._chunks.setdefault(str(tag), {})
+        previous = chunks.get(str(chunk_id))
+        chunks[str(chunk_id)] = chunk
+        if previous is not None and previous is not chunk:
+            self._retire_chunk_locked(previous)
+
     def allocate(self, tag: str, chunk_id: str, nbytes: int, metadata: dict[str, Any] | None = None) -> torch.Tensor:
         # Compatibility path for small CPU tests. Native async paths use
         # allocate_location/write_from_cuda_ipc and do not expose the host
@@ -1178,6 +1234,7 @@ class NativePinnedMemoryBackend(StorageBackend):
                 "allocation_numa_id": segment.numa_id,
             }
         )
+        record_metadata = self._prepare_record_metadata(str(tag), str(chunk_id), record_metadata)
         chunk = BackendChunk(
             tensor=torch.empty(0, dtype=torch.uint8),
             metadata=record_metadata,
@@ -1188,7 +1245,7 @@ class NativePinnedMemoryBackend(StorageBackend):
             offset=int(offset),
         )
         with self._lock:
-            self._chunks.setdefault(str(tag), {})[str(chunk_id)] = chunk
+            self._publish_chunk_locked(str(tag), str(chunk_id), chunk)
         return torch.empty(0, dtype=torch.uint8)
 
     def write_from_bytes(
@@ -1320,18 +1377,21 @@ class NativePinnedMemoryBackend(StorageBackend):
         ipc_open_us = (time.perf_counter() - open_start) * 1_000_000.0
         event = ctypes.c_void_p()
         event_handle = _CudaIpcEventHandle()
-        raw_event_handle = bytes(view["event_handle"])
-        if len(raw_event_handle) != 64:
-            raise RuntimeError(f"CUDA IPC event handle must be 64 bytes, got {len(raw_event_handle)}")
-        ctypes.memmove(ctypes.byref(event_handle), raw_event_handle, 64)
         event_open_start = time.perf_counter()
         try:
+            raw_event_handle = bytes(view["event_handle"])
+            if len(raw_event_handle) != 64:
+                raise RuntimeError(f"CUDA IPC event handle must be 64 bytes, got {len(raw_event_handle)}")
+            ctypes.memmove(ctypes.byref(event_handle), raw_event_handle, 64)
             _cuda_check(
                 cudart.cudaIpcOpenEventHandle(ctypes.byref(event), event_handle),
                 "cudaIpcOpenEventHandle failed",
             )
         except BaseException:
-            self._release_ipc_cache_ref(cache_key)
+            try:
+                self._release_ipc_cache_ref(cache_key)
+            except Exception:
+                pass
             raise
         event_open_us = (time.perf_counter() - event_open_start) * 1_000_000.0
         return remote_ptr_value, int(event.value), cache_key, ipc_open_us, event_open_us, opened_new, set_device_ms
@@ -1345,16 +1405,24 @@ class NativePinnedMemoryBackend(StorageBackend):
             streams = self._copy_streams.get(device)
             if streams is None:
                 streams = []
-                for _ in range(self._copy_stream_pool_size):
-                    stream = ctypes.c_void_p()
-                    _cuda_check(
-                        cudart.cudaStreamCreateWithFlags(
-                            ctypes.byref(stream),
-                            ctypes.c_uint(_CUDA_STREAM_NON_BLOCKING),
-                        ),
-                        "cudaStreamCreateWithFlags failed",
-                    )
-                    streams.append(int(stream.value))
+                try:
+                    for _ in range(self._copy_stream_pool_size):
+                        stream = ctypes.c_void_p()
+                        _cuda_check(
+                            cudart.cudaStreamCreateWithFlags(
+                                ctypes.byref(stream),
+                                ctypes.c_uint(_CUDA_STREAM_NON_BLOCKING),
+                            ),
+                            "cudaStreamCreateWithFlags failed",
+                        )
+                        streams.append(int(stream.value))
+                except BaseException:
+                    for created_stream in streams:
+                        try:
+                            cudart.cudaStreamDestroy(ctypes.c_void_p(int(created_stream)))
+                        except Exception:
+                            pass
+                    raise
                 self._copy_streams[device] = streams
                 self._copy_stream_next[device] = 0
             index = int(self._copy_stream_next.get(device, 0)) % len(streams)
@@ -1370,19 +1438,91 @@ class NativePinnedMemoryBackend(StorageBackend):
         wait_start = ctypes.c_void_p()
         copy_start = ctypes.c_void_p()
         complete = ctypes.c_void_p()
-        _cuda_check(
-            cudart.cudaEventCreateWithFlags(ctypes.byref(wait_start), ctypes.c_uint(event_flags)),
-            "cudaEventCreateWithFlags failed",
-        )
-        _cuda_check(
-            cudart.cudaEventCreateWithFlags(ctypes.byref(copy_start), ctypes.c_uint(event_flags)),
-            "cudaEventCreateWithFlags failed",
-        )
-        _cuda_check(
-            cudart.cudaEventCreateWithFlags(ctypes.byref(complete), ctypes.c_uint(event_flags)),
-            "cudaEventCreateWithFlags failed",
-        )
+        created_events: list[int] = []
+        try:
+            _cuda_check(
+                cudart.cudaEventCreateWithFlags(ctypes.byref(wait_start), ctypes.c_uint(event_flags)),
+                "cudaEventCreateWithFlags failed",
+            )
+            created_events.append(int(wait_start.value))
+            _cuda_check(
+                cudart.cudaEventCreateWithFlags(ctypes.byref(copy_start), ctypes.c_uint(event_flags)),
+                "cudaEventCreateWithFlags failed",
+            )
+            created_events.append(int(copy_start.value))
+            _cuda_check(
+                cudart.cudaEventCreateWithFlags(ctypes.byref(complete), ctypes.c_uint(event_flags)),
+                "cudaEventCreateWithFlags failed",
+            )
+            created_events.append(int(complete.value))
+        except BaseException:
+            for event in created_events:
+                try:
+                    cudart.cudaEventDestroy(ctypes.c_void_p(int(event)))
+                except Exception:
+                    pass
+            raise
         return stream, int(wait_start.value), int(copy_start.value), int(complete.value), False
+
+    def _release_unregistered_copy_resources(
+        self,
+        *,
+        device: int,
+        stream: int | None,
+        events: tuple[int | None, ...],
+        stream_owned: bool,
+        remote_ptr: int | None,
+        remote_event: int | None,
+        cache_key: str | None,
+    ) -> None:
+        """Release resources acquired before an async op can be registered.
+
+        Once a memcpy has been enqueued, its source/destination and IPC mapping
+        must stay alive until the stream is quiescent.  This failure-only path
+        therefore synchronizes the stream before releasing any resource.  It
+        is deliberately separate from normal op completion so successful
+        copies do not pay for an extra stream synchronization.
+        """
+
+        cudart = _load_cudart()
+        if cudart is None:
+            return
+        try:
+            _cuda_set_device(int(device))
+        except Exception:
+            pass
+        if stream is not None:
+            try:
+                cudart.cudaStreamSynchronize(ctypes.c_void_p(int(stream)))
+            except Exception:
+                pass
+        if remote_event is not None:
+            try:
+                cudart.cudaEventDestroy(ctypes.c_void_p(int(remote_event)))
+            except Exception:
+                pass
+        for event in events:
+            if event is None:
+                continue
+            try:
+                cudart.cudaEventDestroy(ctypes.c_void_p(int(event)))
+            except Exception:
+                pass
+        if cache_key:
+            try:
+                self._release_ipc_cache_ref(cache_key)
+            except Exception:
+                pass
+        elif remote_ptr is not None:
+            try:
+                cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(int(remote_ptr)))
+            except Exception:
+                pass
+        if stream_owned and stream is not None:
+            try:
+                cudart.cudaStreamDestroy(ctypes.c_void_p(int(stream)))
+            except Exception:
+                pass
 
     def _release_ipc_cache_ref(self, cache_key: str | None) -> None:
         if not cache_key:
@@ -1448,108 +1588,148 @@ class NativePinnedMemoryBackend(StorageBackend):
         allocation = self._allocate_location(nbytes, allocation_device=int(view["device"]))
         segment = allocation.segment
         offset = allocation.offset
-        location = {"backend": self.name, "segment_id": segment.segment_id, "offset": int(offset), "nbytes": nbytes}
-        if segment.allocation_device is not None:
-            location["allocation_device"] = int(segment.allocation_device)
-        if segment.numa_id is not None:
-            location["numa_id"] = int(segment.numa_id)
-        record_metadata = dict(metadata or {})
-        record_metadata.update(
-            {
-                "storage_backend": self.name,
-                "storage_transport": "native_pinned",
-                "stored_device": "cpu",
-                "daemon_storage_device": "cpu",
-                "daemon_owned": True,
-                "cuda_native_pinned": True,
-                "uses_cudaHostAlloc": True,
-                "supports_cuda_ipc": True,
-                "nbytes": nbytes,
-                "valid_nbytes": int(record_metadata.get("valid_nbytes", nbytes)),
-                "location": location,
+        remote_ptr: int | None = None
+        remote_event: int | None = None
+        cache_key: str | None = None
+        stream: int | None = None
+        wait_start: int | None = None
+        copy_start: int | None = None
+        complete: int | None = None
+        stream_owned = False
+        registered = False
+        try:
+            location = {
+                "backend": self.name,
                 "segment_id": segment.segment_id,
                 "offset": int(offset),
-                "allocation_source": allocation.source,
-                "allocation_ms": allocation.allocate_ms,
-                "allocation_device": segment.allocation_device,
-                "allocation_numa_id": segment.numa_id,
+                "nbytes": nbytes,
             }
-        )
-        chunk = BackendChunk(
-            tensor=torch.empty(0, dtype=torch.uint8),
-            metadata=record_metadata,
-            nbytes=nbytes,
-            capacity_nbytes=nbytes,
-            host_ptr=int(segment.ptr + offset),
-            segment_id=segment.segment_id,
-            offset=int(offset),
-        )
-        remote_ptr, remote_event, cache_key, ipc_open_us, event_open_us, opened_new, set_device_ms = self._open_ipc_mem(view)
-        event_create_start = time.perf_counter()
-        stream, wait_start, copy_start, complete, stream_owned = self._new_stream_and_events(int(view["device"]))
-        event_create_ms = (time.perf_counter() - event_create_start) * 1000.0
-        cudart = _load_cudart()
-        assert cudart is not None
-        enqueue_api_start = time.perf_counter()
-        _cuda_check(
-            cudart.cudaEventRecord(ctypes.c_void_p(wait_start), ctypes.c_void_p(stream)),
-            "cudaEventRecord wait_start failed",
-        )
-        _cuda_check(
-            cudart.cudaStreamWaitEvent(ctypes.c_void_p(stream), ctypes.c_void_p(remote_event), ctypes.c_uint(0)),
-            "cudaStreamWaitEvent failed for source IPC event",
-        )
-        _cuda_check(
-            cudart.cudaEventRecord(ctypes.c_void_p(copy_start), ctypes.c_void_p(stream)),
-            "cudaEventRecord copy_start failed",
-        )
-        src_ptr = int(remote_ptr) + int(view.get("base_offset", 0))
-        copy_wall_start = time.perf_counter()
-        _cuda_check(
-            cudart.cudaMemcpyAsync(
-                ctypes.c_void_p(int(chunk.host_ptr)),
-                ctypes.c_void_p(src_ptr),
-                ctypes.c_size_t(nbytes),
-                ctypes.c_int(_CUDA_MEMCPY_DEVICE_TO_HOST),
-                ctypes.c_void_p(stream),
-            ),
-            "cudaMemcpyAsync D2H to native pinned failed",
-        )
-        _cuda_check(cudart.cudaEventRecord(ctypes.c_void_p(complete), ctypes.c_void_p(stream)), "cudaEventRecord failed")
-        enqueue_api_ms = (time.perf_counter() - enqueue_api_start) * 1000.0
-        enqueue_wall_ms = (time.perf_counter() - copy_wall_start) * 1000.0
-        op_id = str(uuid.uuid4())
-        with self._lock:
-            self._chunks.setdefault(str(tag), {})[str(chunk_id)] = chunk
-            self._ops[op_id] = _NativeCopyOp(
-                op_id=op_id,
-                device=int(view["device"]),
-                stream=stream,
-                wait_start_event=wait_start,
-                copy_start_event=copy_start,
-                complete_event=complete,
-                remote_ptr=remote_ptr,
-                remote_event=remote_event,
-                cache_key=cache_key,
-                stream_owned=stream_owned,
-                profile={
-                    "daemon_allocate_ms": allocation.allocate_ms,
-                    "daemon_allocate_source": allocation.source,
-                    "daemon_allocation_device": segment.allocation_device,
-                    "daemon_allocation_numa_id": segment.numa_id,
-                    "daemon_ipc_open_us": ipc_open_us,
-                    "daemon_ipc_event_open_us": event_open_us,
-                    "daemon_ipc_opened_new": opened_new,
-                    "daemon_set_device_ms": set_device_ms,
-                    "daemon_event_create_ms": event_create_ms,
-                    "daemon_enqueue_api_ms": enqueue_api_ms,
-                    "daemon_memcpy_enqueue_wall_ms": enqueue_wall_ms,
-                    "daemon_event_wait_ms": 0.0,
-                    "daemon_memcpy_ms_cuda_event": 0.0,
-                    "daemon_memcpy_ms_wall": 0.0,
-                },
+            if segment.allocation_device is not None:
+                location["allocation_device"] = int(segment.allocation_device)
+            if segment.numa_id is not None:
+                location["numa_id"] = int(segment.numa_id)
+            record_metadata = dict(metadata or {})
+            record_metadata.update(
+                {
+                    "storage_backend": self.name,
+                    "storage_transport": "native_pinned",
+                    "stored_device": "cpu",
+                    "daemon_storage_device": "cpu",
+                    "daemon_owned": True,
+                    "cuda_native_pinned": True,
+                    "uses_cudaHostAlloc": True,
+                    "supports_cuda_ipc": True,
+                    "nbytes": nbytes,
+                    "valid_nbytes": int(record_metadata.get("valid_nbytes", nbytes)),
+                    "location": location,
+                    "segment_id": segment.segment_id,
+                    "offset": int(offset),
+                    "allocation_source": allocation.source,
+                    "allocation_ms": allocation.allocate_ms,
+                    "allocation_device": segment.allocation_device,
+                    "allocation_numa_id": segment.numa_id,
+                }
             )
-        return op_id, dict(record_metadata)
+            record_metadata = self._prepare_record_metadata(str(tag), str(chunk_id), record_metadata)
+            chunk = BackendChunk(
+                tensor=torch.empty(0, dtype=torch.uint8),
+                metadata=record_metadata,
+                nbytes=nbytes,
+                capacity_nbytes=nbytes,
+                host_ptr=int(segment.ptr + offset),
+                segment_id=segment.segment_id,
+                offset=int(offset),
+            )
+            remote_ptr, remote_event, cache_key, ipc_open_us, event_open_us, opened_new, set_device_ms = (
+                self._open_ipc_mem(view)
+            )
+            event_create_start = time.perf_counter()
+            stream, wait_start, copy_start, complete, stream_owned = self._new_stream_and_events(
+                int(view["device"])
+            )
+            event_create_ms = (time.perf_counter() - event_create_start) * 1000.0
+            cudart = _load_cudart()
+            assert cudart is not None
+            enqueue_api_start = time.perf_counter()
+            _cuda_check(
+                cudart.cudaEventRecord(ctypes.c_void_p(wait_start), ctypes.c_void_p(stream)),
+                "cudaEventRecord wait_start failed",
+            )
+            _cuda_check(
+                cudart.cudaStreamWaitEvent(ctypes.c_void_p(stream), ctypes.c_void_p(remote_event), ctypes.c_uint(0)),
+                "cudaStreamWaitEvent failed for source IPC event",
+            )
+            _cuda_check(
+                cudart.cudaEventRecord(ctypes.c_void_p(copy_start), ctypes.c_void_p(stream)),
+                "cudaEventRecord copy_start failed",
+            )
+            src_ptr = int(remote_ptr) + int(view.get("base_offset", 0))
+            copy_wall_start = time.perf_counter()
+            _cuda_check(
+                cudart.cudaMemcpyAsync(
+                    ctypes.c_void_p(int(chunk.host_ptr)),
+                    ctypes.c_void_p(src_ptr),
+                    ctypes.c_size_t(nbytes),
+                    ctypes.c_int(_CUDA_MEMCPY_DEVICE_TO_HOST),
+                    ctypes.c_void_p(stream),
+                ),
+                "cudaMemcpyAsync D2H to native pinned failed",
+            )
+            _cuda_check(
+                cudart.cudaEventRecord(ctypes.c_void_p(complete), ctypes.c_void_p(stream)),
+                "cudaEventRecord failed",
+            )
+            enqueue_api_ms = (time.perf_counter() - enqueue_api_start) * 1000.0
+            enqueue_wall_ms = (time.perf_counter() - copy_wall_start) * 1000.0
+            op_id = str(uuid.uuid4())
+            with self._lock:
+                self._ops[op_id] = _NativeCopyOp(
+                    op_id=op_id,
+                    device=int(view["device"]),
+                    stream=stream,
+                    wait_start_event=wait_start,
+                    copy_start_event=copy_start,
+                    complete_event=complete,
+                    remote_ptr=remote_ptr,
+                    remote_event=remote_event,
+                    cache_key=cache_key,
+                    stream_owned=stream_owned,
+                    profile={
+                        "daemon_allocate_ms": allocation.allocate_ms,
+                        "daemon_allocate_source": allocation.source,
+                        "daemon_allocation_device": segment.allocation_device,
+                        "daemon_allocation_numa_id": segment.numa_id,
+                        "daemon_ipc_open_us": ipc_open_us,
+                        "daemon_ipc_event_open_us": event_open_us,
+                        "daemon_ipc_opened_new": opened_new,
+                        "daemon_set_device_ms": set_device_ms,
+                        "daemon_event_create_ms": event_create_ms,
+                        "daemon_enqueue_api_ms": enqueue_api_ms,
+                        "daemon_memcpy_enqueue_wall_ms": enqueue_wall_ms,
+                        "daemon_event_wait_ms": 0.0,
+                        "daemon_memcpy_ms_cuda_event": 0.0,
+                        "daemon_memcpy_ms_wall": 0.0,
+                    },
+                    publish_tag=str(tag),
+                    publish_chunk_id=str(chunk_id),
+                    pending_chunk=chunk,
+                )
+                registered = True
+            return op_id, dict(record_metadata)
+        except BaseException:
+            if not registered:
+                self._release_unregistered_copy_resources(
+                    device=int(view["device"]),
+                    stream=stream,
+                    events=(wait_start, copy_start, complete),
+                    stream_owned=stream_owned,
+                    remote_ptr=remote_ptr,
+                    remote_event=remote_event,
+                    cache_key=cache_key,
+                )
+                with self._lock:
+                    self._free_location_locked(segment.segment_id, int(offset), nbytes)
+            raise
 
     def read_to_cuda_ipc(self, tag: str, chunk_id: str, view: dict[str, Any]) -> str:
         if bool(getattr(self, "_serialize_read_ipc", False)):
@@ -1560,124 +1740,165 @@ class NativePinnedMemoryBackend(StorageBackend):
         return self._read_to_cuda_ipc_unserialized(tag, chunk_id, view)
 
     def _read_to_cuda_ipc_unserialized(self, tag: str, chunk_id: str, view: dict[str, Any]) -> str:
+        dst_nbytes = int(view.get("nbytes", 0) or 0)
         with self._lock:
             chunk = self._chunks[str(tag)][str(chunk_id)]
-        debug_read_checksum = any(
-            str(os.environ.get(name, "")).lower() not in {"", "0", "false", "no", "off", "none", "disabled"}
-            for name in ("RACER_DEBUG_STORAGE_READ_CHECKSUM", "RACER_DEBUG_PAYLOAD_CHECKSUM")
-        )
-        if debug_read_checksum:
-            metadata = dict(chunk.metadata or {})
-            expected = str(metadata.get("checksum", "") or "")
-            checksum_type = str(metadata.get("checksum_type", "") or "")
-            if expected:
-                checksum_kind = checksum_type or "sample64"
-                if expected.startswith(("sample64-v1:", "sum64-v1:")):
-                    checksum_kind = "sample64"
-                elif expected.startswith("sha256-v1:"):
-                    checksum_kind = "sha256"
-                try:
-                    actual = self.checksum(str(tag), str(chunk_id), checksum_type=checksum_kind)
-                    if actual == expected:
+            if dst_nbytes < int(chunk.nbytes):
+                raise ValueError(
+                    f"destination CUDA IPC buffer for chunk {chunk_id!r} is too small: "
+                    f"dst_nbytes={dst_nbytes}, chunk_nbytes={int(chunk.nbytes)}"
+                )
+            self._acquire_chunk_read_lease_locked(chunk)
+        remote_ptr: int | None = None
+        remote_event: int | None = None
+        cache_key: str | None = None
+        stream: int | None = None
+        wait_start: int | None = None
+        copy_start: int | None = None
+        complete: int | None = None
+        stream_owned = False
+        registered = False
+        try:
+            debug_read_checksum = any(
+                str(os.environ.get(name, "")).lower()
+                not in {"", "0", "false", "no", "off", "none", "disabled"}
+                for name in ("RACER_DEBUG_STORAGE_READ_CHECKSUM", "RACER_DEBUG_PAYLOAD_CHECKSUM")
+            )
+            if debug_read_checksum:
+                metadata = dict(chunk.metadata or {})
+                expected = str(metadata.get("checksum", "") or "")
+                checksum_type = str(metadata.get("checksum_type", "") or "")
+                if expected:
+                    checksum_kind = checksum_type or "sample64"
+                    if expected.startswith(("sample64-v1:", "sum64-v1:")):
+                        checksum_kind = "sample64"
+                    elif expected.startswith("sha256-v1:"):
+                        checksum_kind = "sha256"
+                    try:
+                        actual = self.checksum(str(tag), str(chunk_id), checksum_type=checksum_kind)
+                        if actual == expected:
+                            print(
+                                f"RACER CSD resident checksum before read verified: tag={tag}, "
+                                f"chunk_id={chunk_id}, checksum={actual}, nbytes={int(chunk.nbytes)}",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"RACER CSD resident checksum before read mismatch: tag={tag}, chunk_id={chunk_id}, "
+                                f"expected={expected}, got={actual}, nbytes={int(chunk.nbytes)}",
+                                flush=True,
+                            )
+                    except Exception as exc:
                         print(
-                            f"RACER CSD resident checksum before read verified: tag={tag}, "
-                            f"chunk_id={chunk_id}, checksum={actual}, nbytes={int(chunk.nbytes)}",
+                            f"RACER CSD resident checksum before read error: tag={tag}, chunk_id={chunk_id}, "
+                            f"checksum_type={checksum_kind!r}, error={type(exc).__name__}: {exc}",
                             flush=True,
                         )
-                    else:
-                        print(
-                            f"RACER CSD resident checksum before read mismatch: tag={tag}, chunk_id={chunk_id}, "
-                            f"expected={expected}, got={actual}, nbytes={int(chunk.nbytes)}",
-                            flush=True,
-                        )
-                except Exception as exc:
-                    print(
-                        f"RACER CSD resident checksum before read error: tag={tag}, chunk_id={chunk_id}, "
-                        f"checksum_type={checksum_kind!r}, error={type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
-        dst_nbytes = int(view.get("nbytes", 0) or 0)
-        if dst_nbytes < int(chunk.nbytes):
-            raise ValueError(
-                f"destination CUDA IPC buffer for chunk {chunk_id!r} is too small: "
-                f"dst_nbytes={dst_nbytes}, chunk_nbytes={int(chunk.nbytes)}"
+            remote_ptr, remote_event, cache_key, ipc_open_us, event_open_us, opened_new, set_device_ms = (
+                self._open_ipc_mem(view)
             )
-        remote_ptr, remote_event, cache_key, ipc_open_us, event_open_us, opened_new, set_device_ms = self._open_ipc_mem(view)
-        stream, wait_start, copy_start, complete, stream_owned = self._new_stream_and_events(int(view["device"]))
-        cudart = _load_cudart()
-        assert cudart is not None
-        _cuda_check(
-            cudart.cudaEventRecord(ctypes.c_void_p(wait_start), ctypes.c_void_p(stream)),
-            "cudaEventRecord wait_start failed",
-        )
-        _cuda_check(
-            cudart.cudaStreamWaitEvent(ctypes.c_void_p(stream), ctypes.c_void_p(remote_event), ctypes.c_uint(0)),
-            "cudaStreamWaitEvent failed for destination IPC event",
-        )
-        _cuda_check(
-            cudart.cudaEventRecord(ctypes.c_void_p(copy_start), ctypes.c_void_p(stream)),
-            "cudaEventRecord copy_start failed",
-        )
-        dst_ptr = int(remote_ptr) + int(view.get("base_offset", 0))
-        copy_wall_start = time.perf_counter()
-        _cuda_check(
-            cudart.cudaMemcpyAsync(
-                ctypes.c_void_p(dst_ptr),
-                ctypes.c_void_p(int(chunk.host_ptr)),
-                ctypes.c_size_t(int(chunk.nbytes)),
-                ctypes.c_int(_CUDA_MEMCPY_HOST_TO_DEVICE),
-                ctypes.c_void_p(stream),
-            ),
-            "cudaMemcpyAsync H2D from native pinned failed",
-        )
-        _cuda_check(cudart.cudaEventRecord(ctypes.c_void_p(complete), ctypes.c_void_p(stream)), "cudaEventRecord failed")
-        enqueue_wall_ms = (time.perf_counter() - copy_wall_start) * 1000.0
-        op_id = str(uuid.uuid4())
-        with self._lock:
-            self._ops[op_id] = _NativeCopyOp(
-                op_id=op_id,
-                device=int(view["device"]),
-                stream=stream,
-                wait_start_event=wait_start,
-                copy_start_event=copy_start,
-                complete_event=complete,
-                remote_ptr=remote_ptr,
-                remote_event=remote_event,
-                cache_key=cache_key,
-                stream_owned=stream_owned,
-                profile={
-                    "daemon_ipc_open_us": ipc_open_us,
-                    "daemon_ipc_event_open_us": event_open_us,
-                    "daemon_ipc_opened_new": opened_new,
-                    "daemon_set_device_ms": set_device_ms,
-                    "daemon_memcpy_enqueue_wall_ms": enqueue_wall_ms,
-                    "daemon_event_wait_ms": 0.0,
-                    "daemon_memcpy_ms_cuda_event": 0.0,
-                    "daemon_memcpy_ms_wall": 0.0,
-                },
+            stream, wait_start, copy_start, complete, stream_owned = self._new_stream_and_events(int(view["device"]))
+            cudart = _load_cudart()
+            assert cudart is not None
+            _cuda_check(
+                cudart.cudaEventRecord(ctypes.c_void_p(wait_start), ctypes.c_void_p(stream)),
+                "cudaEventRecord wait_start failed",
             )
-        return op_id
+            _cuda_check(
+                cudart.cudaStreamWaitEvent(ctypes.c_void_p(stream), ctypes.c_void_p(remote_event), ctypes.c_uint(0)),
+                "cudaStreamWaitEvent failed for destination IPC event",
+            )
+            _cuda_check(
+                cudart.cudaEventRecord(ctypes.c_void_p(copy_start), ctypes.c_void_p(stream)),
+                "cudaEventRecord copy_start failed",
+            )
+            dst_ptr = int(remote_ptr) + int(view.get("base_offset", 0))
+            copy_wall_start = time.perf_counter()
+            _cuda_check(
+                cudart.cudaMemcpyAsync(
+                    ctypes.c_void_p(dst_ptr),
+                    ctypes.c_void_p(int(chunk.host_ptr)),
+                    ctypes.c_size_t(int(chunk.nbytes)),
+                    ctypes.c_int(_CUDA_MEMCPY_HOST_TO_DEVICE),
+                    ctypes.c_void_p(stream),
+                ),
+                "cudaMemcpyAsync H2D from native pinned failed",
+            )
+            _cuda_check(
+                cudart.cudaEventRecord(ctypes.c_void_p(complete), ctypes.c_void_p(stream)),
+                "cudaEventRecord failed",
+            )
+            enqueue_wall_ms = (time.perf_counter() - copy_wall_start) * 1000.0
+            op_id = str(uuid.uuid4())
+            with self._lock:
+                self._ops[op_id] = _NativeCopyOp(
+                    op_id=op_id,
+                    device=int(view["device"]),
+                    stream=stream,
+                    wait_start_event=wait_start,
+                    copy_start_event=copy_start,
+                    complete_event=complete,
+                    remote_ptr=remote_ptr,
+                    remote_event=remote_event,
+                    cache_key=cache_key,
+                    stream_owned=stream_owned,
+                    profile={
+                        "daemon_ipc_open_us": ipc_open_us,
+                        "daemon_ipc_event_open_us": event_open_us,
+                        "daemon_ipc_opened_new": opened_new,
+                        "daemon_set_device_ms": set_device_ms,
+                        "daemon_memcpy_enqueue_wall_ms": enqueue_wall_ms,
+                        "daemon_event_wait_ms": 0.0,
+                        "daemon_memcpy_ms_cuda_event": 0.0,
+                        "daemon_memcpy_ms_wall": 0.0,
+                    },
+                    read_chunk=chunk,
+                )
+                registered = True
+            return op_id
+        except BaseException:
+            if not registered:
+                self._release_unregistered_copy_resources(
+                    device=int(view["device"]),
+                    stream=stream,
+                    events=(wait_start, copy_start, complete),
+                    stream_owned=stream_owned,
+                    remote_ptr=remote_ptr,
+                    remote_event=remote_event,
+                    cache_key=cache_key,
+                )
+                with self._lock:
+                    self._release_chunk_read_lease_locked(chunk)
+            raise
 
-    def _complete_op_locked(self, op: _NativeCopyOp) -> None:
+    def _discard_pending_chunk_locked(self, op: _NativeCopyOp) -> None:
+        chunk = op.pending_chunk
+        if chunk is None:
+            return
+        self._release_chunk_location_locked(chunk)
+        op.pending_chunk = None
+
+    def _release_op_read_lease_locked(self, op: _NativeCopyOp) -> None:
+        chunk = op.read_chunk
+        if chunk is None:
+            return
+        op.read_chunk = None
+        self._release_chunk_read_lease_locked(chunk)
+
+    def _publish_pending_chunk_locked(self, op: _NativeCopyOp) -> None:
+        chunk = op.pending_chunk
+        if chunk is None:
+            return
+        if op.publish_tag is None or op.publish_chunk_id is None:
+            raise RuntimeError(f"native pinned write op {op.op_id} has no publication target")
+        self._publish_chunk_locked(op.publish_tag, op.publish_chunk_id, chunk)
+        op.pending_chunk = None
+
+    def _release_op_resources_locked(self, op: _NativeCopyOp) -> None:
         if op.resources_released:
-            op.done = True
             return
         cudart = _load_cudart()
-        assert cudart is not None
-        try:
-            profile = dict(op.profile or {})
-            if os.environ.get("RACER_CSD_CUDA_EVENT_TIMING", "0") == "1":
-                try:
-                    profile["daemon_event_wait_ms"] = _cuda_event_elapsed_ms(op.wait_start_event, op.copy_start_event)
-                    profile["daemon_memcpy_ms_cuda_event"] = _cuda_event_elapsed_ms(op.copy_start_event, op.complete_event)
-                except Exception as exc:
-                    profile["daemon_event_timing_error"] = str(exc)
-            op.profile = profile
-            op.done = True
-        except BaseException as exc:
-            op.error = str(exc)
-            raise
-        finally:
+        if cudart is not None:
             if op.remote_event is not None:
                 try:
                     cudart.cudaEventDestroy(ctypes.c_void_p(int(op.remote_event)))
@@ -1694,13 +1915,45 @@ class NativePinnedMemoryBackend(StorageBackend):
                 except Exception:
                     pass
             elif op.cache_key:
-                self._release_ipc_cache_ref(op.cache_key)
+                try:
+                    self._release_ipc_cache_ref(op.cache_key)
+                except Exception:
+                    pass
             if op.stream_owned:
                 try:
                     cudart.cudaStreamDestroy(ctypes.c_void_p(int(op.stream)))
                 except Exception:
                     pass
-            op.resources_released = True
+        op.resources_released = True
+
+    def _fail_op_locked(self, op: _NativeCopyOp, error: BaseException | str) -> None:
+        op.error = str(error)
+        self._discard_pending_chunk_locked(op)
+        self._release_op_read_lease_locked(op)
+        op.done = True
+        self._release_op_resources_locked(op)
+
+    def _complete_op_locked(self, op: _NativeCopyOp) -> None:
+        if op.resources_released:
+            op.done = True
+            return
+        try:
+            profile = dict(op.profile or {})
+            if os.environ.get("RACER_CSD_CUDA_EVENT_TIMING", "0") == "1":
+                try:
+                    profile["daemon_event_wait_ms"] = _cuda_event_elapsed_ms(op.wait_start_event, op.copy_start_event)
+                    profile["daemon_memcpy_ms_cuda_event"] = _cuda_event_elapsed_ms(op.copy_start_event, op.complete_event)
+                except Exception as exc:
+                    profile["daemon_event_timing_error"] = str(exc)
+            op.profile = profile
+            self._publish_pending_chunk_locked(op)
+            self._release_op_read_lease_locked(op)
+            op.done = True
+        except BaseException as exc:
+            self._fail_op_locked(op, exc)
+            raise
+        finally:
+            self._release_op_resources_locked(op)
 
     def wait(self, op_id: str) -> None:
         cudart = _load_cudart()
@@ -1731,7 +1984,8 @@ class NativePinnedMemoryBackend(StorageBackend):
                     self._complete_op_locked(op)
         except BaseException as exc:
             with self._op_condition:
-                op.error = str(exc)
+                if not op.done:
+                    self._fail_op_locked(op, exc)
             raise
         finally:
             with self._op_condition:
@@ -1766,9 +2020,14 @@ class NativePinnedMemoryBackend(StorageBackend):
             if err != _CUDA_ERROR_NOT_READY:
                 message = f"cudaEventQuery failed for native pinned op {op_id}: CUDA error code {err}"
                 with self._op_condition:
-                    op.error = message
+                    self._fail_op_locked(op, message)
                 return "FAILED"
             return "RUNNING"
+        except BaseException as exc:
+            with self._op_condition:
+                if not op.done:
+                    self._fail_op_locked(op, exc)
+            return "FAILED"
         finally:
             with self._op_condition:
                 op.in_completion = False
@@ -1836,7 +2095,7 @@ class NativePinnedMemoryBackend(StorageBackend):
                 return
             chunk = chunks.pop(str(chunk_id), None)
             if chunk is not None:
-                self._free_location_locked(chunk.segment_id, chunk.offset, chunk.capacity_nbytes)
+                self._retire_chunk_locked(chunk)
             if not chunks:
                 self._chunks.pop(str(tag), None)
 
@@ -1846,9 +2105,12 @@ class NativePinnedMemoryBackend(StorageBackend):
             if not chunks:
                 return
             for chunk in chunks.values():
-                self._free_location_locked(chunk.segment_id, chunk.offset, chunk.capacity_nbytes)
+                self._retire_chunk_locked(chunk)
 
-    def __del__(self) -> None:
+    def close(self) -> None:
+        if bool(getattr(self, "_closed", False)):
+            return
+        self._closed = True
         try:
             self._stop_poller.set()
         except Exception:
@@ -1859,7 +2121,10 @@ class NativePinnedMemoryBackend(StorageBackend):
                 poller.join(timeout=1.0)
         except Exception:
             pass
-        cudart = _load_cudart()
+        # Use the exact runtime object that allocated these resources. This is
+        # also important for embedders/tests that replace the CUDA runtime
+        # adapter during backend construction.
+        cudart = getattr(self, "_cudart", None)
         if cudart is None:
             return
         for cached in getattr(self, "_ipc_mem_cache", {}).values():
@@ -1878,6 +2143,15 @@ class NativePinnedMemoryBackend(StorageBackend):
                 cudart.cudaFreeHost(ctypes.c_void_p(int(segment.ptr)))
             except Exception:
                 pass
+        getattr(self, "_ipc_mem_cache", {}).clear()
+        getattr(self, "_copy_streams", {}).clear()
+        getattr(self, "_segments", []).clear()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class EgmBackend(StorageBackend):
@@ -1927,6 +2201,7 @@ class EgmBackend(StorageBackend):
         self.numa_id = None if numa_id is None else int(numa_id)
         self.accessing_devices = tuple(int(device) for device in accessing_devices or ())
         self._metadata: dict[str, dict[str, dict[str, Any]]] = {}
+        self._pending_write_metadata: dict[str, tuple[str, str, dict[str, Any]]] = {}
         self._lock = threading.RLock()
 
     def capabilities(self) -> dict[str, Any]:
@@ -1943,7 +2218,10 @@ class EgmBackend(StorageBackend):
             "supports_cuda_ipc": True,
             "supports_async_copy": True,
             "supports_egm_native_transport": True,
-            "supports_zero_copy_region": bool(runtime_caps.get("supports_zero_copy_region", True)),
+            # Native CUDA IPC transport is not the same as exposing a
+            # producer-addressable zero-copy EGM region.  Runtimes must opt in
+            # only when they implement that stronger API.
+            "supports_zero_copy_region": bool(runtime_caps.get("supports_zero_copy_region", False)),
             "pool_id": self.pool_id,
             "owner_node": self.owner_node,
             "owner_tray": self.owner_tray,
@@ -2056,9 +2334,48 @@ class EgmBackend(StorageBackend):
                 "checksum": record_metadata.get("checksum", ""),
             }
         )
-        with self._lock:
-            self._metadata.setdefault(str(tag), {})[str(chunk_id)] = dict(record_metadata)
         return record_metadata
+
+    def _stage_write_metadata(
+        self,
+        op_id: str,
+        tag: str,
+        chunk_id: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        op_key = str(op_id)
+        tag_key = str(tag)
+        chunk_key = str(chunk_id)
+        with self._lock:
+            if op_key in self._pending_write_metadata:
+                raise RuntimeError(f"EGM runtime reused pending operation id {op_key!r}")
+            self._pending_write_metadata[op_key] = (tag_key, chunk_key, dict(metadata))
+
+    def _finish_write_metadata(self, op_id: str, *, success: bool) -> None:
+        with self._lock:
+            pending = self._pending_write_metadata.pop(str(op_id), None)
+            if pending is None:
+                return
+            tag, chunk_id, metadata = pending
+            if success:
+                self._metadata.setdefault(tag, {})[chunk_id] = dict(metadata)
+
+    @staticmethod
+    def _runtime_operation_state(result: Any, *, default: str) -> str:
+        if isinstance(result, dict):
+            raw_state = result.get("state", result.get("status", default))
+        elif result is None:
+            raw_state = default
+        else:
+            raw_state = result
+        state = str(raw_state).strip().upper()
+        if state in {"DONE", "SUCCESS", "SUCCEEDED", "COMPLETE", "COMPLETED"} or state.endswith(".DONE"):
+            return "DONE"
+        if state in {"FAILED", "FAILURE", "ERROR", "CANCELLED", "CANCELED"} or state.endswith(".FAILED"):
+            return "FAILED"
+        if state in {"RUNNING", "PENDING", "IN_PROGRESS", "NOT_READY"} or state.endswith(".RUNNING"):
+            return "RUNNING"
+        return str(default).upper()
 
     def write_from_bytes(
         self,
@@ -2127,7 +2444,9 @@ class EgmBackend(StorageBackend):
             runtime_metadata = {}
         nbytes = int(runtime_metadata.get("nbytes", dict(view).get("nbytes", dict(metadata or {}).get("nbytes", 0))) or 0)
         record_metadata = self._normalize_metadata(str(tag), str(chunk_id), nbytes, metadata, runtime_metadata)
-        return str(op_id), record_metadata
+        op_key = str(op_id)
+        self._stage_write_metadata(op_key, str(tag), str(chunk_id), record_metadata)
+        return op_key, record_metadata
 
     def read_to_cuda_ipc(self, tag: str, chunk_id: str, view: dict[str, Any]) -> str:
         result = self.runtime.read_to_cuda_ipc(str(tag), str(chunk_id), dict(view))
@@ -2137,14 +2456,38 @@ class EgmBackend(StorageBackend):
 
     def wait(self, op_id: str) -> None:
         wait_fn = getattr(self.runtime, "wait", None)
-        if callable(wait_fn):
-            wait_fn(str(op_id))
+        op_key = str(op_id)
+        try:
+            result = wait_fn(op_key) if callable(wait_fn) else None
+            state = self._runtime_operation_state(result, default="DONE")
+            if state != "DONE":
+                error = result.get("error") if isinstance(result, dict) else None
+                detail = f": {error}" if error else ""
+                raise RuntimeError(f"EGM runtime wait for operation {op_key!r} returned {state}{detail}")
+        except BaseException:
+            self._finish_write_metadata(op_key, success=False)
+            raise
+        self._finish_write_metadata(op_key, success=True)
 
     def poll(self, op_id: str) -> str:
         poll_fn = getattr(self.runtime, "poll", None)
+        op_key = str(op_id)
         if callable(poll_fn):
-            return str(poll_fn(str(op_id)))
-        return "DONE"
+            result = poll_fn(op_key)
+            state = self._runtime_operation_state(result, default="RUNNING")
+        else:
+            state = "DONE"
+        if state == "DONE":
+            # CheckpointStorageDaemon follows a DONE poll with wait(). If the
+            # generic runtime only implements wait, defer publication to that
+            # actual completion barrier instead of treating the missing poll
+            # method as proof that the copy finished.
+            wait_fn = getattr(self.runtime, "wait", None)
+            if callable(poll_fn) or not callable(wait_fn):
+                self._finish_write_metadata(op_key, success=True)
+        elif state == "FAILED":
+            self._finish_write_metadata(op_key, success=False)
+        return state
 
     def profile(self, op_id: str) -> dict[str, Any]:
         profile_fn = getattr(self.runtime, "profile", None)
@@ -2158,12 +2501,9 @@ class EgmBackend(StorageBackend):
                 local = dict(self._metadata[str(tag)][str(chunk_id)])
         except KeyError as exc:
             raise KeyError(f"CSD EGM chunk metadata {chunk_id!r} for tag {tag!r} is not resident") from exc
-        runtime_metadata_fn = getattr(self.runtime, "metadata", None)
-        if callable(runtime_metadata_fn):
-            try:
-                local.update(dict(runtime_metadata_fn(str(tag), str(chunk_id))))
-            except KeyError:
-                pass
+        # The op-specific metadata returned by write_from_cuda_ipc is the
+        # wrapper's generation record. Querying a key-based generic runtime
+        # here could merge an eagerly exposed or failed candidate generation.
         return self._normalize_metadata(str(tag), str(chunk_id), int(local.get("nbytes", 0) or 0), local)
 
     def update_metadata(self, tag: str, chunk_id: str, metadata: dict[str, Any]) -> None:
@@ -2171,13 +2511,22 @@ class EgmBackend(StorageBackend):
         runtime_update_metadata = getattr(self.runtime, "update_metadata", None)
         if callable(runtime_update_metadata):
             runtime_update_metadata(str(tag), str(chunk_id), normalized)
+        with self._lock:
+            self._metadata.setdefault(str(tag), {})[str(chunk_id)] = dict(normalized)
 
     def list_chunks(self, tag: str) -> list[str]:
+        with self._lock:
+            published = {str(chunk_id) for chunk_id in self._metadata.get(str(tag), {})}
         runtime_list_fn = getattr(self.runtime, "list_chunks", None)
         if callable(runtime_list_fn):
-            return sorted(str(item) for item in runtime_list_fn(str(tag)))
-        with self._lock:
-            return sorted(self._metadata.get(str(tag), {}))
+            # A pluggable runtime may allocate/expose its candidate key as soon
+            # as write_from_cuda_ipc is enqueued.  Residency must use only the
+            # generations that this wrapper published after successful
+            # poll/wait completion, while still failing closed if runtime
+            # storage no longer reports a published allocation.
+            runtime_resident = {str(item) for item in runtime_list_fn(str(tag))}
+            published.intersection_update(runtime_resident)
+        return sorted(published)
 
     def free(self, tag: str, chunk_id: str) -> None:
         free_fn = getattr(self.runtime, "free", None)
@@ -2201,6 +2550,11 @@ class CheckpointStorageDaemon:
         self._async_ops: dict[str, dict[str, Any]] = {}
         self._pending_seals: dict[str, list[dict[str, Any]]] = {}
         self._lock = threading.RLock()
+        # PUT registration and tag deletion must form one lifecycle.  Holding
+        # this lock through delete's drain prevents a pre-delete PUT future
+        # from registering late and prevents a new PUT from racing the final
+        # backend free_tag call.
+        self._tag_lifecycle_lock = threading.RLock()
         self._put_executor = ThreadPoolExecutor(
             max_workers=max(1, int(os.environ.get("RACER_CSD_PUT_WORKERS", "8"))),
             thread_name_prefix="racer-csd-put",
@@ -2213,6 +2567,12 @@ class CheckpointStorageDaemon:
 
     def close(self) -> None:
         self._put_executor.shutdown(wait=True, cancel_futures=False)
+        if self.manifest_store is not None:
+            self.manifest_store.close()
+            self.manifest_store = None
+        close_backend = getattr(self.backend, "close", None)
+        if callable(close_backend):
+            close_backend()
 
     def _prewarm_put_workers(self) -> None:
         if os.environ.get("RACER_CSD_PREWARM_PUT_WORKERS", "1") != "1":
@@ -2259,6 +2619,16 @@ class CheckpointStorageDaemon:
             if not isinstance(entry, dict) or "tag" not in entry:
                 continue
             tag = str(entry["tag"])
+            if self.manifest_store is not None:
+                try:
+                    durable = self.manifest_store.get_checkpoint(tag)
+                except KeyError:
+                    durable = None
+                if durable is not None and int(durable.get("expected_chunks", 0) or 0) == 0:
+                    # Metadata-only records are SQLite-authoritative.  In
+                    # particular, do not let a stale legacy WRITING .pt cache
+                    # shadow an atomically committed row after daemon restart.
+                    continue
             entry.setdefault("chunks", {})
             entry["data_resident"] = False
             with self._lock:
@@ -2272,11 +2642,14 @@ class CheckpointStorageDaemon:
     ) -> dict[str, Any]:
         actual = str(tag)
         manifest = dict(manifest_base or {})
+        expected = len(list(manifest.get("chunks", []))) if expected_chunks is None else int(expected_chunks)
+        if expected < 0:
+            raise ValueError("expected_chunks must be non-negative")
         if self.manifest_store is not None:
             self.manifest_store.begin_checkpoint(
                 actual,
                 manifest,
-                expected_chunks=expected_chunks,
+                expected_chunks=expected,
                 backend=self.backend.name,
             )
         with self._lock:
@@ -2284,8 +2657,9 @@ class CheckpointStorageDaemon:
                 "tag": actual,
                 "manifest": manifest,
                 "chunks": {},
+                "expected_chunks": expected,
                 "committed": False,
-                "data_resident": True,
+                "data_resident": expected == 0,
                 "storage_backend": self.backend.name,
                 "backend_capabilities": self.backend.capabilities(),
             }
@@ -2303,6 +2677,7 @@ class CheckpointStorageDaemon:
                     "tag": actual,
                     "manifest": {},
                     "chunks": {},
+                    "expected_chunks": 0,
                     "committed": False,
                     "data_resident": True,
                     "storage_backend": self.backend.name,
@@ -2313,6 +2688,83 @@ class CheckpointStorageDaemon:
         if self.manifest_store is not None:
             self.manifest_store.update_manifest(actual, dict(manifest))
         self._persist(actual)
+
+    def commit_metadata(self, tag: str, manifest: dict[str, Any]) -> dict[str, Any]:
+        """Atomically commit a manifest that owns no data chunks.
+
+        Tensor-tree metadata and top-level commit markers are control-plane
+        records.  Sending them through begin/put_manifest/commit duplicates a
+        large payload and exposes three intermediate durable states.  This
+        method publishes the record in one daemon request and one SQLite
+        transaction while retaining exact-payload idempotency.
+        """
+
+        actual = str(tag)
+        value = dict(manifest or {})
+        if list(value.get("chunks", [])):
+            raise ValueError("commit_metadata only accepts metadata-only manifests without chunks")
+        with self._tag_lifecycle_lock:
+            with self._lock:
+                if self.manifest_store is not None:
+                    created = self.manifest_store.commit_metadata_checkpoint(
+                        actual,
+                        value,
+                        backend=self.backend.name,
+                    )
+                else:
+                    current = self._entries.get(actual)
+                    if current is not None:
+                        previous = dict(
+                            current.get("metadata_manifest_base", current.get("manifest")) or {}
+                        )
+                        if previous != value:
+                            raise RuntimeError(
+                                f"CSD metadata checkpoint {actual!r} already exists with different content"
+                            )
+                        if bool(current.get("committed", False)):
+                            created = False
+                        else:
+                            expected = int(current.get("expected_chunks", 0) or 0)
+                            chunk_count = len(dict(current.get("chunks") or {}))
+                            if expected != 0 or chunk_count:
+                                raise RuntimeError(
+                                    f"CSD metadata checkpoint {actual!r} owns data chunks"
+                                )
+                            created = True
+                    else:
+                        created = True
+                self._entries[actual] = {
+                    "tag": actual,
+                    "manifest": dict(value),
+                    "metadata_manifest_base": dict(value),
+                    "chunks": {},
+                    "expected_chunks": 0,
+                    "committed": True,
+                    "data_resident": True,
+                    "storage_backend": self.backend.name,
+                    "backend_capabilities": self.backend.capabilities(),
+                }
+            if self.metadata_dir is not None:
+                # Remove a possible PREPARING/WRITING cache left by an older
+                # three-step publisher.  Otherwise it could shadow the
+                # authoritative committed SQLite row after daemon restart.
+                try:
+                    self._metadata_path(actual).unlink(missing_ok=True)
+                except OSError as exc:
+                    print(
+                        f"[CSD] WARNING: failed to remove redundant metadata cache for "
+                        f"{actual!r}: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        # When metadata_dir is configured, SQLite is the durable authority.
+        # Avoid the legacy .pt compatibility cache here: it would serialize
+        # the same ~100 KiB tree several more times on the commit hot path.
+        return {
+            "tag": actual,
+            "committed": True,
+            "created": bool(created),
+        }
 
     def _merge_chunk_metadata(self, entry: dict[str, Any]) -> None:
         manifest = dict(entry.get("manifest") or {})
@@ -2335,6 +2787,25 @@ class CheckpointStorageDaemon:
         manifest["daemon_owned"] = True
         entry["manifest"] = manifest
 
+    def _entry_residency(self, tag: str, entry: dict[str, Any]) -> tuple[bool, int, int]:
+        """Return complete-residency state for the in-memory metadata path."""
+
+        expected = int(
+            entry.get(
+                "expected_chunks",
+                len(list(dict(entry.get("manifest") or {}).get("chunks", []))),
+            )
+            or 0
+        )
+        sealed_chunk_ids = {str(chunk_id) for chunk_id in dict(entry.get("chunks") or {})}
+        try:
+            resident_chunk_ids = {str(chunk_id) for chunk_id in self.backend.list_chunks(str(tag))}
+        except Exception:
+            resident_chunk_ids = set()
+        published_chunk_ids = sealed_chunk_ids.intersection(resident_chunk_ids)
+        resident = expected == 0 or len(published_chunk_ids) == expected
+        return resident, len(published_chunk_ids), expected
+
     def _flush_pending_seals(self, tag: str) -> float:
         if self.manifest_store is None:
             return 0.0
@@ -2344,16 +2815,27 @@ class CheckpointStorageDaemon:
         if not seals:
             return 0.0
         start = time.perf_counter()
-        for seal in seals:
-            self.manifest_store.seal_chunk(
-                actual,
-                seal["chunk_id"],
-                location=seal["location"],
-                checksum_type=seal["checksum_type"],
-                checksum=seal["checksum"],
-                nbytes=seal["nbytes"],
-                valid_nbytes=seal["valid_nbytes"],
-            )
+        for index, seal in enumerate(seals):
+            try:
+                self.manifest_store.seal_chunk(
+                    actual,
+                    seal["chunk_id"],
+                    location=seal["location"],
+                    checksum_type=seal["checksum_type"],
+                    checksum=seal["checksum"],
+                    nbytes=seal["nbytes"],
+                    valid_nbytes=seal["valid_nbytes"],
+                )
+            except BaseException:
+                # Keep the common path lock-free across the SQLite batch, but
+                # never lose retry state on a partial failure.  New seals may
+                # have been appended after the initial pop; prepend the failed
+                # item and untouched tail so their original order is retained.
+                # Successfully sealed prefix items are deliberately omitted.
+                with self._lock:
+                    pending = self._pending_seals.setdefault(actual, [])
+                    pending[:0] = seals[index:]
+                raise
         return (time.perf_counter() - start) * 1000.0
 
     def commit(self, tag: str) -> None:
@@ -2364,11 +2846,18 @@ class CheckpointStorageDaemon:
         except KeyError as exc:
             raise KeyError(f"unknown CSD checkpoint tag {actual!r}") from exc
         flush_ms = self._flush_pending_seals(actual)
+        with self._lock:
+            resident, sealed, expected = self._entry_residency(actual, entry)
+        if not resident:
+            raise RuntimeError(
+                f"CSD checkpoint {actual!r} cannot commit: "
+                f"sealed_chunks={sealed}, expected_chunks={expected}"
+            )
         if self.manifest_store is not None:
             self.manifest_store.commit_checkpoint(actual)
         with self._lock:
             entry["committed"] = True
-            entry["data_resident"] = True
+            entry["data_resident"] = resident
             self._merge_chunk_metadata(entry)
             entry.setdefault("profile", {})["sqlite_batch_flush_ms"] = flush_ms
         self._persist(actual)
@@ -2389,9 +2878,26 @@ class CheckpointStorageDaemon:
         if self.manifest_store is not None:
             manifest = self.manifest_store.manifest_for_tag(actual)
             expected_chunks = int(manifest.get("expected_chunks", len(list(manifest.get("chunks", [])))) or 0)
-            manifest["data_resident"] = expected_chunks == 0 or bool(self.backend.list_chunks(actual))
+            sealed_chunk_ids = {
+                str(record.chunk_id)
+                for record in self.manifest_store.list_chunks(actual)
+                if str(record.state) == "SEALED"
+            }
+            resident_chunk_ids = {str(chunk_id) for chunk_id in self.backend.list_chunks(actual)}
+            manifest["data_resident"] = expected_chunks == 0 or (
+                len(sealed_chunk_ids) == expected_chunks
+                and sealed_chunk_ids.issubset(resident_chunk_ids)
+            )
             manifest["daemon_owned"] = True
             manifest["backend_capabilities"] = self.backend.capabilities()
+        else:
+            assert entry is not None
+            resident, _, _ = self._entry_residency(actual, entry)
+            manifest["data_resident"] = resident
+            with self._lock:
+                current = self._entries.get(actual)
+                if current is not None:
+                    current["data_resident"] = resident
         return manifest
 
     def get_chunk(self, tag: str, chunk_id: str) -> tuple[bytes, dict[str, Any]]:
@@ -2402,6 +2908,16 @@ class CheckpointStorageDaemon:
         return self.backend.metadata(str(tag), str(chunk_id))
 
     def put_cuda_ipc(
+        self,
+        tag: str,
+        chunk_id: str,
+        view: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._tag_lifecycle_lock:
+            return self._put_cuda_ipc_registered(tag, chunk_id, view, metadata)
+
+    def _put_cuda_ipc_registered(
         self,
         tag: str,
         chunk_id: str,
@@ -2468,6 +2984,7 @@ class CheckpointStorageDaemon:
                 "chunk_id": chunk,
                 "metadata": dict(metadata_dict),
                 "profile": put_profile,
+                "cancelled_by_delete": False,
             }
             entry = self._entries.setdefault(
                 actual,
@@ -2505,18 +3022,6 @@ class CheckpointStorageDaemon:
                 profile.get("daemon_put_backend_write_ms", 0.0)
             )
             current["profile"] = profile
-            self._entries.setdefault(
-                current["tag"],
-                {
-                    "tag": current["tag"],
-                    "manifest": {},
-                    "chunks": {},
-                    "committed": False,
-                    "data_resident": True,
-                    "storage_backend": self.backend.name,
-                    "backend_capabilities": self.backend.capabilities(),
-                },
-            ).setdefault("chunks", {})[current["chunk_id"]] = dict(record_metadata)
             return dict(current)
 
     def read_to_cuda_ipc(self, tag: str, chunk_id: str, view: dict[str, Any]) -> dict[str, Any]:
@@ -2551,6 +3056,20 @@ class CheckpointStorageDaemon:
     def wait(self, op_id: str) -> dict[str, Any]:
         op_id = str(op_id)
         with self._lock:
+            op = self._async_ops[op_id]
+            completion_lock = op.get("completion_lock")
+            if completion_lock is None:
+                completion_lock = threading.Lock()
+                op["completion_lock"] = completion_lock
+        with completion_lock:
+            with self._lock:
+                if op_id not in self._async_ops:
+                    raise KeyError(op_id)
+            return self._wait_once(op_id)
+
+    def _wait_once(self, op_id: str) -> dict[str, Any]:
+        op_id = str(op_id)
+        with self._lock:
             op = dict(self._async_ops[op_id])
         remove_async_op = True
         try:
@@ -2559,6 +3078,15 @@ class CheckpointStorageDaemon:
             profile = dict(op.get("profile") or {})
             if hasattr(self.backend, "profile"):
                 profile.update(self.backend.profile(op["backend_op_id"]))  # type: ignore[attr-defined]
+            with self._lock:
+                current = self._async_ops.get(op_id)
+                cancelled_by_delete = bool(
+                    (current or {}).get("cancelled_by_delete", op.get("cancelled_by_delete", False))
+                )
+            if cancelled_by_delete:
+                if op.get("op_type") == "PUT":
+                    self.backend.free(op["tag"], op["chunk_id"])
+                raise RuntimeError(f"CSD operation {op_id!r} was cancelled because tag {op['tag']!r} was deleted")
             if op["op_type"] == "PUT":
                 metadata = dict(self.backend.metadata(op["tag"], op["chunk_id"]))
                 requested_checksum_type = str(
@@ -2650,20 +3178,53 @@ class CheckpointStorageDaemon:
     def poll(self, op_id: str) -> dict[str, Any]:
         op_id = str(op_id)
         with self._lock:
-            op = dict(self._async_ops[op_id])
+            op = self._async_ops[op_id]
+            completion_lock = op.get("completion_lock")
+            if completion_lock is None:
+                completion_lock = threading.Lock()
+                op["completion_lock"] = completion_lock
+        if not completion_lock.acquire(blocking=False):
+            # wait() or another poll owns completion.  Poll is a non-blocking
+            # observation API, so report progress instead of queueing behind
+            # the completion barrier.
+            return {"op_id": op_id, "state": "RUNNING"}
         try:
-            state = self.backend.poll(op["backend_op_id"])  # type: ignore[attr-defined]
-        except AttributeError:
-            state = "RUNNING"
-        if state == "DONE":
-            return self.wait(op_id)
-        return {"op_id": op_id, "state": state}
+            with self._lock:
+                op = dict(self._async_ops[op_id])
+            backend_future = op.get("backend_future")
+            if isinstance(backend_future, Future):
+                # PUT dispatch happens on the daemon executor, so there is no
+                # backend operation id until enqueue completes.  Poll must
+                # remain non-blocking and must never pass the temporary None
+                # sentinel into Native/Egm backend poll implementations.
+                if not backend_future.done():
+                    return {"op_id": op_id, "state": "RUNNING"}
+                try:
+                    op = self._resolve_backend_future(op_id, op)
+                except BaseException:
+                    # Reuse the normal completion path so operation failure is
+                    # recorded and returned with the same FAILED/error payload
+                    # as wait().  Future.result() is non-blocking once done.
+                    return self._wait_once(op_id)
+            try:
+                state = self.backend.poll(op["backend_op_id"])  # type: ignore[attr-defined]
+            except AttributeError:
+                state = "RUNNING"
+            if state in {"DONE", "FAILED"}:
+                # A terminal daemon poll consumes/finalizes the operation, as
+                # it did before executor dispatch was introduced.
+                return self._wait_once(op_id)
+            return {"op_id": op_id, "state": state}
+        finally:
+            completion_lock.release()
 
     def list_chunks(self, tag: str) -> list[str]:
         return self.backend.list_chunks(str(tag))
 
     def capabilities(self) -> dict[str, Any]:
-        return dict(self.backend.capabilities())
+        capabilities = dict(self.backend.capabilities())
+        capabilities["supports_atomic_metadata_commit"] = True
+        return capabilities
 
     def list_tags(self) -> list[str]:
         if self.manifest_store is not None:
@@ -2673,15 +3234,38 @@ class CheckpointStorageDaemon:
 
     def delete(self, tag: str) -> None:
         actual = str(tag)
-        self.backend.free_tag(actual)
-        with self._lock:
-            self._entries.pop(actual, None)
-        if self.manifest_store is not None:
-            self.manifest_store.delete_checkpoint(actual)
-        if self.metadata_dir is not None:
-            path = self._metadata_path(actual)
-            if path.exists():
-                path.unlink()
+        with self._tag_lifecycle_lock:
+            with self._lock:
+                pending_puts = [
+                    op_id
+                    for op_id, op in self._async_ops.items()
+                    if op.get("op_type") == "PUT" and str(op.get("tag")) == actual
+                ]
+                for op_id in pending_puts:
+                    self._async_ops[op_id]["cancelled_by_delete"] = True
+
+            # A backend can only release IPC/copy resources safely after its
+            # completion barrier.  Drain every registered pre-delete PUT, then
+            # perform free_tag last so even a backend that publishes in wait()
+            # cannot resurrect the deleted tag.
+            for op_id in pending_puts:
+                try:
+                    self.wait(op_id)
+                except KeyError:
+                    # Another waiter may have completed and removed the op.
+                    # The final free_tag below remains authoritative.
+                    pass
+
+            self.backend.free_tag(actual)
+            with self._lock:
+                self._entries.pop(actual, None)
+                self._pending_seals.pop(actual, None)
+            if self.manifest_store is not None:
+                self.manifest_store.delete_checkpoint(actual)
+            if self.metadata_dir is not None:
+                path = self._metadata_path(actual)
+                if path.exists():
+                    path.unlink()
 
 
 def _backend_from_name(name: str, options: dict[str, Any] | None = None) -> StorageBackend:
@@ -2793,6 +3377,8 @@ def _serve(address, authkey: bytes, backend_name: str, backend_options: dict[str
                     elif op == "put_manifest":
                         daemon.put_manifest(request["tag"], request["manifest"])
                         result = None
+                    elif op == "commit_metadata":
+                        result = daemon.commit_metadata(request["tag"], request["manifest"])
                     elif op == "commit":
                         daemon.commit(request["tag"])
                         result = None
@@ -2901,6 +3487,7 @@ class CheckpointStorageDaemonClient:
         self._conn = None
         self._conn_pid = os.getpid()
         self._conn_lock = threading.RLock()
+        self._server_capabilities: dict[str, Any] | None = None
 
     def _close_cached_conn_locked(self) -> None:
         conn = self._conn
@@ -3020,6 +3607,29 @@ class CheckpointStorageDaemonClient:
     def put_manifest(self, tag: str, manifest: dict[str, Any]) -> None:
         self._request({"op": "put_manifest", "tag": str(tag), "manifest": dict(manifest)})
 
+    def commit_metadata(self, tag: str, manifest: dict[str, Any]) -> dict[str, Any]:
+        if self._server_capabilities is not None and not bool(
+            self._server_capabilities.get("supports_atomic_metadata_commit", False)
+        ):
+            self.begin(str(tag), dict(manifest), expected_chunks=0)
+            self.put_manifest(str(tag), dict(manifest))
+            self.commit(str(tag))
+            return {"tag": str(tag), "committed": True, "created": True}
+        payload = {"op": "commit_metadata", "tag": str(tag), "manifest": dict(manifest)}
+        try:
+            return dict(self._request(payload))
+        except RuntimeError as exc:
+            # A new client can briefly coexist with an old daemon during a
+            # rolling upgrade.  Preserve protocol compatibility without an
+            # extra capabilities RPC on the checkpoint hot path.
+            message = str(exc)
+            if "unknown CSD op" not in message or "commit_metadata" not in message:
+                raise
+            self.begin(str(tag), dict(manifest), expected_chunks=0)
+            self.put_manifest(str(tag), dict(manifest))
+            self.commit(str(tag))
+            return {"tag": str(tag), "committed": True, "created": True}
+
     def commit(self, tag: str) -> None:
         self._request({"op": "commit", "tag": str(tag)})
 
@@ -3080,10 +3690,25 @@ class CheckpointStorageDaemonClient:
         return result
 
     def poll(self, op_id: str) -> dict[str, Any]:
-        return dict(self._request({"op": "poll", "op_id": str(op_id)}))
+        op = str(op_id)
+        result = dict(self._request({"op": "poll", "op_id": op}))
+        if str(result.get("state", "")).upper() in {"DONE", "FAILED"}:
+            # Daemon terminal poll finalizes and consumes the async operation.
+            # Mirror wait()'s CUDA-view ownership here so poll-only callers do
+            # not leak IPC events/handles (or skip read staging materialization).
+            view = self._pending_cuda_views.pop(op, None)
+            if view is not None:
+                try:
+                    if str(result.get("state", "")).upper() == "DONE":
+                        view.materialize_after_read()
+                finally:
+                    view.release()
+        return result
 
     def capabilities(self) -> dict[str, Any]:
-        return dict(self._request({"op": "capabilities"}))
+        if self._server_capabilities is None:
+            self._server_capabilities = dict(self._request({"op": "capabilities"}))
+        return dict(self._server_capabilities)
 
     def get(self, tag: str, chunk_id: str, device: torch.device | str = "cpu") -> torch.Tensor:
         raise RuntimeError("CheckpointStorageDaemonClient.get is disabled; use read_into_cuda_tensor")
@@ -3189,7 +3814,7 @@ def main() -> None:
     parser.add_argument("--egm-pool-id", default=None)
     parser.add_argument("--egm-owner-node", default=None)
     parser.add_argument("--egm-owner-tray", default=None)
-    parser.add_argument("--egm-home-device", type=int, default=0)
+    parser.add_argument("--egm-home-device", type=int, default=None)
     parser.add_argument("--egm-numa-id", type=int, default=None)
     parser.add_argument("--egm-accessing-devices", default=None)
     args = parser.parse_args()
@@ -3201,18 +3826,47 @@ def main() -> None:
             "device": int(args.native_pinned_device),
         }
     elif args.backend == "egm":
+        accessing_devices = (
+            [int(item) for item in str(args.egm_accessing_devices).split(",") if item.strip()]
+            if args.egm_accessing_devices
+            else None
+        )
+        runtime_config = _json_config_arg(args.egm_runtime_config)
+        # CLI topology flags configure the allocator itself as well as the
+        # protocol wrapper.  Previously they only changed EgmBackend metadata
+        # and happened to work in the PAI scripts because the same values were
+        # also exported through the environment.
+        if args.egm_home_device is not None:
+            runtime_config.setdefault("home_device", int(args.egm_home_device))
+        if args.egm_numa_id is not None:
+            runtime_config.setdefault("numa_id", int(args.egm_numa_id))
+        if accessing_devices is not None:
+            runtime_config.setdefault("accessing_devices", list(accessing_devices))
+        resolved_home_device = args.egm_home_device
+        if resolved_home_device is None:
+            resolved_home_device = runtime_config.get("home_device")
+        if resolved_home_device is None:
+            resolved_home_device = os.environ.get("CSD_EGM_HOME_DEVICE", "0")
+        resolved_numa_id = args.egm_numa_id
+        if resolved_numa_id is None:
+            resolved_numa_id = runtime_config.get("numa_id")
+        resolved_accessing_devices = accessing_devices
+        if resolved_accessing_devices is None and runtime_config.get("accessing_devices") is not None:
+            raw_accessing_devices = runtime_config["accessing_devices"]
+            if isinstance(raw_accessing_devices, str):
+                resolved_accessing_devices = [
+                    int(item) for item in raw_accessing_devices.split(",") if item.strip()
+                ]
+            else:
+                resolved_accessing_devices = [int(item) for item in raw_accessing_devices]
         backend_options = {
-            "runtime": _load_egm_runtime(args.egm_runtime_factory, _json_config_arg(args.egm_runtime_config)),
+            "runtime": _load_egm_runtime(args.egm_runtime_factory, runtime_config),
             "pool_id": args.egm_pool_id,
             "owner_node": args.egm_owner_node,
             "owner_tray": args.egm_owner_tray,
-            "home_device": int(args.egm_home_device),
-            "numa_id": args.egm_numa_id,
-            "accessing_devices": (
-                [int(item) for item in str(args.egm_accessing_devices).split(",") if item.strip()]
-                if args.egm_accessing_devices
-                else None
-            ),
+            "home_device": int(resolved_home_device),
+            "numa_id": None if resolved_numa_id is None else int(resolved_numa_id),
+            "accessing_devices": resolved_accessing_devices,
         }
     _serve(
         str(args.socket_path) if args.socket_path else (args.host, int(args.port)),

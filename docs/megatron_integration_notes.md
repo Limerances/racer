@@ -115,11 +115,16 @@ class RacerMegatronCheckpointManager:
 1. 在 Megatron checkpoint save 边界拿到每个 rank 的 local state_dict。
 2. train rank flatten 成 CUDA `uint8` payload，spare rank 传 `None`。
 3. 所有参与 rank 调 `racer.distributed.distributed_store`。
-4. adapter 把 chunks、manifest、tensor metadata 写进 checkpoint 目录。
+4. adapter 将 data/parity chunks 和 child manifest 两阶段提交到 per-node CSD；
+   metadata-only tensor-tree/top marker 通过 CSD 单 RPC、单 SQLite transaction
+   原子提交，shared-file 副本只作索引/缓存。
 5. load 时读 manifest/chunks，调用 distributed load。
 6. 恢复出的 byte payload 按 metadata unflatten 回 Megatron state_dict。
 
-后续优化：不要长期依赖“一整个 rank flatten 成一个大 payload”，大模型需要 tensor/chunk 级流式处理，避免额外显存峰值。
+当前实现已经采用 tensor-tree chunk packing 和 train-side pinned arena，不再把
+整个 rank checkpoint 拼成单个常驻 CUDA payload。async store-many 会按 child
+chunk 数保留 CUDA reload/receive slots；显存随 inflight child tags 增长，后续
+需要可配置 window，而不是回退到整 rank flatten。
 
 ## 9. 最容易踩错的点
 
@@ -131,16 +136,48 @@ class RacerMegatronCheckpointManager:
 - 不要默认 Megatron global rank 等于 CUDA device id。
 - 不要用 CPU/Jerasure benchmark 代表 RACER runtime 性能。
 - 不要以为 `buffer_size` 能解决 state_dict flatten 的整包显存问题。
+- 不要用 valid payload 最大值作为 decode survivor 的 NCCL count；send/recv 必须
+  使用 manifest 的对齐 `group_nbytes`，decode 后才能截短。
 
-## 10. 当前还缺什么
+## 10. 当前实现状态与剩余边界
 
-- persistent checkpoint storage。
-- Megatron rank 到 RACER train/spare rank 的映射。
-- state_dict metadata 的分布式保存和恢复。
-- chunk/tensor 流式 flatten。
-- 多节点通信和 checkpoint 目录布局。
-- failure/restart 语义。
-- 多 spare GPU 的更完整调度。
+已经完成：
+
+- per-node CSD-owned native pinned / topology-aware EGM；
+- strict direct CUDA IPC 与两阶段 child-tag commit；
+- Megatron physical rank 到独立 RACER process-group rank 的映射；
+- tensor-tree metadata、chunk packing、pinned arena 和 async store-many；
+- 两训练节点加 remote spare 的多节点路径；
+- CSD 保持存活时的训练进程 restart/load。
+- manifest v3 的 CSD-authoritative tensor-tree manifest 与 storage-bearing
+  train-node generation marker；同 generation 重试幂等，shared
+  文件只作原子兼容缓存；
+- metadata-only tree/top marker 使用 `commit_metadata` 单 RPC 原子提交；新 client
+  连接旧 daemon 时回退 legacy begin/put/commit，不改变 data-bearing child 协议；
+- 每个 per-node CSD coordinator 在 load 前验证 child tag 的 committed、
+  daemon-owned 和完整 residency，并 collective 一致失败。
+
+仍缺少：
+
+- 物理 failed rank 缺席后的 elastic Megatron world rebuild 和真正 replacement process 接管；
+- distributed repair；
+- multi-spare 负载均衡（执行路径当前固定使用第一个 spare）；
+- TrainingLocal / Hybrid planner 和基于真实 topology 的 cost model；
+- store abort、失败 generation 的确定性资源回收；
+- async child-tag 显存窗口上限。
+
+第三方 EGM runtime 还必须自己保证同 key payload 的 copy-before-publish；wrapper
+只能延迟 metadata/list 可见性，不能隔离一个 custom runtime 已经提前暴露给 read
+路径的底层 bytes。内置 Host-NUMA runtime 满足该语义。
+
+当前 repair 只具备单 chunk copy-before-publish/reader lease；不要把它描述成
+多 chunk repair transaction 原子性。`RacerContext.repair` 与 distributed repair
+仍缺 generation rollback 和跨节点冗余确认。
+
+注意：标准 restart driver 的 3 次 load 是无 failed-row fast load，不能单独证明
+纠删码恢复。EC correctness 必须额外显式注入 1～m 个 failed codeword rows。
+最大擦除测试还应打开 payload SHA-256，并在恢复后的 optimizer step 之后至少再跑
+一轮；只看到 load 成功或第一轮 forward loss 正常不足以排除 optimizer tail 损坏。
 
 ## 11. 验证入口
 

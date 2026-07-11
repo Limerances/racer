@@ -132,8 +132,22 @@ class _CostAccumulator:
         spare_compute = sum(self.compute_spare.values())
         train_xor = sum(self.xor_train.values())
         spare_xor = sum(self.xor_spare.values())
-        max_train = max(self.compute_train.values(), default=0) + max(self.xor_train.values(), default=0)
-        max_spare = max(self.compute_spare.values(), default=0) + max(self.xor_spare.values(), default=0)
+        # Compute and XOR maxima must belong to the same rank.  Adding their
+        # independent maxima can fabricate a critical rank that does not exist.
+        max_train = max(
+            (
+                self.compute_train.get(rank, 0) + self.xor_train.get(rank, 0)
+                for rank in set(self.compute_train) | set(self.xor_train)
+            ),
+            default=0,
+        )
+        max_spare = max(
+            (
+                self.compute_spare.get(rank, 0) + self.xor_spare.get(rank, 0)
+                for rank in set(self.compute_spare) | set(self.xor_spare)
+            ),
+            default=0,
+        )
         return CostModel(
             total_bytes_sent=self.total_bytes_sent,
             num_messages=self.num_messages,

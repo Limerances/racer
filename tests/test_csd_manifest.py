@@ -18,6 +18,51 @@ def test_manifest_begin_uncommitted_is_not_loadable(tmp_path):
     assert store.list_tags(committed_only=False) == ["t0"]
 
 
+def test_atomic_metadata_commit_is_idempotent_and_rejects_conflict(tmp_path):
+    store = CsdManifestStore(tmp_path / "csd.sqlite")
+    manifest = {
+        "racer_manifest_kind": "megatron_tensor_tree",
+        "checkpoint_tag": "checkpoint",
+        "generation": "gen-1",
+    }
+
+    assert store.commit_metadata_checkpoint("meta", manifest, backend="egm") is True
+    assert store.commit_metadata_checkpoint("meta", manifest, backend="egm") is False
+    loaded = store.manifest_for_tag("meta")
+    assert loaded["generation"] == "gen-1"
+    assert loaded["expected_chunks"] == 0
+    assert loaded["committed"] is True
+
+    with pytest.raises(RuntimeError, match="different content"):
+        store.commit_metadata_checkpoint(
+            "meta",
+            {**manifest, "generation": "gen-2"},
+            backend="egm",
+        )
+    assert store.manifest_for_tag("meta")["generation"] == "gen-1"
+
+
+def test_atomic_metadata_commit_completes_matching_legacy_writing_record(tmp_path):
+    store = CsdManifestStore(tmp_path / "csd.sqlite")
+    manifest = {"racer_manifest_kind": "marker", "generation": "gen-1"}
+    store.begin_checkpoint("meta", manifest, expected_chunks=0, backend="egm")
+
+    assert store.commit_metadata_checkpoint("meta", manifest, backend="egm") is True
+    assert store.manifest_for_tag("meta")["checkpoint_state"] == "COMMITTED"
+
+
+def test_atomic_metadata_commit_rejects_data_manifests(tmp_path):
+    store = CsdManifestStore(tmp_path / "csd.sqlite")
+
+    with pytest.raises(ValueError, match="cannot contain chunks"):
+        store.commit_metadata_checkpoint(
+            "data",
+            {"chunks": [{"chunk_id": "c0"}]},
+            backend="egm",
+        )
+    assert store.list_tags(committed_only=False) == []
+
+
 def test_manifest_commit_requires_all_chunks_sealed(tmp_path):
     store = CsdManifestStore(tmp_path / "csd.sqlite")
     store.begin_checkpoint(

@@ -654,35 +654,46 @@ def _payload_store_slot(
     device: torch.device,
     zero_slot: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return a store-time slot3 view, padding in-place when the payload view is short."""
+    """Return a full-width store slot without mutating outside ``payload``.
+
+    A short tensor can be a view into storage shared with another packet.  Its
+    unused backing bytes are therefore not an owned padding region.  Reuse the
+    caller-owned group slot when available; the allocation fallback is kept for
+    compatibility with call sites that do not provide one.
+    """
     flat = _flat_uint8_view(payload)
     nbytes = int(nbytes)
+    if nbytes < 0:
+        raise ValueError("store payload slot size must be non-negative")
     if flat.device != device:
         raise ValueError("store payload slot must stay on the current CUDA device")
     if int(flat.numel()) == nbytes:
         return flat
     if int(flat.numel()) > nbytes:
         return flat.narrow(0, 0, nbytes)
-    if int(flat.numel()) < nbytes:
-        out = torch.empty(nbytes, dtype=torch.uint8, device=device)
-        valid = int(flat.numel())
-        if valid > 0:
-            out.narrow(0, 0, valid).copy_(flat)
-        out.narrow(0, valid, nbytes - valid).zero_()
-        return out
 
-    storage_nbytes = int(flat.untyped_storage().nbytes())
-    element_size = int(flat.element_size())
-    required_storage_nbytes = (int(flat.storage_offset()) + nbytes) * element_size
-    if required_storage_nbytes > storage_nbytes:
-        raise RuntimeError(
-            "strict RACER store requires the payload chunk to come from a full-size device slot; "
-            f"valid_nbytes={int(flat.numel())}, required_nbytes={nbytes}, "
-            f"storage_nbytes={storage_nbytes}"
-        )
-    slot = torch.as_strided(flat, (nbytes,), (1,), storage_offset=int(flat.storage_offset()))
-    slot.narrow(0, int(flat.numel()), nbytes - int(flat.numel())).zero_()
-    return slot
+    valid = int(flat.numel())
+    if zero_slot is not None:
+        if zero_slot.device != device:
+            raise ValueError("store zero slot must stay on the current CUDA device")
+        if zero_slot.dtype is not torch.uint8 or not zero_slot.is_contiguous():
+            raise ValueError("store zero slot must be a contiguous torch.uint8 tensor")
+        if int(zero_slot.numel()) < nbytes:
+            raise ValueError(
+                "store zero slot is too small: "
+                f"capacity_nbytes={int(zero_slot.numel())}, required_nbytes={nbytes}"
+            )
+        slot = zero_slot.narrow(0, 0, nbytes)
+        if valid > 0:
+            slot.narrow(0, 0, valid).copy_(flat)
+        slot.narrow(0, valid, nbytes - valid).zero_()
+        return slot
+
+    out = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    if valid > 0:
+        out.narrow(0, 0, valid).copy_(flat)
+    out.narrow(0, valid, nbytes - valid).zero_()
+    return out
 
 
 def _send_tensor(tensor: torch.Tensor, dst: int, process_group: Any | None = None) -> None:
@@ -1071,13 +1082,9 @@ def distributed_store(
     for group in layout.reduction_groups:
         group_chunks: dict[str, torch.Tensor] = {}
         group_index = int(group[0].relative_index)
-        group_local_slot_payload: dict[int, torch.Tensor] = {}
-        if rank in config.train_ranks and local_payload is not None:
-            group_local_slot_payload[rank] = _payload_store_slot(
-                local_payload,
-                int(group_sizes[group_index]),
-                device=_current_cuda_device(),
-            )
+        # Keep the valid-width view here.  The data/parity send helpers widen
+        # it with the group's reusable zero/receive slot when required.
+        group_local_slot_payload = local_slot_payload
         data_rows_start = time.perf_counter()
         data_bytes_sent += _store_data_rows_for_group(
             rank=rank,
@@ -1353,13 +1360,13 @@ def prepare_distributed_store_many(
             )
             if recv_slot4 is not None:
                 retained_tensors_by_tag[state_index].append(recv_slot4)
-            group_local_slot_payload: dict[int, torch.Tensor] = {}
-            if rank in config.train_ranks and local_payload is not None:
-                group_local_slot_payload[rank] = _payload_store_slot(
-                    local_payload,
-                    int(group_sizes[group_index]),
-                    device=_current_cuda_device(),
-                )
+            # Delay tail padding until a send/placement actually consumes the
+            # local packet so it can reuse this group's retained recv slot.
+            group_local_slot_payload = (
+                {rank: local_payload}
+                if rank in config.train_ranks and local_payload is not None
+                else {}
+            )
 
             data_rows_start = time.perf_counter()
             data_bytes_sent += _store_data_rows_for_group(
@@ -1995,23 +2002,47 @@ def distributed_load(
         if requested_rank in failed_set or slot.data_group_id in failed_owner_rows:
             decode_requests.append((int(requested_rank), slot))
 
+    # Store pads every codeword row to the aligned reduction-group width.  P2P
+    # send/recv counts during decode must use that exact width; using only the
+    # largest valid packet silently mismatches NCCL counts on the tail chunk.
+    # Recompute for old manifests, then prefer the recorded storage width.
+    stored_group_nbytes = _group_nbytes(layout, state.packet_nbytes_by_rank)
+    stored_group_nbytes.update(
+        {
+            int(group_id): int(value)
+            for group_id, value in dict((state.manifest or {}).get("group_nbytes", {})).items()
+        }
+    )
     decode_start = time.perf_counter()
     for requested_rank, slot in decode_requests:
         survivors = [row for row in range(len(config.train_ranks)) if row not in failed_owner_rows]
         if len(survivors) < config.k:
             raise RuntimeError(f"not enough survivor rows to decode: have {len(survivors)}, need {config.k}")
         chosen_rows = survivors[: config.k]
-        nbytes = max(
+        valid_group_nbytes = max(
             state.packet_nbytes_by_rank[int(s.train_rank)]
             for s in layout.reduction_groups[slot.relative_index]
             if s.train_rank is not None
         )
+        nbytes = int(stored_group_nbytes.get(int(slot.relative_index), valid_group_nbytes))
+        if nbytes < valid_group_nbytes:
+            raise RuntimeError(
+                "RACER manifest group_nbytes is smaller than a valid packet: "
+                f"group={slot.relative_index}, stored={nbytes}, valid={valid_group_nbytes}"
+            )
         survivor_chunks: list[torch.Tensor] = []
         for row in chosen_rows:
             owner = int(config.train_ranks[row])
             chunk_id = _chunk_id(slot.relative_index, row)
             if rank == owner:
                 chunk = state.local_chunks[chunk_id]
+                if int(chunk.numel()) < nbytes:
+                    raise RuntimeError(
+                        "RACER survivor chunk is smaller than manifest group_nbytes: "
+                        f"chunk_id={chunk_id}, chunk_nbytes={int(chunk.numel())}, "
+                        f"group_nbytes={nbytes}"
+                    )
+                chunk = chunk.narrow(0, 0, nbytes)
                 if owner == decode_rank:
                     survivor_chunks.append(chunk)
                 else:

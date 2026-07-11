@@ -68,6 +68,7 @@ LOG_ROOT="${LOG_ROOT:-${OUTPUT_ROOT}/logs}"
 
 TRAIN_ITERS="${TRAIN_ITERS:-80}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
+RACER_RETAIN_CHECKPOINTS="${RACER_RETAIN_CHECKPOINTS:-1}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-}"
 MEGATRON_DATALOADER_PIN_MEMORY="${MEGATRON_DATALOADER_PIN_MEMORY:-}"
@@ -793,7 +794,7 @@ MSG
     --racer-spare-launch-mode "${launch_mode}"
     --racer-buffer-size "${RACER_BUFFER_SIZE:-1073741824}"
     --racer-payload-pool-prewarm-chunks "${RACER_PAYLOAD_POOL_PREWARM_CHUNKS}"
-    --racer-retain-checkpoints 1
+    --racer-retain-checkpoints "${RACER_RETAIN_CHECKPOINTS}"
     --racer-distributed-store
     --racer-storage-backend "${storage_backend}"
     --racer-csd-host 127.0.0.1
