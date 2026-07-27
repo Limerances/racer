@@ -294,6 +294,8 @@ state_dir = Path(sys.argv[4])
 iter_re = re.compile(r"iteration\s+([0-9]+)\s*/\s*([0-9]+).*elapsed time per iteration \(ms\):\s*([0-9.]+)")
 store_re = re.compile(r"RACER distributed tensor-tree checkpoint stored: tag=([^,]+), store=([0-9.]+) ms")
 load_re = re.compile(r"RACER distributed memory checkpoint loaded: tag=([^,]+), total=([0-9.]+) ms")
+async_schedule_re = re.compile(r"RACER async checkpoint scheduled: iteration=([0-9]+)")
+async_commit_re = re.compile(r"RACER async checkpoint committed: iteration=([0-9]+)")
 
 rows_by_key = {}
 stores_by_key = {}
@@ -301,18 +303,31 @@ loads_by_key = {}
 for path in sorted(log_root.glob(f"{base_run_id}_phase*.driver.node*.log")):
     phase = path.stem.split(".")[0].replace(base_run_id + "_", "")
     node = path.stem.rsplit("node", 1)[-1]
+    async_active = False
+    overlap_since_last_iteration = False
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if async_schedule_re.search(line):
+            async_active = True
+            overlap_since_last_iteration = True
+        if async_commit_re.search(line):
+            overlap_since_last_iteration = overlap_since_last_iteration or async_active
+            async_active = False
         m = iter_re.search(line)
         if m:
             iteration = int(m.group(1))
-            rows_by_key[(phase, iteration)] = {
+            key = (phase, iteration)
+            overlap = async_active or overlap_since_last_iteration
+            previous = rows_by_key.get(key)
+            rows_by_key[key] = {
                 "phase": phase,
                 "node": node,
                 "iteration": iteration,
                 "train_iters": int(m.group(2)),
                 "elapsed_time_per_iteration_ms": float(m.group(3)),
                 "checkpoint_iteration": iteration % save_interval == 0,
+                "async_checkpoint_overlap": overlap or bool(previous and previous.get("async_checkpoint_overlap")),
             }
+            overlap_since_last_iteration = async_active
         m = store_re.search(line)
         if m:
             stores_by_key[(phase, m.group(1))] = {"phase": phase, "tag": m.group(1), "store_ms": float(m.group(2))}
@@ -336,8 +351,40 @@ state_dir.mkdir(parents=True, exist_ok=True)
 rows = [rows_by_key[key] for key in sorted(rows_by_key)]
 stores = [stores_by_key[key] for key in sorted(stores_by_key)]
 loads = [loads_by_key[key] for key in sorted(loads_by_key)]
+first_iteration_by_phase = {}
+for row in rows:
+    phase = row["phase"]
+    iteration = int(row["iteration"])
+    first_iteration_by_phase[phase] = min(iteration, first_iteration_by_phase.get(phase, iteration))
+for row in rows:
+    phase = row["phase"]
+    iteration = int(row["iteration"])
+    first_iteration = first_iteration_by_phase[phase]
+    if row["async_checkpoint_overlap"]:
+        sample_class = "async_checkpoint_overlap"
+    elif phase != "phase00" and iteration == first_iteration:
+        sample_class = "restart_first"
+    elif iteration <= first_iteration + 1:
+        sample_class = "phase_warmup"
+    else:
+        sample_class = "clean_ordinary"
+    row["sample_class"] = sample_class
+    row["clean_ordinary_iteration"] = sample_class == "clean_ordinary"
 with (state_dir / "iteration_times.csv").open("w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(f, fieldnames=["phase", "node", "iteration", "train_iters", "elapsed_time_per_iteration_ms", "checkpoint_iteration"])
+    writer = csv.DictWriter(
+        f,
+        fieldnames=[
+            "phase",
+            "node",
+            "iteration",
+            "train_iters",
+            "elapsed_time_per_iteration_ms",
+            "checkpoint_iteration",
+            "async_checkpoint_overlap",
+            "clean_ordinary_iteration",
+            "sample_class",
+        ],
+    )
     writer.writeheader()
     writer.writerows(rows)
 
@@ -346,19 +393,17 @@ all_iters = [r["elapsed_time_per_iteration_ms"] for r in rows]
 unique_iterations = sorted({int(r["iteration"]) for r in rows})
 unique_checkpoint_iterations = [iteration for iteration in unique_iterations if iteration % save_interval == 0]
 unique_normal_iterations = [iteration for iteration in unique_iterations if iteration % save_interval != 0]
-first_iteration_by_phase = {}
-for row in rows:
-    phase = row["phase"]
-    iteration = int(row["iteration"])
-    first_iteration_by_phase[phase] = min(iteration, first_iteration_by_phase.get(phase, iteration))
-steady_normal = [
-    r["elapsed_time_per_iteration_ms"]
-    for r in rows
-    if not r["checkpoint_iteration"] and int(r["iteration"]) > first_iteration_by_phase[r["phase"]] + 1
-]
+clean_ordinary = [r["elapsed_time_per_iteration_ms"] for r in rows if r["clean_ordinary_iteration"]]
+async_overlap = [r["elapsed_time_per_iteration_ms"] for r in rows if r["async_checkpoint_overlap"]]
+restart_first = [r for r in rows if r["sample_class"] == "restart_first"]
 normal_stats = stats(normal)
-steady_normal_stats = stats(steady_normal)
+clean_ordinary_stats = stats(clean_ordinary)
+async_overlap_stats = stats(async_overlap)
 all_stats = stats(all_iters)
+restart_first_text = ", ".join(
+    f"{r['phase']}:iter{r['iteration']}={r['elapsed_time_per_iteration_ms']:.3f} ms"
+    for r in restart_first
+) or "none"
 
 summary = [
     "# GB200 多节点 RACER 重启测试摘要",
@@ -372,10 +417,15 @@ summary = [
     f"- 非 checkpoint 日志样本数: `{normal_stats['count']}`",
     f"- 非 checkpoint 样本平均耗时: `{normal_stats['avg']} ms`",
     f"- 非 checkpoint 样本 p50/p95: `{normal_stats['p50']} / {normal_stats['p95']} ms`",
-    f"- 稳态非 checkpoint 样本数: `{steady_normal_stats['count']}`",
-    f"- 稳态训练每 iteration 平均耗时: `{steady_normal_stats['avg']} ms`",
-    f"- 稳态训练 p50/p95: `{steady_normal_stats['p50']} / {steady_normal_stats['p95']} ms`",
+    f"- Clean ordinary 样本数: `{clean_ordinary_stats['count']}`",
+    f"- Clean ordinary 每 iteration 平均耗时: `{clean_ordinary_stats['avg']} ms`",
+    f"- Clean ordinary p50/p95: `{clean_ordinary_stats['p50']} / {clean_ordinary_stats['p95']} ms`",
+    f"- Async checkpoint overlap 样本数: `{async_overlap_stats['count']}`",
+    f"- Async checkpoint overlap 平均耗时: `{async_overlap_stats['avg']} ms`",
+    f"- Restart 后首轮样本: `{restart_first_text}`",
     f"- 全部日志样本平均耗时: `{all_stats['avg']} ms`",
+    "- 口径: Megatron 先输出 iteration elapsed，之后才调用 checkpoint；因此 checkpoint trigger iteration 的 elapsed 不含 save blocking，可以属于 clean ordinary。",
+    "- 口径: 从 async scheduled 到 committed 之间与训练相交的 iteration 单列为 async checkpoint overlap，不计入 clean ordinary。",
     "- 说明: 日志样本数可能大于唯一 iteration 数；kill marker 从 node0 传播前，其他节点可能多打印少量边界 iteration。",
     f"- 观察到 RACER store 次数: `{len(stores)}`",
     f"- 观察到 RACER restart load 次数: `{len(loads)}`",

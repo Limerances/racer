@@ -158,6 +158,14 @@ racer_manifests/<RUN_ID>/
 
 连续 3 分钟没有新 iteration、store/commit 或 marker 时应主动检查，而不是等待默认 7200 秒超时。
 
+iteration 性能必须按 checkpoint 时间线分类，不能简单使用
+`checkpoint_iteration=false`：
+
+- Megatron 的 `elapsed time per iteration` 在调用 checkpoint 之前输出，所以触发保存的 iteration 本身仍是纯训练耗时；save blocking 需要单独统计。
+- 从 `RACER async checkpoint scheduled` 到 `RACER async checkpoint committed` 期间与训练相交的 iteration 是 `async_checkpoint_overlap`，它会受到 EC、CUDA IPC 和 EGM 流量影响，不能计入普通训练基线。
+- restart/load 后的第一轮是 `restart_first` 冷启动样本，应与普通训练和 async-overlap 分开。
+- 新版 driver 会在 `iteration_times.csv` 中输出 `sample_class`、`async_checkpoint_overlap` 和 `clean_ordinary_iteration`。
+
 ## 5. 性能比较
 
 同配置的即时未修改基线与本轮接受结果：

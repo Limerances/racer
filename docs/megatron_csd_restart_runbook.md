@@ -103,7 +103,9 @@ python scripts/summarize_megatron_csd_restart.py results/megatron_csd_restart/gp
 
 1. `每迭代训练耗时摘要`
    - 这是 Megatron 原始日志里的 `elapsed time per iteration (ms)`。
-   - `non_checkpoint` 是排除保存点 iteration 后的训练耗时。
+   - `checkpoint_iteration` 只表示该 iteration 之后会触发保存；elapsed 日志先于 save，因此它不包含 checkpoint blocking。
+   - 普通训练基线应使用 `sample_class=clean_ordinary`；`sample_class=async_checkpoint_overlap` 会与异步 EC/EGM commit 竞争资源，必须单列。
+   - `sample_class=restart_first` 是恢复后的冷启动首轮，也不能作为稳态训练基线。
    - 每个 iteration 的明细在 `iteration_times.csv`；命令行需要展开时加 `--show-iteration-details`。
 
 2. `Megatron 保存阻塞耗时`

@@ -2541,6 +2541,32 @@ class EgmBackend(StorageBackend):
                 self._metadata.pop(str(tag), None)
 
 
+    def free_tag(self, tag: str) -> None:
+        runtime_free_tag = getattr(self.runtime, "free_tag", None)
+        if callable(runtime_free_tag):
+            runtime_free_tag(str(tag))
+        else:
+            for chunk_id in self.list_chunks(str(tag)):
+                self.free(str(tag), str(chunk_id))
+        with self._lock:
+            self._metadata.pop(str(tag), None)
+
+    def trim(self) -> dict[str, int]:
+        trim_fn = getattr(self.runtime, "trim_free_segments", None)
+        if not callable(trim_fn):
+            raise RuntimeError("EGM runtime does not support trim_free_segments")
+        report = dict(trim_fn())
+        if int(report.get("released_segments", 0)) > 0:
+            print(
+                "[CSD] EGM trim: "
+                f"released_segments={int(report.get('released_segments', 0))} "
+                f"released_bytes={int(report.get('released_bytes', 0))} "
+                f"replenished_segments={int(report.get('replenished_segments', 0))}",
+                flush=True,
+            )
+        return report
+
+
 class CheckpointStorageDaemon:
     def __init__(self, backend: StorageBackend, *, metadata_dir: str | Path | None = None) -> None:
         self.backend = backend
@@ -3417,6 +3443,11 @@ def _serve(address, authkey: bytes, backend_name: str, backend_options: dict[str
                     elif op == "delete":
                         daemon.delete(request["tag"])
                         result = None
+                    elif op == "trim":
+                        trim_fn = getattr(daemon.backend, "trim", None)
+                        if not callable(trim_fn):
+                            raise RuntimeError("CSD backend does not support trim")
+                        result = dict(trim_fn())
                     elif op == "shutdown":
                         shutdown_event.set()
                         result = None
@@ -3724,6 +3755,9 @@ class CheckpointStorageDaemonClient:
 
     def delete(self, tag: str) -> None:
         self._request({"op": "delete", "tag": str(tag)})
+
+    def trim(self) -> dict[str, Any]:
+        return dict(self._request({"op": "trim"}))
 
     def shutdown(self) -> None:
         self._request({"op": "shutdown"})

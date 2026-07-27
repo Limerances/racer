@@ -215,6 +215,7 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
         )
         self._egm_pool: int | None = int(self._egm_pools[primary_device])
         super().__init__(total_bytes=0, segment_bytes=int(segment_bytes), device=int(primary_device))
+        self._next_segment_id = 0
         self.total_bytes = int(total_bytes)
         self.segment_bytes = int(segment_bytes)
         self._device_preallocated_bytes = {int(device): 0 for device in self.accessing_devices}
@@ -353,12 +354,13 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
         )
         numa_id = int(self._device_numa_ids[device])
         segment = _NativeSegment(
-            segment_id=f"egm_dev{device}_numa{numa_id}_seg_{len(self._segments):08d}",
+            segment_id=f"egm_dev{device}_numa{numa_id}_seg_{self._next_segment_id:08d}",
             ptr=int(ptr.value),
             nbytes=int(nbytes),
             allocation_device=device,
             numa_id=numa_id,
         )
+        self._next_segment_id += 1
         self._segments.append(segment)
         self._segment_by_id[segment.segment_id] = segment
         return segment
@@ -394,6 +396,127 @@ class CudaMempoolEgmRuntime(NativePinnedMemoryBackend):
                 }
             return result
 
+    def trim_free_segments(self) -> dict[str, int]:
+        """Return fully unused EGM segments to CUDA and trim pool backing pages."""
+
+        cudart = _configure_cudart_mempool_api()
+        with self._lock:
+            closed_ipc_handles = 0
+            for cached in list(self._ipc_mem_cache.values()):
+                ptr = int(cached.get("ptr", 0))
+                if ptr:
+                    _cuda_check(
+                        cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr)),
+                        "cudaIpcCloseMemHandle failed during EGM trim",
+                    )
+                    closed_ipc_handles += 1
+            self._ipc_mem_cache.clear()
+            free_bytes_by_segment: dict[str, int] = {}
+            for block in self._free_blocks:
+                free_bytes_by_segment[str(block.segment_id)] = (
+                    int(free_bytes_by_segment.get(str(block.segment_id), 0)) + int(block.nbytes)
+                )
+            releasable = [
+                segment
+                for segment in self._segments
+                if int(free_bytes_by_segment.get(str(segment.segment_id), 0))
+                + max(0, int(segment.nbytes) - int(segment.offset))
+                >= int(segment.nbytes)
+            ]
+            if not releasable:
+                return {"released_segments": 0, "released_bytes": 0, "closed_ipc_handles": closed_ipc_handles}
+            by_device: dict[int, list[_NativeSegment]] = {}
+            for segment in releasable:
+                device = self._resolve_allocation_device(segment.allocation_device)
+                by_device.setdefault(int(device), []).append(segment)
+            for device, segments in by_device.items():
+                stream = self._get_copy_stream(int(device))
+                for segment in segments:
+                    _cuda_check(
+                        cudart.cudaFreeAsync(
+                            ctypes.c_void_p(int(segment.ptr)),
+                            ctypes.c_void_p(int(stream)),
+                        ),
+                        f"cudaFreeAsync EGM trim failed for device {device}",
+                    )
+                _cuda_check(
+                    cudart.cudaStreamSynchronize(ctypes.c_void_p(int(stream))),
+                    f"EGM trim sync failed for device {device}",
+                )
+                if hasattr(cudart, "cudaMemPoolTrimTo"):
+                    _cuda_check(
+                        cudart.cudaMemPoolTrimTo(
+                            ctypes.c_void_p(int(self._egm_pools[int(device)])),
+                            ctypes.c_size_t(0),
+                        ),
+                        f"cudaMemPoolTrimTo failed for EGM device {device}",
+                    )
+            released_ids = {str(segment.segment_id) for segment in releasable}
+            self._segments = [
+                segment for segment in self._segments if str(segment.segment_id) not in released_ids
+            ]
+            for segment_id in released_ids:
+                self._segment_by_id.pop(segment_id, None)
+            self._free_blocks = [
+                block for block in self._free_blocks if str(block.segment_id) not in released_ids
+            ]
+            reset_pools = 0
+            if not self._segments:
+                for device, pool in list(self._egm_pools.items()):
+                    _cuda_check(
+                        cudart.cudaMemPoolDestroy(ctypes.c_void_p(int(pool))),
+                        f"cudaMemPoolDestroy failed during EGM trim for device {device}",
+                    )
+                self._egm_pools = {}
+                self._create_egm_pools()
+                primary_device = (
+                    int(self.home_device)
+                    if int(self.home_device) in self._egm_pools
+                    else int(self.accessing_devices[0])
+                )
+                self._egm_pool = int(self._egm_pools[primary_device])
+                reset_pools = len(self._egm_pools)
+            released_bytes = sum(int(segment.nbytes) for segment in releasable)
+            for segment in releasable:
+                device = self._resolve_allocation_device(segment.allocation_device)
+                self._device_preallocated_bytes[int(device)] = max(
+                    0,
+                    int(self._device_preallocated_bytes.get(int(device), 0)) - int(segment.nbytes),
+                )
+            replenish_total = (
+                self.total_bytes
+                if os.environ.get("RACER_EGM_REPLENISH_AFTER_TRIM", "1").lower()
+                in {"1", "true", "yes", "on"}
+                else 0
+            )
+            target_by_device = self._split_bytes_evenly(replenish_total, self.accessing_devices)
+            current_by_device = {int(device): 0 for device in self.accessing_devices}
+            for segment in self._segments:
+                device = self._resolve_allocation_device(segment.allocation_device)
+                current_by_device[int(device)] += int(segment.nbytes)
+            replenished_segments = 0
+            replenished_bytes = 0
+            for device in self.accessing_devices:
+                missing = max(
+                    0,
+                    int(target_by_device.get(int(device), 0)) - int(current_by_device.get(int(device), 0)),
+                )
+                while missing > 0:
+                    allocation_bytes = min(int(self.segment_bytes), int(missing))
+                    self._new_segment(allocation_bytes, allocation_device=int(device))
+                    self._device_preallocated_bytes[int(device)] = (
+                        int(self._device_preallocated_bytes.get(int(device), 0)) + allocation_bytes
+                    )
+                    replenished_segments += 1
+                    replenished_bytes += allocation_bytes
+                    missing -= allocation_bytes
+            return {
+                "released_segments": len(releasable),
+                "released_bytes": int(released_bytes),
+                "replenished_segments": int(replenished_segments),
+                "replenished_bytes": int(replenished_bytes),
+                "closed_ipc_handles": int(closed_ipc_handles),
+            }
     def capabilities(self) -> dict[str, Any]:
         stats = self.pool_stats()
         per_device = self._device_pool_stats()
